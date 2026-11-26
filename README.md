@@ -35,7 +35,7 @@ The switcher and ComfyUI use HTTP Basic authentication. The username is `operato
 - `docker-compose.yml`, `nginx.conf`, and `comfyui.Dockerfile` define the installed services.
 - `test_*.py` contains the local test suite.
 
-For installation details, storage locations, and upgrades, see [Installation](docs/INSTALLATION.md). For daily use, see [Operations](docs/OPERATIONS.md). For source changes and tests, see [Development](docs/DEVELOPMENT.md). For credentials and network exposure, see [Security](SECURITY.md).
+For installation details, storage locations, and upgrades, see [Installation](docs/INSTALLATION.md). For daily use, see [Operations](docs/OPERATIONS.md). For the service map, see [Architecture](docs/ARCHITECTURE.md). For source changes and tests, see [Development](docs/DEVELOPMENT.md). For credentials and network exposure, see [Security](SECURITY.md).
 
 ## Project state
 
