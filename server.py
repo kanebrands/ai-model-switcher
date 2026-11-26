@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Small, fixed-action GPU mode switch. Only nginx should expose this service."""
+"""Small, fixed-action model switch. Only nginx should expose this service."""
 import html
 import http.client
 import datetime as dt
@@ -28,6 +28,8 @@ import model_views
 
 SOCKET = "/var/run/docker.sock"
 LLM = "local-ai-llm"
+CPU_TINY = "local-ai-cpu-tiny"
+CPU_4B = "local-ai-cpu-4b"
 QWEN4B = "local-ai-qwen4b"
 HUIHUI = "local-ai-huihui"
 FLINT_IQ4 = "local-ai-flint-iq4"
@@ -42,8 +44,11 @@ ORIGIN = os.environ["CONTROL_ORIGIN"]
 WEB_URL = os.environ["WEB_URL"]
 COMFY_URL = os.environ["COMFY_URL"]
 CSRF = os.environ["CONTROL_CSRF_TOKEN"]
+SELECTED_MODES = {value for value in os.environ.get("AI_SELECTED_MODELS", "").split(",") if value}
 LOCK = threading.Lock()
 BUILTIN_LABELS = {
+    "cpu-tiny": "Qwen3 0.6B Q8 CPU (local-cpu-tiny)",
+    "cpu-4b": "Qwen3 4B Q4 CPU (local-cpu-4b)",
     "llm": "Qwen3 Coder 30B-A3B (local-coder)",
     "qwen4b": "Qwen3 4B Instruct 2507 (local-qwen4b)",
     "huihui": "Huihui Qwen3.6 35B-A3B Q3_K (local-huihui)",
@@ -107,6 +112,8 @@ def switch(target):
     workloads = {mode: container for mode, (_, container) in MODELS.items()}
     if target not in workloads:
         raise ValueError("Unknown mode")
+    if SELECTED_MODES and target not in SELECTED_MODES and not target.startswith("hf-"):
+        raise ValueError("This workload was not selected at installation")
     if ENGINE_UPDATES.busy or CONTEXT_TUNER.busy or PARALLEL_TUNER.busy:
         raise RuntimeError("Wait for the engine or context change to finish before switching models")
     with LOCK:
@@ -188,11 +195,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def _page(self, message="", status=200):
         try:
-            llm_on, qwen4b_on, huihui_on, flint_iq4_on, flint_q3_on, deepseek_on, qwen38_on, gemma4_on, vision_on, media_on = (
-                running(LLM), running(QWEN4B), running(HUIHUI),
+            cpu_tiny_on, cpu_4b_on, llm_on, qwen4b_on, huihui_on, flint_iq4_on, flint_q3_on, deepseek_on, qwen38_on, gemma4_on, vision_on, media_on = (
+                running(CPU_TINY), running(CPU_4B), running(LLM), running(QWEN4B), running(HUIHUI),
                 running(FLINT_IQ4), running(FLINT_Q3), running(DEEPSEEK), running(QWEN38), running(GEMMA4), running(VISION), running(MEDIA)
             )
             huihui_state = workload_state(HUIHUI)
+            cpu_tiny_state = workload_state(CPU_TINY)
+            cpu_4b_state = workload_state(CPU_4B)
+            llm_state = workload_state(LLM)
+            vision_state = workload_state(VISION)
             qwen4b_state = workload_state(QWEN4B)
             flint_iq4_state = workload_state(FLINT_IQ4)
             flint_q3_state = workload_state(FLINT_Q3)
@@ -202,12 +213,13 @@ class Handler(BaseHTTPRequestHandler):
             media_state = workload_state(MEDIA)
             managed = MODEL_MANAGER.installed()
         except Exception as exc:
-            llm_on = qwen4b_on = huihui_on = flint_iq4_on = flint_q3_on = deepseek_on = qwen38_on = gemma4_on = vision_on = media_on = False
-            qwen4b_state = huihui_state = flint_iq4_state = flint_q3_state = deepseek_state = qwen38_state = gemma4_state = media_state = "unknown"
+            cpu_tiny_on = cpu_4b_on = llm_on = qwen4b_on = huihui_on = flint_iq4_on = flint_q3_on = deepseek_on = qwen38_on = gemma4_on = vision_on = media_on = False
+            cpu_tiny_state = cpu_4b_state = llm_state = vision_state = qwen4b_state = huihui_state = flint_iq4_state = flint_q3_state = deepseek_state = qwen38_state = gemma4_state = media_state = "unknown"
             message = f"Docker status error: {exc}"
             status = 503
             managed = []
-        active = [label for label, on in (("Coder", llm_on), ("Qwen3 4B", qwen4b_on),
+        active = [label for label, on in (("Qwen3 0.6B CPU", cpu_tiny_on), ("Qwen3 4B CPU", cpu_4b_on),
+                  ("Coder", llm_on), ("Qwen3 4B", qwen4b_on),
                   ("Huihui Qwen3.6", huihui_on), ("Flint IQ4_XS", flint_iq4_on),
                   ("Flint Q3_K_M", flint_q3_on), ("Vision", vision_on),
                   ("DeepSeek V4 distill Q5", deepseek_on),
@@ -226,7 +238,8 @@ class Handler(BaseHTTPRequestHandler):
             item = contexts.get(which) or {}
             tokens = item.get("tokens")
             return f'{tokens:,} tokens ({item["state"]})' if tokens else item.get("state", "unavailable")
-        model_labels = {**BUILTIN_LABELS,
+        model_labels = {**{key: value for key, value in BUILTIN_LABELS.items()
+                           if not SELECTED_MODES or key in SELECTED_MODES},
                         **{"hf-" + item["candidate_id"]: item["alias"] + " (Hugging Face)" for item in managed}}
         model_options = "".join(
             f'<option value="{h(which)}" {"selected" if contexts.get(which, {}).get("running") else ""}>'
@@ -257,12 +270,17 @@ class Handler(BaseHTTPRequestHandler):
                         '<button type="submit">Test and save context</button></form>') if context_active else '<p>Start one model to tune its context.</p>'
         if context_status["busy"]:
             context_form = '<p>Context test running. This page refreshes every five seconds.</p>'
-        states = (("Qwen 4B", qwen4b_state), ("Huihui", huihui_state), ("Flint IQ4", flint_iq4_state),
-                  ("Flint Q3", flint_q3_state), ("DeepSeek distill", deepseek_state),
-                  ("Qwen3.8 distill", qwen38_state), ("Gemma 4", gemma4_state), ("ComfyUI", media_state))
+        states = (("cpu-tiny", "Qwen3 0.6B CPU", cpu_tiny_state),
+                  ("cpu-4b", "Qwen3 4B CPU", cpu_4b_state),
+                  ("llm", "Qwen3 Coder", llm_state),
+                  ("vision", "Qwen3 VL", vision_state),
+                  ("qwen4b", "Qwen 4B", qwen4b_state), ("huihui", "Huihui", huihui_state),
+                  ("flint-iq4", "Flint IQ4", flint_iq4_state), ("flint-q3", "Flint Q3", flint_q3_state),
+                  ("deepseek", "DeepSeek distill", deepseek_state), ("qwen38", "Qwen3.8 distill", qwen38_state),
+                  ("gemma4", "Gemma 4", gemma4_state), ("media", "ComfyUI", media_state))
         status_cards = "".join(
             f'<div class="service"><span>{h(label)}</span><strong class="{"ready" if state in ("healthy", "running") else "idle"}">{h(state)}</strong></div>'
-            for label, state in states)
+            for key, label, state in states if not SELECTED_MODES or key in SELECTED_MODES)
         webui_status = WEBUI_UPDATES.status()
         webui_job = webui_status.get("job") or {}
         webui_card = ""
@@ -299,21 +317,21 @@ class Handler(BaseHTTPRequestHandler):
 {'<meta http-equiv="refresh" content="5">' if context_status['busy'] or webui_status['checking'] or webui_status['busy'] else ''}
 <title>AI Model Switcher</title><style>{benchmark_views.STYLE}{home_style}</style>
 <main><nav aria-label="Main navigation"><a href="/">AI Model Switcher</a><a href="/models">Find models</a><a href="/benchmarks">Benchmarks</a><a href="/sharing">Client sharing</a></nav>
-<header class="hero"><div class="hero-copy"><div class="eyebrow">Local AI / Control desk</div><h1>AI Model Switcher</h1><p>Manage GPU workloads and model context from one place.</p><div class="active-line"><span class="active-badge">Active workload</span><strong>{h(mode)}</strong></div></div></header>
+<header class="hero"><div class="hero-copy"><div class="eyebrow">Local AI / Control desk</div><h1>AI Model Switcher</h1><p>Manage local workloads and model context from one place.</p><div class="active-line"><span class="active-badge">Active workload</span><strong>{h(mode)}</strong></div></div></header>
 {webui_card}
 {webui_result}
 {f'<p class="message" role="status">{h(message)}</p>' if message else ''}
 <h2>Choose a workload</h2><div class="home-grid"><section class="card"><h3>Language model</h3>
 <form method="post" action="/switch"><input type="hidden" name="token" value="{h(CSRF)}"><label for="model">LLM model and saved context</label><br><select id="model" name="mode">{model_options}</select><button type="submit">Use selected model</button></form>
 <details><summary>Context for every model before loading</summary><table><tr><th>Model</th><th>Context</th></tr>{context_rows}</table></details>
-<div class="home-actions"><span class="note">Image and video workflow</span>
-<form method="post" action="/switch"><input type="hidden" name="token" value="{h(CSRF)}"><button name="mode" value="media">Use ComfyUI</button></form>
-</div><p class="note">Switching stops the other GPU workloads and interrupts active requests. In Open WebUI, choose the matching model after it starts.</p></section>
+{'' if SELECTED_MODES and 'media' not in SELECTED_MODES else '<div class="home-actions"><span class="note">Image and video workflow</span>'}
+{'' if SELECTED_MODES and 'media' not in SELECTED_MODES else f'''<form method="post" action="/switch"><input type="hidden" name="token" value="{h(CSRF)}"><button name="mode" value="media">Use ComfyUI</button></form></div>'''}
+<p class="note">Switching stops the other model workloads and interrupts active requests. In Open WebUI, choose the matching model after it starts.</p></section>
 <section class="card"><h3>Context tuning</h3>{context_form}{context_note}<p class="note">“Tuned” means the value passed a restart and readiness test on this hardware. Testing briefly interrupts requests; a failed test restores the previous setting. Larger context uses more memory and may reduce speed.</p></section></div>
 <h2>Service status</h2><div class="services">{status_cards}</div><p><a href="/">Refresh status</a></p>
-<section class="card"><h2>Live GPU status</h2><p class="gpu-note">GPU use and VRAM use over recent samples. Temperature and power are current readings. This panel refreshes every five seconds without reloading the switcher controls.</p><iframe class="gpu-frame" src="/gpu/graph" title="Live GPU utilization and memory graph" loading="lazy"></iframe></section>
+{'' if SELECTED_MODES and not any(item not in ('cpu-tiny','cpu-4b') for item in SELECTED_MODES) else '<section class="card"><h2>Live GPU status</h2><p class="gpu-note">GPU use and VRAM use over recent samples. Temperature and power are current readings. This panel refreshes every five seconds without reloading the switcher controls.</p><iframe class="gpu-frame" src="/gpu/graph" title="Live GPU utilization and memory graph" loading="lazy"></iframe></section>'}
 <p class="note">If a service fails, check ai-control.sh huihui-logs or media-logs. If Open WebUI still shows local-coder after switching, set its connection URL to http://nginx:8080/v1 in Admin → Settings → Connections.</p>
-<div class="home-footer"><a href="/models">Find models</a><a href="/benchmarks">Benchmarks and results</a><a href="/sharing">Client sharing and rate limits</a><a href="{h(WEB_URL)}">Open WebUI</a><a href="{h(COMFY_URL)}">ComfyUI</a></div></main></html>"""
+<div class="home-footer"><a href="/models">Find models</a><a href="/benchmarks">Benchmarks and results</a><a href="/sharing">Client sharing and rate limits</a><a href="{h(WEB_URL)}">Open WebUI</a>{'' if SELECTED_MODES and 'media' not in SELECTED_MODES else f'<a href="{h(COMFY_URL)}">ComfyUI</a>'}</div></main></html>"""
         data = page.encode()
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -363,8 +381,9 @@ class Handler(BaseHTTPRequestHandler):
             prefer_ablit = query.get("ablit", ["1"])[0] != "0"
             try:
                 hardware = MODEL_MANAGER.hardware()
-                DISCOVERY.maybe_refresh(hardware)
-                ENGINE_UPDATES.check_async()
+                if hardware.get("vram_mib"):
+                    DISCOVERY.maybe_refresh(hardware)
+                    ENGINE_UPDATES.check_async()
                 hardware, suggestions = MODEL_MANAGER.recommendations(prefer_ablit, hardware)
                 media_suggestions = MEDIA_MANAGER.recommendations(hardware, prefer_ablit)
                 self._send_html(model_views.index(hardware, suggestions, MODEL_MANAGER.installed(), MODEL_MANAGER.jobs(), CSRF,
@@ -472,6 +491,12 @@ class Handler(BaseHTTPRequestHandler):
                     backend = "gemma4-ablit:8080"
                 elif running(HUIHUI):
                     backend = "huihui:8080"
+                elif running(CPU_4B):
+                    backend = "cpu-4b:8080"
+                elif running(CPU_TINY):
+                    backend = "cpu-tiny:8080"
+                elif running(VISION):
+                    backend = "vision:8000"
                 else:
                     backend = next((item["container"] + ":8080" for item in MODEL_MANAGER.installed()
                                     if running(item["container"])), "llm:8000")
@@ -730,6 +755,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(403, "Invalid request")
             return
         mode = fields["mode"][0]
+        if SELECTED_MODES and mode not in SELECTED_MODES and not mode.startswith("hf-"):
+            self.send_error(403, "This workload was not selected at installation")
+            return
         if self.path == "/benchmark":
             if CONTEXT_TUNER.busy or ENGINE_UPDATES.busy or PARALLEL_TUNER.busy:
                 self.send_error(409, "Finish the context test or engine update before benchmarking")

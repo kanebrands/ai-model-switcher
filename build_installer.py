@@ -82,6 +82,7 @@ for target, marker, file in (
     ("gpu_control/fairness_gateway.py", "FAIRNESS_GATEWAY", "fairness_gateway.py"),
     ("gpu_control/gpu_metrics.py", "GPU_METRICS", "gpu_metrics.py"),
     ("gpu_control/parallel_tuning.py", "PARALLEL_TUNING", "parallel_tuning.py"),
+    ("gpu_control/install_profile.py", "INSTALL_PROFILE", "install_profile.py"),
     ("gpu_control/context_tuning.py", "CONTEXT_TUNING", "context_tuning.py"),
     ("gpu_control/media_catalog.py", "MEDIA_CATALOG", "media_catalog.py"),
 ):
@@ -90,6 +91,8 @@ modules += f"\ncat > \"$INSTALL_DIR/gpu_control/update-engine.sh\" <<'ENGINE_UPD
 modules += f"\ncat > \"$INSTALL_DIR/gpu_control/update-webui.sh\" <<'WEBUI_UPDATE_SCRIPT'\n{(root / 'update-webui.sh').read_text().rstrip()}\nWEBUI_UPDATE_SCRIPT\n"
 modules += f"\ncat > \"$INSTALL_DIR/gpu_control/tune-parallel.sh\" <<'PARALLEL_TUNE_SCRIPT'\n{(root / 'tune-parallel.sh').read_text().rstrip()}\nPARALLEL_TUNE_SCRIPT\n"
 modules += f"\ncat > \"$INSTALL_DIR/gpu_control/tune-context.sh\" <<'CONTEXT_TUNE_SCRIPT'\n{(root / 'tune-context.sh').read_text().rstrip()}\nCONTEXT_TUNE_SCRIPT\n"
+modules += f"\ncat > \"$INSTALL_DIR/gpu_control/install_models.sh\" <<'INSTALL_MODELS_SCRIPT'\n{(root / 'install_models.sh').read_text().rstrip()}\nINSTALL_MODELS_SCRIPT\n"
+modules += f"\ncat > \"$INSTALL_DIR/start-selected.sh\" <<'START_SELECTED_SCRIPT'\n{(root / 'start-selected.sh').read_text().rstrip()}\nSTART_SELECTED_SCRIPT\n"
 asset = base64.b64encode((root / "assets/gpu-workstation.webp").read_bytes()).decode("ascii")
 modules += ("\nmkdir -p \"$INSTALL_DIR/gpu_control/assets\"\n"
             "base64 -d > \"$INSTALL_DIR/gpu_control/assets/gpu-workstation.webp\" <<'GPU_HERO_WEBP'\n"
@@ -108,18 +111,11 @@ fi
 if [[ -d "$INSTALL_DIR/gpu_control/assets" && ! -w "$INSTALL_DIR/gpu_control/assets" ]]; then
   sudo chown "$(id -u):$(id -g)" "$INSTALL_DIR/gpu_control/assets"
 fi
-for generated in docker-compose.yml gpu_control/server.py gpu_control/benchmarks.py gpu_control/benchmark_views.py gpu_control/model_catalog.py gpu_control/model_views.py gpu_control/catalog_discovery.py gpu_control/engine_updates.py gpu_control/webui_updates.py gpu_control/sharing.py gpu_control/sharing_views.py gpu_control/fairness_gateway.py gpu_control/gpu_metrics.py gpu_control/parallel_tuning.py gpu_control/context_tuning.py gpu_control/update-engine.sh gpu_control/update-webui.sh gpu_control/tune-parallel.sh gpu_control/tune-context.sh gpu_control/media_catalog.py gpu_control/assets/gpu-workstation.webp ai-control.sh; do
+for generated in docker-compose.yml gpu_control/server.py gpu_control/benchmarks.py gpu_control/benchmark_views.py gpu_control/model_catalog.py gpu_control/model_views.py gpu_control/catalog_discovery.py gpu_control/engine_updates.py gpu_control/webui_updates.py gpu_control/sharing.py gpu_control/sharing_views.py gpu_control/fairness_gateway.py gpu_control/gpu_metrics.py gpu_control/parallel_tuning.py gpu_control/install_profile.py gpu_control/install_models.sh gpu_control/context_tuning.py gpu_control/update-engine.sh gpu_control/update-webui.sh gpu_control/tune-parallel.sh gpu_control/tune-context.sh gpu_control/media_catalog.py gpu_control/assets/gpu-workstation.webp ai-control.sh start-selected.sh; do
   if [[ -e "$INSTALL_DIR/$generated" && ! -w "$INSTALL_DIR/$generated" ]]; then
     sudo chown "$(id -u):$(id -g)" "$INSTALL_DIR/$generated"
   fi
 done''', 1)
-
-after_driver = 'DRIVER_VERSION=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -n 1)'
-assert source.count(after_driver) == 1
-source = source.replace(after_driver, after_driver + '''
-HOST_RAM_GIB=$(awk '/^MemTotal:/ {printf "%.1f", $2 / 1048576}' /proc/meminfo)
-[[ -n $HOST_RAM_GIB ]] || die 'Could not read host RAM from /proc/meminfo.'
-info "Ubuntu reports $HOST_RAM_GIB GiB of usable RAM; sizing CPU offload against that value"''', 1)
 
 anchor_helper = "sudo systemctl enable --now docker"
 assert source.count(anchor_helper) == 1
@@ -144,49 +140,25 @@ max_offload = max(0, min(64, int(ram_kib / 1048576 - 16)))
 if not 0.5 <= gpu_util < 1 or not 0.5 <= vision_gpu_util < 1 or not 0 <= offload <= max_offload:
     sys.exit(f'GPU utilization must be 0.5..<1; CPU offload must be 0..{max_offload} GiB on this host')''', 1)
 
-anchor = 'SWITCH_PASSWORD=$(sed -n \'s/^AI_SWITCH_PASSWORD=//p\' "$ENV_FILE" | head -n 1)'
-assert source.count(anchor) == 1
-downloads = '''# Keep every selectable GGUF model available after a fresh installation.
-# hf resumes incomplete files in the model directory and verifies Hub metadata.
-download_gguf() {
-  local repository=$1 filename=$2
-  [[ -s "$HUIHUI_MODEL_DIR/$filename" ]] && return 0
-  info "Downloading $filename to $HUIHUI_MODEL_DIR"
-  sudo docker run --rm -e HF_HOME=/tmp/hf \\
-    -v "$HUIHUI_MODEL_DIR:/models" --entrypoint hf \\
-    vllm/vllm-openai:v0.32.0-ubuntu2404 \\
-    download "$repository" "$filename" --local-dir /models
-  [[ -s "$HUIHUI_MODEL_DIR/$filename" ]] || die "Model download failed: $filename"
-}
-download_gguf bartowski/RecursiveSI_flint-GGUF RecursiveSI_flint-IQ4_XS.gguf
-download_gguf bartowski/RecursiveSI_flint-GGUF RecursiveSI_flint-Q3_K_M.gguf
-download_gguf mradermacher/DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic-GGUF DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic.Q5_K_M.gguf
-download_gguf IsValorum/Qwen3.8-35B-A3B-Distill-MTP-APEX-I-MiniPlus-V2.1-Abliterated-GGUF Qwen3.8-35B-A3B-Distill.APEX-I-MiniPlus-V2.1-Abliterated.gguf
-download_gguf bullerwins/Huihui-gemma-4-26B-A4B-it-abliterated-GGUF Huihui-gemma-4-26B-A4B-it-abliterated-Q4_K_M.gguf
-
-'''
-source = source.replace(anchor, downloads + anchor, 1)
-
 old_start = '''sudo docker compose --env-file .env --profile media --profile vision --profile huihui stop comfyui vision huihui
 sudo docker compose --env-file .env up -d
 sudo docker compose --env-file .env --profile media create --force-recreate comfyui
 sudo docker compose --env-file .env --profile vision create vision
 sudo docker compose --env-file .env --profile huihui create huihui'''
-new_start = '''sudo docker ps -q --filter label=local-ai.model-manager=1 | xargs -r sudo docker stop
-sudo docker compose --env-file .env --profile media --profile vision --profile huihui --profile qwen4b --profile flint --profile deepseek --profile qwen38 --profile gemma4 stop comfyui vision huihui qwen4b flint-iq4 flint-q3 deepseek-v4-distill qwen38-ablit gemma4-ablit
-sudo docker compose --env-file .env up -d
-sudo docker compose --env-file .env --profile media create comfyui
-sudo docker compose --env-file .env --profile vision create vision
-sudo docker compose --env-file .env --profile huihui create huihui
-sudo docker compose --env-file .env --profile qwen4b create qwen4b
-sudo docker compose --env-file .env --profile flint create flint-iq4 flint-q3
-sudo docker compose --env-file .env --profile deepseek create deepseek-v4-distill
-sudo docker compose --env-file .env --profile qwen38 create qwen38-ablit
-sudo docker compose --env-file .env --profile gemma4 create gemma4-ablit'''
+new_start = '''bash "$INSTALL_DIR/start-selected.sh"'''
 assert source.count(old_start) == 1
 source = source.replace(old_start, new_start, 1)
+old_build = 'sudo docker compose --env-file .env --profile media build comfyui\n'
+assert source.count(old_build) == 1
+source = source.replace(old_build, '', 1)
+source = source.replace("info 'Building ComfyUI and starting the LLM (downloads may take a while)'",
+                        "info 'Starting selected workloads (downloads may take a while)'", 1)
 
-source = source.replace("printf 'Model name: local-coder\\n'", "printf 'Host RAM visible to Ubuntu: %s GiB\\n' \"$HOST_RAM_GIB\"\nprintf 'Benchmarks: http://%s:%s/benchmarks\\n' \"$READY_BIND_IP\" \"$READY_CONTROL_PORT\"\nprintf 'Model name: local-coder\\n'", 1)
+# The base script embeds an older control helper. Keep the standalone installer
+# in sync with the maintained source helper used by this repository.
+source = replace_block(source, "ai-control.sh", "CONTROL", (root / "ai-control.sh").read_text())
+
+source = source.replace("printf 'Model name: local-coder\\n'", "printf 'Host RAM visible to Ubuntu: %s GiB\\n' \"$HOST_RAM_GIB\"\nprintf 'Benchmarks: http://%s:%s/benchmarks\\n' \"$READY_BIND_IP\" \"$READY_CONTROL_PORT\"\nprintf 'Initial model: %s (%s)\\n' \"$READY_SERVICE\" \"$READY_ALIAS\"", 1)
 
 path.write_text(source)
 print(f"Updated {path} ({len(source.splitlines())} lines)")

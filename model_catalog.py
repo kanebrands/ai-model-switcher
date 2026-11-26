@@ -138,6 +138,8 @@ class ModelManager:
         query = ["nvidia-smi", "--query-gpu=name,memory.total,uuid", "--format=csv,noheader,nounits"]
         output = None
         for _, container in MODELS.values():
+            if os.environ.get("AI_GPU_COMPATIBLE") == "0":
+                break
             try:
                 state = docker_api("GET", f"/containers/{container}/json")["State"]
                 if not state.get("Running"):
@@ -146,7 +148,7 @@ class ModelManager:
                 break
             except (RuntimeError, ValueError, IndexError, KeyError):
                 continue
-        if not output:
+        if not output and os.environ.get("AI_GPU_COMPATIBLE") != "0":
             # Probe independently of the selected model. This also works just
             # after a GPU replacement, before any model container is running.
             container_id = None
@@ -237,6 +239,8 @@ class ModelManager:
 
     def recommendations(self, prefer_ablit=True, hardware=None):
         hardware = hardware or self.hardware()
+        if not hardware.get("vram_mib"):
+            return hardware, []
         installed = {item["candidate_id"]: item for item in self.installed()}
         rates = self._baseline_rates(hardware["gpu"])
         def get(candidate):

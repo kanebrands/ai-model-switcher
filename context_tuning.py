@@ -12,7 +12,7 @@ import uuid
 from benchmarks import MODELS, docker_api, docker_stream_text
 
 
-SERVICES = {"llm": "llm", "qwen4b": "qwen4b", "huihui": "huihui",
+SERVICES = {"cpu-tiny": "cpu-tiny", "cpu-4b": "cpu-4b", "llm": "llm", "qwen4b": "qwen4b", "huihui": "huihui",
             "flint-iq4": "flint-iq4", "flint-q3": "flint-q3",
             "deepseek": "deepseek-v4-distill", "qwen38": "qwen38-ablit",
             "gemma4": "gemma4-ablit", "vision": "vision"}

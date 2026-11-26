@@ -6,6 +6,8 @@ action=${1:-}
 service=${2:-}
 tokens=${3:-}
 case "$service" in
+  cpu-tiny) key=AI_CPU_TINY_CONTEXT_TOKENS ;;
+  cpu-4b) key=AI_CPU_4B_CONTEXT_TOKENS ;;
   llm) key=AI_CONTEXT_TOKENS ;;
   qwen4b) key=AI_QWEN4B_CONTEXT_TOKENS ;;
   huihui) key=AI_HUIHUI_CONTEXT_TOKENS ;;
@@ -22,7 +24,7 @@ case "$tokens" in ''|*[!0-9]*) echo 'Invalid context size' >&2; exit 2;; esac
 [ $((tokens % 1024)) -eq 0 ] || { echo 'Context must be a multiple of 1024' >&2; exit 2; }
 
 compose() {
-  docker compose --env-file .env --profile qwen4b --profile huihui --profile flint \
+  docker compose --env-file .env --profile coder --profile cpu-tiny --profile cpu-4b --profile qwen4b --profile huihui --profile flint \
     --profile deepseek --profile qwen38 --profile gemma4 --profile vision "$@"
 }
 
@@ -42,12 +44,12 @@ save_context() {
 
 case "$action" in
   apply)
-    env "$key=$tokens" docker compose --env-file .env --profile qwen4b --profile huihui \
+    env "$key=$tokens" docker compose --env-file .env --profile coder --profile cpu-tiny --profile cpu-4b --profile qwen4b --profile huihui \
       --profile flint --profile deepseek --profile qwen38 --profile gemma4 --profile vision \
       up -d --no-deps --force-recreate --pull never "$service"
     ;;
   rollback)
-    env "$key=$tokens" docker compose --env-file .env --profile qwen4b --profile huihui \
+    env "$key=$tokens" docker compose --env-file .env --profile coder --profile cpu-tiny --profile cpu-4b --profile qwen4b --profile huihui \
       --profile flint --profile deepseek --profile qwen38 --profile gemma4 --profile vision \
       up -d --no-deps --force-recreate --pull never "$service"
     save_context

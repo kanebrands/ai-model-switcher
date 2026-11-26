@@ -1,4 +1,4 @@
-"""Fixed, repeatable local benchmarks for the GPU switcher.
+"""Fixed, repeatable local benchmarks for the AI model switcher.
 
 The email set is synthetic and deliberately small. Scores are a smoke test,
 not a measure of real-world mail-filter accuracy.
@@ -23,6 +23,8 @@ import uuid
 
 SUITE_VERSION = "2026-11-07-v2"
 MODELS = {
+    "cpu-tiny": ("local-cpu-tiny", "local-ai-cpu-tiny"),
+    "cpu-4b": ("local-cpu-4b", "local-ai-cpu-4b"),
     "llm": ("local-coder", "local-ai-llm"),
     "qwen4b": ("local-qwen4b", "local-ai-qwen4b"),
     "huihui": ("local-huihui", "local-ai-huihui"),

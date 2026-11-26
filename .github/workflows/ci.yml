@@ -20,5 +20,5 @@ jobs:
           git diff --exit-code -- ai-setup.sh
       - name: Check shell syntax
         run: |
-          bash -n ai-setup.base.sh ai-setup.sh ai-control.sh media-models.sh
+          bash -n ai-setup.base.sh ai-setup.sh ai-control.sh media-models.sh install_models.sh start-selected.sh
           sh -n tune-context.sh tune-parallel.sh update-engine.sh update-webui.sh

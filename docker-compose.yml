@@ -1,6 +1,29 @@
 name: local-ai
 services:
+  cpu-tiny:
+    profiles: [cpu-tiny]
+    image: ghcr.io/ggml-org/llama.cpp:server
+    container_name: local-ai-cpu-tiny
+    restart: unless-stopped
+    environment:
+      LLAMA_API_KEY: ${AI_API_KEY:?set AI_API_KEY in .env}
+    volumes:
+      - ${AI_MODEL_CACHE:?set AI_MODEL_CACHE in .env}/gguf:/models:ro
+    command: [--model, /models/Qwen3-0.6B-Q8_0.gguf, --alias, local-cpu-tiny, --host, 0.0.0.0, --port, '8080', --ctx-size, '${AI_CPU_TINY_CONTEXT_TOKENS:-4096}', --threads, '${AI_CPU_THREADS:-4}', --parallel, '${AI_CPU_TINY_PARALLEL_SLOTS:-1}']
+    networks: [ai_internal]
+  cpu-4b:
+    profiles: [cpu-4b]
+    image: ghcr.io/ggml-org/llama.cpp:server
+    container_name: local-ai-cpu-4b
+    restart: unless-stopped
+    environment:
+      LLAMA_API_KEY: ${AI_API_KEY:?set AI_API_KEY in .env}
+    volumes:
+      - ${AI_MODEL_CACHE:?set AI_MODEL_CACHE in .env}/gguf:/models:ro
+    command: [--model, /models/Qwen3-4B-Q4_K_M.gguf, --alias, local-cpu-4b, --host, 0.0.0.0, --port, '8080', --ctx-size, '${AI_CPU_4B_CONTEXT_TOKENS:-8192}', --threads, '${AI_CPU_THREADS:-4}', --parallel, '${AI_CPU_4B_PARALLEL_SLOTS:-1}']
+    networks: [ai_internal]
   llm:
+    profiles: [coder]
     image: vllm/vllm-openai:v0.32.0-ubuntu2404
     container_name: local-ai-llm
     restart: unless-stopped
@@ -386,8 +409,8 @@ services:
       ENABLE_OLLAMA_API: "false"
       OPENAI_API_BASE_URL: http://nginx:8080/v1
       OPENAI_API_KEY: ${AI_API_KEY:?set AI_API_KEY in .env}
-      OPENAI_API_BASE_URLS: http://nginx:8080/v1;http://vision:8000/v1
-      OPENAI_API_KEYS: ${AI_API_KEY:?set AI_API_KEY in .env};${AI_API_KEY:?set AI_API_KEY in .env}
+      OPENAI_API_BASE_URLS: http://nginx:8080/v1
+      OPENAI_API_KEYS: ${AI_API_KEY:?set AI_API_KEY in .env}
       WEBUI_SECRET_KEY: ${AI_WEBUI_SECRET_KEY:?set AI_WEBUI_SECRET_KEY in .env}
       WEBUI_URL: http://${AI_BIND_IP:?set AI_BIND_IP in .env}:${AI_WEB_PORT:-3000}
       CORS_ALLOW_ORIGIN: http://${AI_BIND_IP:?set AI_BIND_IP in .env}:${AI_WEB_PORT:-3000}
@@ -433,6 +456,8 @@ services:
       CONTROL_CSRF_TOKEN: ${AI_CONTROL_CSRF_TOKEN:?set AI_CONTROL_CSRF_TOKEN in .env}
       BENCHMARK_API_KEY: ${AI_API_KEY:?set AI_API_KEY in .env}
       BENCHMARK_COMFY_PASSWORD: ${AI_SWITCH_PASSWORD:?set AI_SWITCH_PASSWORD in .env}
+      AI_SELECTED_MODELS: ${AI_SELECTED_MODELS:-}
+      AI_GPU_COMPATIBLE: ${AI_GPU_COMPATIBLE:-1}
       BENCHMARK_DB: /app/data/benchmarks.sqlite3
       MODEL_HOST_DIR: ${AI_MODEL_CACHE:?set AI_MODEL_CACHE in .env}/gguf
       MODEL_DIR: /app/models

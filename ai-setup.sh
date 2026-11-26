@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Ubuntu 24.04, one RTX 3090: Docker + NVIDIA runtime + vLLM + ComfyUI + Open WebUI + nginx.
+# Ubuntu 24.04: Docker, a hardware-selected local model, Open WebUI, and nginx.
 set -Eeuo pipefail
 
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
@@ -63,38 +63,54 @@ fi
 if [[ -d "$INSTALL_DIR/gpu_control/assets" && ! -w "$INSTALL_DIR/gpu_control/assets" ]]; then
   sudo chown "$(id -u):$(id -g)" "$INSTALL_DIR/gpu_control/assets"
 fi
-for generated in docker-compose.yml gpu_control/server.py gpu_control/benchmarks.py gpu_control/benchmark_views.py gpu_control/model_catalog.py gpu_control/model_views.py gpu_control/catalog_discovery.py gpu_control/engine_updates.py gpu_control/webui_updates.py gpu_control/sharing.py gpu_control/sharing_views.py gpu_control/fairness_gateway.py gpu_control/gpu_metrics.py gpu_control/parallel_tuning.py gpu_control/context_tuning.py gpu_control/update-engine.sh gpu_control/update-webui.sh gpu_control/tune-parallel.sh gpu_control/tune-context.sh gpu_control/media_catalog.py gpu_control/assets/gpu-workstation.webp ai-control.sh; do
+for generated in docker-compose.yml gpu_control/server.py gpu_control/benchmarks.py gpu_control/benchmark_views.py gpu_control/model_catalog.py gpu_control/model_views.py gpu_control/catalog_discovery.py gpu_control/engine_updates.py gpu_control/webui_updates.py gpu_control/sharing.py gpu_control/sharing_views.py gpu_control/fairness_gateway.py gpu_control/gpu_metrics.py gpu_control/parallel_tuning.py gpu_control/install_profile.py gpu_control/install_models.sh gpu_control/context_tuning.py gpu_control/update-engine.sh gpu_control/update-webui.sh gpu_control/tune-parallel.sh gpu_control/tune-context.sh gpu_control/media_catalog.py gpu_control/assets/gpu-workstation.webp ai-control.sh start-selected.sh; do
   if [[ -e "$INSTALL_DIR/$generated" && ! -w "$INSTALL_DIR/$generated" ]]; then
     sudo chown "$(id -u):$(id -g)" "$INSTALL_DIR/$generated"
   fi
 done
 
-info 'Checking NVIDIA driver'
-if ! nvidia-smi >/dev/null 2>&1; then
-  if dpkg-query -W -f='${Status}' 'nvidia-driver-*' 2>/dev/null | grep -q 'install ok installed'; then
-    die 'An NVIDIA driver is installed but nvidia-smi fails. Reboot, then rerun. Check Secure Boot and driver status if it still fails.'
+info 'Detecting available compute hardware'
+NVIDIA_PCI=0
+for device in /sys/bus/pci/devices/*; do
+  [[ -f $device/vendor && -f $device/class ]] || continue
+  [[ $(<"$device/vendor") == 0x10de && $(<"$device/class") == 0x03* ]] && NVIDIA_PCI=1
+done
+GPU_NAME='none'
+GPU_VRAM_MIB=0
+GPU_COMPUTE_CAP=0
+GPU_CUDA_READY=0
+if command -v nvidia-smi >/dev/null && nvidia-smi >/dev/null 2>&1; then
+  GPU_DETAILS=$(nvidia-smi --query-gpu=name,memory.total,compute_cap,driver_version --format=csv,noheader,nounits 2>/dev/null | head -n 1 || true)
+  IFS=, read -r GPU_NAME GPU_VRAM_MIB GPU_COMPUTE_CAP DRIVER_VERSION <<< "$GPU_DETAILS"
+  GPU_NAME=${GPU_NAME## }
+  GPU_VRAM_MIB=${GPU_VRAM_MIB//[[:space:]]/}
+  GPU_COMPUTE_CAP=${GPU_COMPUTE_CAP//[[:space:]]/}
+  DRIVER_VERSION=${DRIVER_VERSION//[[:space:]]/}
+  if [[ $GPU_VRAM_MIB =~ ^[0-9]+$ && $GPU_COMPUTE_CAP =~ ^[0-9]+\.[0-9]+$ && $DRIVER_VERSION =~ ^[0-9]+(\.[0-9]+)+$ ]] && dpkg --compare-versions "$GPU_COMPUTE_CAP" ge 7.5; then
+    if dpkg --compare-versions "$DRIVER_VERSION" lt 580.65.06; then
+      sudo apt-get update
+      sudo apt-get install -y ubuntu-drivers-common
+      sudo ubuntu-drivers install
+      printf '\nUpdated NVIDIA driver for CUDA 13. Reboot, then run this script again.\n'
+      exit 0
+    fi
+    GPU_CUDA_READY=1
+  else
+    GPU_VRAM_MIB=0
+    info "GPU $GPU_NAME cannot run the included CUDA 13 profiles; CPU models remain available"
   fi
+elif (( NVIDIA_PCI )); then
   sudo apt-get update
   sudo apt-get install -y ubuntu-drivers-common
   sudo ubuntu-drivers install
-  printf '\nNVIDIA driver installed. Reboot Ubuntu, then run this same script again.\n'
+  printf '\nNVIDIA driver installed. Reboot, then run this script again.\n'
   exit 0
+else
+  info 'No NVIDIA GPU detected; installing a CPU inference profile'
 fi
-GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -n 1)
-[[ $GPU_NAME == *3090* ]] || die "Expected an RTX 3090; found: $GPU_NAME"
-GPU_COUNT=$(nvidia-smi --query-gpu=uuid --format=csv,noheader | wc -l)
-(( GPU_COUNT == 1 )) || die "Expected exactly one GPU; found $GPU_COUNT"
-DRIVER_VERSION=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -n 1)
 HOST_RAM_GIB=$(awk '/^MemTotal:/ {printf "%.1f", $2 / 1048576}' /proc/meminfo)
 [[ -n $HOST_RAM_GIB ]] || die 'Could not read host RAM from /proc/meminfo.'
-info "Ubuntu reports $HOST_RAM_GIB GiB of usable RAM; sizing CPU offload against that value"
-if dpkg --compare-versions "$DRIVER_VERSION" lt 580.65.06; then
-  sudo apt-get update
-  sudo apt-get install -y ubuntu-drivers-common
-  sudo ubuntu-drivers install
-  printf '\nCUDA 13.0 needs an NVIDIA driver at least 580.65.06. Reboot, then rerun this script.\n'
-  exit 0
-fi
+info "Ubuntu reports $HOST_RAM_GIB GiB of usable RAM"
 
 info 'Installing Docker Engine and Compose from the official repository'
 sudo apt-get update
@@ -119,23 +135,48 @@ sudo systemctl enable --now docker
 # to apply a llama.cpp engine update in the web interface.
 sudo docker pull docker:cli
 
-info 'Installing NVIDIA Container Toolkit'
-if ! dpkg-query -W -f='${Status}' nvidia-container-toolkit 2>/dev/null | grep -q 'install ok installed'; then
-  curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor --yes -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
-  curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
-    sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
-    sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list >/dev/null
-  sudo apt-get update
-  sudo apt-get install -y nvidia-container-toolkit
+if (( GPU_CUDA_READY )); then
+  info 'Installing NVIDIA Container Toolkit'
+  if ! dpkg-query -W -f='${Status}' nvidia-container-toolkit 2>/dev/null | grep -q 'install ok installed'; then
+    curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor --yes -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+    curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
+      sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
+      sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list >/dev/null
+    sudo apt-get update
+    sudo apt-get install -y nvidia-container-toolkit
+  fi
+  sudo nvidia-ctk runtime configure --runtime=docker
+  sudo systemctl restart docker
 fi
-sudo nvidia-ctk runtime configure --runtime=docker
-sudo systemctl restart docker
 
 info 'Writing the Compose stack, Open WebUI, and nginx proxy'
 cat > "$INSTALL_DIR/docker-compose.yml" <<'COMPOSE'
 name: local-ai
 services:
+  cpu-tiny:
+    profiles: [cpu-tiny]
+    image: ghcr.io/ggml-org/llama.cpp:server
+    container_name: local-ai-cpu-tiny
+    restart: unless-stopped
+    environment:
+      LLAMA_API_KEY: ${AI_API_KEY:?set AI_API_KEY in .env}
+    volumes:
+      - ${AI_MODEL_CACHE:?set AI_MODEL_CACHE in .env}/gguf:/models:ro
+    command: [--model, /models/Qwen3-0.6B-Q8_0.gguf, --alias, local-cpu-tiny, --host, 0.0.0.0, --port, '8080', --ctx-size, '${AI_CPU_TINY_CONTEXT_TOKENS:-4096}', --threads, '${AI_CPU_THREADS:-4}', --parallel, '${AI_CPU_TINY_PARALLEL_SLOTS:-1}']
+    networks: [ai_internal]
+  cpu-4b:
+    profiles: [cpu-4b]
+    image: ghcr.io/ggml-org/llama.cpp:server
+    container_name: local-ai-cpu-4b
+    restart: unless-stopped
+    environment:
+      LLAMA_API_KEY: ${AI_API_KEY:?set AI_API_KEY in .env}
+    volumes:
+      - ${AI_MODEL_CACHE:?set AI_MODEL_CACHE in .env}/gguf:/models:ro
+    command: [--model, /models/Qwen3-4B-Q4_K_M.gguf, --alias, local-cpu-4b, --host, 0.0.0.0, --port, '8080', --ctx-size, '${AI_CPU_4B_CONTEXT_TOKENS:-8192}', --threads, '${AI_CPU_THREADS:-4}', --parallel, '${AI_CPU_4B_PARALLEL_SLOTS:-1}']
+    networks: [ai_internal]
   llm:
+    profiles: [coder]
     image: vllm/vllm-openai:v0.32.0-ubuntu2404
     container_name: local-ai-llm
     restart: unless-stopped
@@ -521,8 +562,8 @@ services:
       ENABLE_OLLAMA_API: "false"
       OPENAI_API_BASE_URL: http://nginx:8080/v1
       OPENAI_API_KEY: ${AI_API_KEY:?set AI_API_KEY in .env}
-      OPENAI_API_BASE_URLS: http://nginx:8080/v1;http://vision:8000/v1
-      OPENAI_API_KEYS: ${AI_API_KEY:?set AI_API_KEY in .env};${AI_API_KEY:?set AI_API_KEY in .env}
+      OPENAI_API_BASE_URLS: http://nginx:8080/v1
+      OPENAI_API_KEYS: ${AI_API_KEY:?set AI_API_KEY in .env}
       WEBUI_SECRET_KEY: ${AI_WEBUI_SECRET_KEY:?set AI_WEBUI_SECRET_KEY in .env}
       WEBUI_URL: http://${AI_BIND_IP:?set AI_BIND_IP in .env}:${AI_WEB_PORT:-3000}
       CORS_ALLOW_ORIGIN: http://${AI_BIND_IP:?set AI_BIND_IP in .env}:${AI_WEB_PORT:-3000}
@@ -568,6 +609,8 @@ services:
       CONTROL_CSRF_TOKEN: ${AI_CONTROL_CSRF_TOKEN:?set AI_CONTROL_CSRF_TOKEN in .env}
       BENCHMARK_API_KEY: ${AI_API_KEY:?set AI_API_KEY in .env}
       BENCHMARK_COMFY_PASSWORD: ${AI_SWITCH_PASSWORD:?set AI_SWITCH_PASSWORD in .env}
+      AI_SELECTED_MODELS: ${AI_SELECTED_MODELS:-}
+      AI_GPU_COMPATIBLE: ${AI_GPU_COMPATIBLE:-1}
       BENCHMARK_DB: /app/data/benchmarks.sqlite3
       MODEL_HOST_DIR: ${AI_MODEL_CACHE:?set AI_MODEL_CACHE in .env}/gguf
       MODEL_DIR: /app/models
@@ -698,7 +741,7 @@ http {
     server {
         listen 3001;
         server_name _;
-        auth_basic "GPU switch";
+            auth_basic "AI Model Switcher";
         auth_basic_user_file /etc/nginx/.htpasswd;
         location / {
             proxy_pass http://gpu-control:8001;
@@ -800,7 +843,7 @@ fi
 
 cat > "$INSTALL_DIR/gpu_control/server.py" <<'GPU_CONTROLLER'
 #!/usr/bin/env python3
-"""Small, fixed-action GPU mode switch. Only nginx should expose this service."""
+"""Small, fixed-action model switch. Only nginx should expose this service."""
 import html
 import http.client
 import datetime as dt
@@ -829,6 +872,8 @@ import model_views
 
 SOCKET = "/var/run/docker.sock"
 LLM = "local-ai-llm"
+CPU_TINY = "local-ai-cpu-tiny"
+CPU_4B = "local-ai-cpu-4b"
 QWEN4B = "local-ai-qwen4b"
 HUIHUI = "local-ai-huihui"
 FLINT_IQ4 = "local-ai-flint-iq4"
@@ -843,8 +888,11 @@ ORIGIN = os.environ["CONTROL_ORIGIN"]
 WEB_URL = os.environ["WEB_URL"]
 COMFY_URL = os.environ["COMFY_URL"]
 CSRF = os.environ["CONTROL_CSRF_TOKEN"]
+SELECTED_MODES = {value for value in os.environ.get("AI_SELECTED_MODELS", "").split(",") if value}
 LOCK = threading.Lock()
 BUILTIN_LABELS = {
+    "cpu-tiny": "Qwen3 0.6B Q8 CPU (local-cpu-tiny)",
+    "cpu-4b": "Qwen3 4B Q4 CPU (local-cpu-4b)",
     "llm": "Qwen3 Coder 30B-A3B (local-coder)",
     "qwen4b": "Qwen3 4B Instruct 2507 (local-qwen4b)",
     "huihui": "Huihui Qwen3.6 35B-A3B Q3_K (local-huihui)",
@@ -908,6 +956,8 @@ def switch(target):
     workloads = {mode: container for mode, (_, container) in MODELS.items()}
     if target not in workloads:
         raise ValueError("Unknown mode")
+    if SELECTED_MODES and target not in SELECTED_MODES and not target.startswith("hf-"):
+        raise ValueError("This workload was not selected at installation")
     if ENGINE_UPDATES.busy or CONTEXT_TUNER.busy or PARALLEL_TUNER.busy:
         raise RuntimeError("Wait for the engine or context change to finish before switching models")
     with LOCK:
@@ -989,11 +1039,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def _page(self, message="", status=200):
         try:
-            llm_on, qwen4b_on, huihui_on, flint_iq4_on, flint_q3_on, deepseek_on, qwen38_on, gemma4_on, vision_on, media_on = (
-                running(LLM), running(QWEN4B), running(HUIHUI),
+            cpu_tiny_on, cpu_4b_on, llm_on, qwen4b_on, huihui_on, flint_iq4_on, flint_q3_on, deepseek_on, qwen38_on, gemma4_on, vision_on, media_on = (
+                running(CPU_TINY), running(CPU_4B), running(LLM), running(QWEN4B), running(HUIHUI),
                 running(FLINT_IQ4), running(FLINT_Q3), running(DEEPSEEK), running(QWEN38), running(GEMMA4), running(VISION), running(MEDIA)
             )
             huihui_state = workload_state(HUIHUI)
+            cpu_tiny_state = workload_state(CPU_TINY)
+            cpu_4b_state = workload_state(CPU_4B)
+            llm_state = workload_state(LLM)
+            vision_state = workload_state(VISION)
             qwen4b_state = workload_state(QWEN4B)
             flint_iq4_state = workload_state(FLINT_IQ4)
             flint_q3_state = workload_state(FLINT_Q3)
@@ -1003,12 +1057,13 @@ class Handler(BaseHTTPRequestHandler):
             media_state = workload_state(MEDIA)
             managed = MODEL_MANAGER.installed()
         except Exception as exc:
-            llm_on = qwen4b_on = huihui_on = flint_iq4_on = flint_q3_on = deepseek_on = qwen38_on = gemma4_on = vision_on = media_on = False
-            qwen4b_state = huihui_state = flint_iq4_state = flint_q3_state = deepseek_state = qwen38_state = gemma4_state = media_state = "unknown"
+            cpu_tiny_on = cpu_4b_on = llm_on = qwen4b_on = huihui_on = flint_iq4_on = flint_q3_on = deepseek_on = qwen38_on = gemma4_on = vision_on = media_on = False
+            cpu_tiny_state = cpu_4b_state = llm_state = vision_state = qwen4b_state = huihui_state = flint_iq4_state = flint_q3_state = deepseek_state = qwen38_state = gemma4_state = media_state = "unknown"
             message = f"Docker status error: {exc}"
             status = 503
             managed = []
-        active = [label for label, on in (("Coder", llm_on), ("Qwen3 4B", qwen4b_on),
+        active = [label for label, on in (("Qwen3 0.6B CPU", cpu_tiny_on), ("Qwen3 4B CPU", cpu_4b_on),
+                  ("Coder", llm_on), ("Qwen3 4B", qwen4b_on),
                   ("Huihui Qwen3.6", huihui_on), ("Flint IQ4_XS", flint_iq4_on),
                   ("Flint Q3_K_M", flint_q3_on), ("Vision", vision_on),
                   ("DeepSeek V4 distill Q5", deepseek_on),
@@ -1027,7 +1082,8 @@ class Handler(BaseHTTPRequestHandler):
             item = contexts.get(which) or {}
             tokens = item.get("tokens")
             return f'{tokens:,} tokens ({item["state"]})' if tokens else item.get("state", "unavailable")
-        model_labels = {**BUILTIN_LABELS,
+        model_labels = {**{key: value for key, value in BUILTIN_LABELS.items()
+                           if not SELECTED_MODES or key in SELECTED_MODES},
                         **{"hf-" + item["candidate_id"]: item["alias"] + " (Hugging Face)" for item in managed}}
         model_options = "".join(
             f'<option value="{h(which)}" {"selected" if contexts.get(which, {}).get("running") else ""}>'
@@ -1058,12 +1114,17 @@ class Handler(BaseHTTPRequestHandler):
                         '<button type="submit">Test and save context</button></form>') if context_active else '<p>Start one model to tune its context.</p>'
         if context_status["busy"]:
             context_form = '<p>Context test running. This page refreshes every five seconds.</p>'
-        states = (("Qwen 4B", qwen4b_state), ("Huihui", huihui_state), ("Flint IQ4", flint_iq4_state),
-                  ("Flint Q3", flint_q3_state), ("DeepSeek distill", deepseek_state),
-                  ("Qwen3.8 distill", qwen38_state), ("Gemma 4", gemma4_state), ("ComfyUI", media_state))
+        states = (("cpu-tiny", "Qwen3 0.6B CPU", cpu_tiny_state),
+                  ("cpu-4b", "Qwen3 4B CPU", cpu_4b_state),
+                  ("llm", "Qwen3 Coder", llm_state),
+                  ("vision", "Qwen3 VL", vision_state),
+                  ("qwen4b", "Qwen 4B", qwen4b_state), ("huihui", "Huihui", huihui_state),
+                  ("flint-iq4", "Flint IQ4", flint_iq4_state), ("flint-q3", "Flint Q3", flint_q3_state),
+                  ("deepseek", "DeepSeek distill", deepseek_state), ("qwen38", "Qwen3.8 distill", qwen38_state),
+                  ("gemma4", "Gemma 4", gemma4_state), ("media", "ComfyUI", media_state))
         status_cards = "".join(
             f'<div class="service"><span>{h(label)}</span><strong class="{"ready" if state in ("healthy", "running") else "idle"}">{h(state)}</strong></div>'
-            for label, state in states)
+            for key, label, state in states if not SELECTED_MODES or key in SELECTED_MODES)
         webui_status = WEBUI_UPDATES.status()
         webui_job = webui_status.get("job") or {}
         webui_card = ""
@@ -1100,21 +1161,21 @@ class Handler(BaseHTTPRequestHandler):
 {'<meta http-equiv="refresh" content="5">' if context_status['busy'] or webui_status['checking'] or webui_status['busy'] else ''}
 <title>AI Model Switcher</title><style>{benchmark_views.STYLE}{home_style}</style>
 <main><nav aria-label="Main navigation"><a href="/">AI Model Switcher</a><a href="/models">Find models</a><a href="/benchmarks">Benchmarks</a><a href="/sharing">Client sharing</a></nav>
-<header class="hero"><div class="hero-copy"><div class="eyebrow">Local AI / Control desk</div><h1>AI Model Switcher</h1><p>Manage GPU workloads and model context from one place.</p><div class="active-line"><span class="active-badge">Active workload</span><strong>{h(mode)}</strong></div></div></header>
+<header class="hero"><div class="hero-copy"><div class="eyebrow">Local AI / Control desk</div><h1>AI Model Switcher</h1><p>Manage local workloads and model context from one place.</p><div class="active-line"><span class="active-badge">Active workload</span><strong>{h(mode)}</strong></div></div></header>
 {webui_card}
 {webui_result}
 {f'<p class="message" role="status">{h(message)}</p>' if message else ''}
 <h2>Choose a workload</h2><div class="home-grid"><section class="card"><h3>Language model</h3>
 <form method="post" action="/switch"><input type="hidden" name="token" value="{h(CSRF)}"><label for="model">LLM model and saved context</label><br><select id="model" name="mode">{model_options}</select><button type="submit">Use selected model</button></form>
 <details><summary>Context for every model before loading</summary><table><tr><th>Model</th><th>Context</th></tr>{context_rows}</table></details>
-<div class="home-actions"><span class="note">Image and video workflow</span>
-<form method="post" action="/switch"><input type="hidden" name="token" value="{h(CSRF)}"><button name="mode" value="media">Use ComfyUI</button></form>
-</div><p class="note">Switching stops the other GPU workloads and interrupts active requests. In Open WebUI, choose the matching model after it starts.</p></section>
+{'' if SELECTED_MODES and 'media' not in SELECTED_MODES else '<div class="home-actions"><span class="note">Image and video workflow</span>'}
+{'' if SELECTED_MODES and 'media' not in SELECTED_MODES else f'''<form method="post" action="/switch"><input type="hidden" name="token" value="{h(CSRF)}"><button name="mode" value="media">Use ComfyUI</button></form></div>'''}
+<p class="note">Switching stops the other model workloads and interrupts active requests. In Open WebUI, choose the matching model after it starts.</p></section>
 <section class="card"><h3>Context tuning</h3>{context_form}{context_note}<p class="note">“Tuned” means the value passed a restart and readiness test on this hardware. Testing briefly interrupts requests; a failed test restores the previous setting. Larger context uses more memory and may reduce speed.</p></section></div>
 <h2>Service status</h2><div class="services">{status_cards}</div><p><a href="/">Refresh status</a></p>
-<section class="card"><h2>Live GPU status</h2><p class="gpu-note">GPU use and VRAM use over recent samples. Temperature and power are current readings. This panel refreshes every five seconds without reloading the switcher controls.</p><iframe class="gpu-frame" src="/gpu/graph" title="Live GPU utilization and memory graph" loading="lazy"></iframe></section>
+{'' if SELECTED_MODES and not any(item not in ('cpu-tiny','cpu-4b') for item in SELECTED_MODES) else '<section class="card"><h2>Live GPU status</h2><p class="gpu-note">GPU use and VRAM use over recent samples. Temperature and power are current readings. This panel refreshes every five seconds without reloading the switcher controls.</p><iframe class="gpu-frame" src="/gpu/graph" title="Live GPU utilization and memory graph" loading="lazy"></iframe></section>'}
 <p class="note">If a service fails, check ai-control.sh huihui-logs or media-logs. If Open WebUI still shows local-coder after switching, set its connection URL to http://nginx:8080/v1 in Admin → Settings → Connections.</p>
-<div class="home-footer"><a href="/models">Find models</a><a href="/benchmarks">Benchmarks and results</a><a href="/sharing">Client sharing and rate limits</a><a href="{h(WEB_URL)}">Open WebUI</a><a href="{h(COMFY_URL)}">ComfyUI</a></div></main></html>"""
+<div class="home-footer"><a href="/models">Find models</a><a href="/benchmarks">Benchmarks and results</a><a href="/sharing">Client sharing and rate limits</a><a href="{h(WEB_URL)}">Open WebUI</a>{'' if SELECTED_MODES and 'media' not in SELECTED_MODES else f'<a href="{h(COMFY_URL)}">ComfyUI</a>'}</div></main></html>"""
         data = page.encode()
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -1164,8 +1225,9 @@ class Handler(BaseHTTPRequestHandler):
             prefer_ablit = query.get("ablit", ["1"])[0] != "0"
             try:
                 hardware = MODEL_MANAGER.hardware()
-                DISCOVERY.maybe_refresh(hardware)
-                ENGINE_UPDATES.check_async()
+                if hardware.get("vram_mib"):
+                    DISCOVERY.maybe_refresh(hardware)
+                    ENGINE_UPDATES.check_async()
                 hardware, suggestions = MODEL_MANAGER.recommendations(prefer_ablit, hardware)
                 media_suggestions = MEDIA_MANAGER.recommendations(hardware, prefer_ablit)
                 self._send_html(model_views.index(hardware, suggestions, MODEL_MANAGER.installed(), MODEL_MANAGER.jobs(), CSRF,
@@ -1273,6 +1335,12 @@ class Handler(BaseHTTPRequestHandler):
                     backend = "gemma4-ablit:8080"
                 elif running(HUIHUI):
                     backend = "huihui:8080"
+                elif running(CPU_4B):
+                    backend = "cpu-4b:8080"
+                elif running(CPU_TINY):
+                    backend = "cpu-tiny:8080"
+                elif running(VISION):
+                    backend = "vision:8000"
                 else:
                     backend = next((item["container"] + ":8080" for item in MODEL_MANAGER.installed()
                                     if running(item["container"])), "llm:8000")
@@ -1531,6 +1599,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(403, "Invalid request")
             return
         mode = fields["mode"][0]
+        if SELECTED_MODES and mode not in SELECTED_MODES and not mode.startswith("hf-"):
+            self.send_error(403, "This workload was not selected at installation")
+            return
         if self.path == "/benchmark":
             if CONTEXT_TUNER.busy or ENGINE_UPDATES.busy or PARALLEL_TUNER.busy:
                 self.send_error(409, "Finish the context test or engine update before benchmarking")
@@ -1560,7 +1631,7 @@ if __name__ == "__main__":
 GPU_CONTROLLER
 
 cat > "$INSTALL_DIR/gpu_control/benchmarks.py" <<'BENCHMARK_RUNNER'
-"""Fixed, repeatable local benchmarks for the GPU switcher.
+"""Fixed, repeatable local benchmarks for the AI model switcher.
 
 The email set is synthetic and deliberately small. Scores are a smoke test,
 not a measure of real-world mail-filter accuracy.
@@ -1585,6 +1656,8 @@ import uuid
 
 SUITE_VERSION = "2026-11-07-v2"
 MODELS = {
+    "cpu-tiny": ("local-cpu-tiny", "local-ai-cpu-tiny"),
+    "cpu-4b": ("local-cpu-4b", "local-ai-cpu-4b"),
     "llm": ("local-coder", "local-ai-llm"),
     "qwen4b": ("local-qwen4b", "local-ai-qwen4b"),
     "huihui": ("local-huihui", "local-ai-huihui"),
@@ -2036,6 +2109,7 @@ BENCHMARK_RUNNER
 cat > "$INSTALL_DIR/gpu_control/benchmark_views.py" <<'BENCHMARK_VIEWS'
 """Escaped, no-JavaScript pages for persisted benchmark results."""
 import html
+import os
 import json
 import statistics
 import urllib.parse
@@ -2180,7 +2254,10 @@ def index(runs, csrf, message="", active_mode=None, sort="tokens_per_second", di
         sort = "tokens_per_second"
     if direction not in ("asc", "desc"):
         direction = "desc"
-    options = "".join(f'<option value="{esc(mode)}" {"selected" if mode == active_mode else ""}>{esc(alias)} ({esc(mode)})</option>' for mode, (alias, _) in MODELS.items())
+    selected_modes = {value for value in os.environ.get("AI_SELECTED_MODELS", "").split(",") if value}
+    options = "".join(f'<option value="{esc(mode)}" {"selected" if mode == active_mode else ""}>{esc(alias)} ({esc(mode)})</option>'
+                      for mode, (alias, _) in MODELS.items()
+                      if not selected_modes or mode in selected_modes or mode.startswith("hf-"))
     headers = []
     for key, title in COLUMNS:
         next_direction = ("asc" if direction == "desc" else "desc") if key == sort else ("asc" if key in TEXT_ASCENDING else "desc")
@@ -2461,6 +2538,8 @@ class ModelManager:
         query = ["nvidia-smi", "--query-gpu=name,memory.total,uuid", "--format=csv,noheader,nounits"]
         output = None
         for _, container in MODELS.values():
+            if os.environ.get("AI_GPU_COMPATIBLE") == "0":
+                break
             try:
                 state = docker_api("GET", f"/containers/{container}/json")["State"]
                 if not state.get("Running"):
@@ -2469,7 +2548,7 @@ class ModelManager:
                 break
             except (RuntimeError, ValueError, IndexError, KeyError):
                 continue
-        if not output:
+        if not output and os.environ.get("AI_GPU_COMPATIBLE") != "0":
             # Probe independently of the selected model. This also works just
             # after a GPU replacement, before any model container is running.
             container_id = None
@@ -2560,6 +2639,8 @@ class ModelManager:
 
     def recommendations(self, prefer_ablit=True, hardware=None):
         hardware = hardware or self.hardware()
+        if not hardware.get("vram_mib"):
+            return hardware, []
         installed = {item["candidate_id"]: item for item in self.installed()}
         rates = self._baseline_rates(hardware["gpu"])
         def get(candidate):
@@ -2780,6 +2861,14 @@ def index(hardware, suggestions, installed, jobs, csrf, prefer_ablit=True,
                      'CPU details are shown, but CPU upgrades do not increase the GPU memory available to models.</p>'
                      f'<form method="post" action="/models/hardware/rescan"><input type="hidden" name="token" value="{esc(csrf)}">'
                      '<button type="submit">Rescan hardware and suggestions</button></form>')
+    if not hardware.get("vram_mib"):
+        body = ('<section class="card">' + hardware_line + '</section>'
+                '<section class="card"><h2>CPU model choices</h2>'
+                '<p>The current installation has no compatible NVIDIA GPU. The installer offers CPU models according to detected RAM. '
+                'Installed choices are available on the switcher home page. To change the selection, rerun the installer with '
+                '<code>AI_MODEL_SELECTION=cpu-tiny,cpu-4b</code> after checking which choices fit this host. '
+                'The GPU catalog and engine updates appear when a supported GPU is detected and the installer is rerun.</p></section>')
+        return shell("Hardware and model choices", body, wide=True)
     discovery = discovery or {"status": "not checked", "items": [], "query": "", "error": None}
     engine = engine or {"checked_at": None, "checking": False, "update_available": None,
                         "local_build": None, "error": None, "job": None, "busy": False}
@@ -4406,6 +4495,107 @@ class ParallelTuner:
                 self.busy = False
 PARALLEL_TUNING
 
+cat > "$INSTALL_DIR/gpu_control/install_profile.py" <<'INSTALL_PROFILE'
+"""Choose installer workloads from detected RAM and NVIDIA GPU capacity."""
+import os
+from pathlib import Path
+import re
+import sys
+
+
+# Sizes are approximate transfer sizes. The exact files are downloaded by the installer.
+CATALOG = (
+    ("cpu-tiny", "Qwen3 0.6B Q8 (CPU, light chat)", 4, 0, "0.7 GB"),
+    ("cpu-4b", "Qwen3 4B Q4_K_M (CPU, general chat)", 12, 0, "2.5 GB"),
+    ("qwen4b", "Qwen3 4B Instruct 2507 (vLLM, fast chat)", 16, 16, "~9 GB"),
+    ("deepseek", "DeepSeek V4 distill 9B Q5 (classification/coding)", 24, 12, "~7 GB"),
+    ("llm", "Qwen3 Coder 30B-A3B AWQ (coding)", 32, 24, "~20 GB"),
+    ("huihui", "Huihui Qwen3.6 35B-A3B Q3 (MoE chat)", 32, 24, "17.2 GB"),
+    ("flint-q3", "Flint 40B-A2.5B Q3 (MoE classification)", 48, 24, "~22 GB"),
+    ("flint-iq4", "Flint 40B-A2.5B IQ4 (MoE classification)", 64, 32, "~26 GB"),
+    ("qwen38", "Qwen3.8 35B-A3B abliterated (MoE)", 48, 24, "~21 GB"),
+    ("gemma4", "Gemma 4 26B-A4B abliterated (MoE)", 48, 24, "~17 GB"),
+    ("vision", "Qwen3-VL 30B-A3B AWQ (vision)", 48, 24, "~20 GB"),
+    ("media", "ComfyUI runtime (image/video models chosen later)", 16, 8, "container only"),
+)
+
+
+def eligible(ram_gib, vram_gib):
+    return [item for item in CATALOG if ram_gib >= item[2] and vram_gib >= item[3]]
+
+
+def select(raw, available):
+    ids = {item[0] for item in available}
+    pieces = [piece.strip() for piece in raw.split(",")]
+    selected = []
+    for piece in pieces:
+        if piece.isdecimal() and 1 <= int(piece) <= len(available):
+            piece = available[int(piece) - 1][0]
+        if piece not in ids:
+            raise ValueError(f"Unavailable selection: {piece or '(empty)'}")
+        if piece not in selected:
+            selected.append(piece)
+    if not any(item != "media" for item in selected):
+        raise ValueError("Select at least one language model")
+    return selected
+
+
+def update_env(path, values):
+    old = path.read_text()
+    for key, value in values.items():
+        line = f"{key}={value}"
+        pattern = rf"(?m)^{re.escape(key)}=.*$"
+        old, count = re.subn(pattern, line, old)
+        if not count:
+            old += ("" if old.endswith("\n") else "\n") + line + "\n"
+    temporary = path.with_suffix(".selection.tmp")
+    temporary.write_text(old)
+    temporary.chmod(path.stat().st_mode & 0o777)
+    temporary.replace(path)
+
+
+def main():
+    env_path = Path(sys.argv[1])
+    ram_gib = float(sys.argv[2])
+    vram_gib = int(sys.argv[3]) / 1024
+    available = eligible(ram_gib, vram_gib)
+    if not available:
+        raise SystemExit("At least 4 GiB RAM is needed for this stack")
+    print(f"Detected RAM: {ram_gib:.1f} GiB; usable NVIDIA VRAM: {vram_gib:.1f} GiB")
+    print("Recommended choices for this hardware (approximate download size):")
+    for number, (ident, name, _, _, size) in enumerate(available, 1):
+        print(f"  {number:2}. {name} [{ident}] — {size}")
+    existing = dict(line.split("=", 1) for line in env_path.read_text().splitlines() if "=" in line)
+    requested = os.environ.get("AI_MODEL_SELECTION")
+    if requested:
+        print("Using explicit AI_MODEL_SELECTION")
+    elif existing.get("AI_SELECTED_MODELS"):
+        requested = existing["AI_SELECTED_MODELS"]
+        try:
+            select(requested, available)
+        except ValueError:
+            requested = None
+            print("Previously selected models no longer fit the detected hardware")
+        else:
+            print("Keeping the previously selected models")
+    if not requested:
+        if not sys.stdin.isatty():
+            raise SystemExit("Interactive model selection needs a terminal. Set AI_MODEL_SELECTION to comma-separated IDs for unattended installation.")
+        requested = input("Enter one or more numbers or IDs, separated by commas: ").strip()
+    try:
+        chosen = select(requested, available)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from None
+    first = next(item for item in chosen if item != "media")
+    update_env(env_path, {"AI_SELECTED_MODELS": ",".join(chosen), "AI_START_MODEL": first})
+    print("Selected:", ", ".join(chosen))
+    print("Initial workload:", first)
+
+
+if __name__ == "__main__":
+    main()
+INSTALL_PROFILE
+
 cat > "$INSTALL_DIR/gpu_control/context_tuning.py" <<'CONTEXT_TUNING'
 """Test and persist context changes for the active text or vision model."""
 import datetime as dt
@@ -4421,7 +4611,7 @@ import uuid
 from benchmarks import MODELS, docker_api, docker_stream_text
 
 
-SERVICES = {"llm": "llm", "qwen4b": "qwen4b", "huihui": "huihui",
+SERVICES = {"cpu-tiny": "cpu-tiny", "cpu-4b": "cpu-4b", "llm": "llm", "qwen4b": "qwen4b", "huihui": "huihui",
             "flint-iq4": "flint-iq4", "flint-q3": "flint-q3",
             "deepseek": "deepseek-v4-distill", "qwen38": "qwen38-ablit",
             "gemma4": "gemma4-ablit", "vision": "vision"}
@@ -5104,6 +5294,8 @@ action=${1:-}
 service=${2:-}
 slots=${3:-}
 case "$service" in
+  cpu-tiny) key=AI_CPU_TINY_PARALLEL_SLOTS ;;
+  cpu-4b) key=AI_CPU_4B_PARALLEL_SLOTS ;;
   llm) key=AI_CODER_PARALLEL_SLOTS ;;
   qwen4b) key=AI_QWEN4B_PARALLEL_SLOTS ;;
   huihui) key=AI_HUIHUI_PARALLEL_SLOTS ;;
@@ -5133,7 +5325,7 @@ save_slots() {
 }
 
 compose() {
-  env "$key=$slots" docker compose --env-file .env --profile qwen4b --profile huihui \
+  env "$key=$slots" docker compose --env-file .env --profile coder --profile cpu-tiny --profile cpu-4b --profile qwen4b --profile huihui \
     --profile flint --profile deepseek --profile qwen38 --profile gemma4 --profile vision \
     up -d --no-deps --force-recreate --pull never "$service"
 }
@@ -5154,6 +5346,8 @@ action=${1:-}
 service=${2:-}
 tokens=${3:-}
 case "$service" in
+  cpu-tiny) key=AI_CPU_TINY_CONTEXT_TOKENS ;;
+  cpu-4b) key=AI_CPU_4B_CONTEXT_TOKENS ;;
   llm) key=AI_CONTEXT_TOKENS ;;
   qwen4b) key=AI_QWEN4B_CONTEXT_TOKENS ;;
   huihui) key=AI_HUIHUI_CONTEXT_TOKENS ;;
@@ -5170,7 +5364,7 @@ case "$tokens" in ''|*[!0-9]*) echo 'Invalid context size' >&2; exit 2;; esac
 [ $((tokens % 1024)) -eq 0 ] || { echo 'Context must be a multiple of 1024' >&2; exit 2; }
 
 compose() {
-  docker compose --env-file .env --profile qwen4b --profile huihui --profile flint \
+  docker compose --env-file .env --profile coder --profile cpu-tiny --profile cpu-4b --profile qwen4b --profile huihui --profile flint \
     --profile deepseek --profile qwen38 --profile gemma4 --profile vision "$@"
 }
 
@@ -5190,12 +5384,12 @@ save_context() {
 
 case "$action" in
   apply)
-    env "$key=$tokens" docker compose --env-file .env --profile qwen4b --profile huihui \
+    env "$key=$tokens" docker compose --env-file .env --profile coder --profile cpu-tiny --profile cpu-4b --profile qwen4b --profile huihui \
       --profile flint --profile deepseek --profile qwen38 --profile gemma4 --profile vision \
       up -d --no-deps --force-recreate --pull never "$service"
     ;;
   rollback)
-    env "$key=$tokens" docker compose --env-file .env --profile qwen4b --profile huihui \
+    env "$key=$tokens" docker compose --env-file .env --profile coder --profile cpu-tiny --profile cpu-4b --profile qwen4b --profile huihui \
       --profile flint --profile deepseek --profile qwen38 --profile gemma4 --profile vision \
       up -d --no-deps --force-recreate --pull never "$service"
     save_context
@@ -5206,6 +5400,113 @@ case "$action" in
   *) echo 'Invalid context action' >&2; exit 2 ;;
 esac
 CONTEXT_TUNE_SCRIPT
+
+cat > "$INSTALL_DIR/gpu_control/install_models.sh" <<'INSTALL_MODELS_SCRIPT'
+#!/usr/bin/env bash
+# Download only the models chosen in the hardware-aware installer prompt.
+set -Eeuo pipefail
+INSTALL_DIR=${1:?installation directory required}
+ENV_FILE="$INSTALL_DIR/.env"
+MODEL_CACHE=$(sed -n 's/^AI_MODEL_CACHE=//p' "$ENV_FILE" | head -n 1)
+SELECTED=$(sed -n 's/^AI_SELECTED_MODELS=//p' "$ENV_FILE" | head -n 1)
+[[ $MODEL_CACHE == /* && -n $SELECTED ]] || { echo 'Missing model cache or selection' >&2; exit 1; }
+mkdir -p "$MODEL_CACHE/gguf"
+
+gguf() {
+  local repo=$1 file=$2 min_bytes=$3 destination="$MODEL_CACHE/gguf/$2" partial="$MODEL_CACHE/gguf/$2.part"
+  if [[ -s $destination && $(stat -c %s "$destination") -ge $min_bytes ]]; then
+    printf 'Already downloaded: %s\n' "$destination"
+    return
+  fi
+  printf 'Downloading %s into %s\n' "$repo/$file" "$partial"
+  curl --fail --location --retry 5 --retry-delay 3 --continue-at - \
+    --output "$partial" "https://huggingface.co/$repo/resolve/main/$file"
+  [[ $(stat -c %s "$partial") -ge $min_bytes ]] || { echo "Download incomplete: $partial" >&2; exit 1; }
+  mv "$partial" "$destination"
+}
+
+hf_repo() {
+  local repo=$1
+  printf 'Downloading selected Hugging Face model: %s\n' "$repo"
+  sudo docker run --rm -e HF_HOME=/root/.cache/huggingface \
+    -v "$MODEL_CACHE:/root/.cache/huggingface" --entrypoint python \
+    vllm/vllm-openai:v0.32.0-ubuntu2404 \
+    -c 'import sys; from huggingface_hub import snapshot_download; snapshot_download(sys.argv[1])' "$repo"
+}
+
+IFS=, read -ra models <<< "$SELECTED"
+for model in "${models[@]}"; do
+  case "$model" in
+    cpu-tiny) gguf Qwen/Qwen3-0.6B-GGUF Qwen3-0.6B-Q8_0.gguf 600000000 ;;
+    cpu-4b) gguf Qwen/Qwen3-4B-GGUF Qwen3-4B-Q4_K_M.gguf 2400000000 ;;
+    qwen4b) hf_repo Qwen/Qwen3-4B-Instruct-2507 ;;
+    llm) hf_repo cyankiwi/Qwen3-Coder-30B-A3B-Instruct-AWQ-4bit ;;
+    huihui) gguf huihui-ai/Huihui-Qwen3.6-35B-A3B-abliterated-MTP-GGUF Huihui-Qwen3.6-35B-A3B-abliterated-ggml-model-Q3_K.gguf 16000000000
+            ln -sf Huihui-Qwen3.6-35B-A3B-abliterated-ggml-model-Q3_K.gguf "$MODEL_CACHE/gguf/huihui-qwen3.6-35b-a3b-q3_k.gguf" ;;
+    flint-iq4) gguf bartowski/RecursiveSI_flint-GGUF RecursiveSI_flint-IQ4_XS.gguf 10000000000 ;;
+    flint-q3) gguf bartowski/RecursiveSI_flint-GGUF RecursiveSI_flint-Q3_K_M.gguf 10000000000 ;;
+    deepseek) gguf mradermacher/DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic-GGUF DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic.Q5_K_M.gguf 3000000000 ;;
+    qwen38) gguf IsValorum/Qwen3.8-35B-A3B-Distill-MTP-APEX-I-MiniPlus-V2.1-Abliterated-GGUF Qwen3.8-35B-A3B-Distill.APEX-I-MiniPlus-V2.1-Abliterated.gguf 10000000000 ;;
+    gemma4) gguf bullerwins/Huihui-gemma-4-26B-A4B-it-abliterated-GGUF Huihui-gemma-4-26B-A4B-it-abliterated-Q4_K_M.gguf 10000000000 ;;
+    vision) hf_repo QuantTrio/Qwen3-VL-30B-A3B-Instruct-AWQ ;;
+    media) ;; # ComfyUI runtime; image/video models are chosen in the switcher later.
+    *) echo "Unsupported selected model: $model" >&2; exit 2 ;;
+  esac
+done
+INSTALL_MODELS_SCRIPT
+
+cat > "$INSTALL_DIR/start-selected.sh" <<'START_SELECTED_SCRIPT'
+#!/usr/bin/env bash
+# Start only the workloads explicitly selected at installation.
+set -Eeuo pipefail
+DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+cd "$DIR"
+[[ -s .env ]] || { echo 'Missing .env' >&2; exit 1; }
+compose() { sudo docker compose --env-file .env "$@"; }
+all_profiles=(--profile coder --profile cpu-tiny --profile cpu-4b --profile qwen4b
+              --profile huihui --profile flint --profile deepseek --profile qwen38
+              --profile gemma4 --profile vision --profile media)
+all_services=(llm cpu-tiny cpu-4b qwen4b huihui flint-iq4 flint-q3
+              deepseek-v4-distill qwen38-ablit gemma4-ablit vision comfyui)
+
+service_for() {
+  case "$1" in
+    cpu-tiny) profile=cpu-tiny; service=cpu-tiny; alias=local-cpu-tiny ;;
+    cpu-4b) profile=cpu-4b; service=cpu-4b; alias=local-cpu-4b ;;
+    llm) profile=coder; service=llm; alias=local-coder ;;
+    qwen4b) profile=qwen4b; service=qwen4b; alias=local-qwen4b ;;
+    huihui) profile=huihui; service=huihui; alias=local-huihui ;;
+    flint-iq4) profile=flint; service=flint-iq4; alias=local-flint-iq4 ;;
+    flint-q3) profile=flint; service=flint-q3; alias=local-flint-q3 ;;
+    deepseek) profile=deepseek; service=deepseek-v4-distill; alias=local-deepseek-v4-distill ;;
+    qwen38) profile=qwen38; service=qwen38-ablit; alias=local-qwen38-ablit ;;
+    gemma4) profile=gemma4; service=gemma4-ablit; alias=local-gemma4-ablit ;;
+    vision) profile=vision; service=vision; alias=local-vision ;;
+    media) profile=media; service=comfyui; alias=ComfyUI ;;
+    *) echo "Unknown selected model: $1" >&2; return 2 ;;
+  esac
+}
+
+selected=$(sed -n 's/^AI_SELECTED_MODELS=//p' .env | head -n 1)
+active=$(sed -n 's/^AI_START_MODEL=//p' .env | head -n 1)
+[[ -n $selected && -n $active ]] || { echo 'Run the installer to select models first' >&2; exit 1; }
+IFS=, read -ra models <<< "$selected"
+[[ " ,$selected," == *",$active,"* ]] || { echo 'Initial model is not in selection' >&2; exit 1; }
+
+sudo docker ps -q --filter label=local-ai.model-manager=1 | xargs -r sudo docker stop
+compose "${all_profiles[@]}" stop "${all_services[@]}"
+compose up -d
+for model in "${models[@]}"; do
+  service_for "$model"
+  if [[ $model == media ]]; then
+    compose --profile media build comfyui
+  fi
+  compose --profile "$profile" create "$service"
+done
+service_for "$active"
+compose --profile "$profile" up -d --no-deps "$service"
+printf 'Started %s (%s)\n' "$active" "$alias"
+START_SELECTED_SCRIPT
 
 mkdir -p "$INSTALL_DIR/gpu_control/assets"
 base64 -d > "$INSTALL_DIR/gpu_control/assets/gpu-workstation.webp" <<'GPU_HERO_WEBP'
@@ -5365,40 +5666,19 @@ ACTUAL_MEDIA_DIR=$(sed -n 's/^AI_MEDIA_DIR=//p' "$ENV_FILE" | head -n 1)
 mkdir -p "$ACTUAL_MEDIA_DIR/models" "$ACTUAL_MEDIA_DIR/input" "$ACTUAL_MEDIA_DIR/output" "$ACTUAL_MEDIA_DIR/user" "$ACTUAL_MEDIA_DIR/temp"
 ACTUAL_MODEL_CACHE=$(sed -n 's/^AI_MODEL_CACHE=//p' "$ENV_FILE" | head -n 1)
 [[ $ACTUAL_MODEL_CACHE == /* ]] || die 'AI_MODEL_CACHE in .env must be an absolute path.'
-HUIHUI_MODEL_DIR="$ACTUAL_MODEL_CACHE/gguf"
-HUIHUI_MODEL_FILE="$HUIHUI_MODEL_DIR/huihui-qwen3.6-35b-a3b-q3_k.gguf"
-HUIHUI_PARTIAL="$HUIHUI_MODEL_FILE.part"
-mkdir -p "$HUIHUI_MODEL_DIR"
-if [[ -f $HUIHUI_MODEL_FILE && $(stat -c %s "$HUIHUI_MODEL_FILE") -lt 16000000000 ]]; then
-  mv "$HUIHUI_MODEL_FILE" "$HUIHUI_PARTIAL"
+CPU_THREADS=$(nproc)
+(( CPU_THREADS > 2 )) && CPU_THREADS=$((CPU_THREADS - 2))
+if ! grep -q '^AI_CPU_THREADS=' "$ENV_FILE"; then
+  printf 'AI_CPU_THREADS=%s\n' "$CPU_THREADS" >> "$ENV_FILE"
 fi
-if [[ ! -s $HUIHUI_MODEL_FILE ]]; then
-  info 'Downloading Huihui Qwen3.6 35B-A3B Q3_K GGUF (17.2 GB; resumable)'
-  printf 'Download progress file: %s\n' "$HUIHUI_PARTIAL"
-  curl --fail --location --retry 5 --retry-delay 3 --continue-at - \
-    --output "$HUIHUI_PARTIAL" \
-    'https://huggingface.co/huihui-ai/Huihui-Qwen3.6-35B-A3B-abliterated-MTP-GGUF/resolve/main/Huihui-Qwen3.6-35B-A3B-abliterated-ggml-model-Q3_K.gguf'
-  [[ $(stat -c %s "$HUIHUI_PARTIAL") -ge 16000000000 ]] || die "Huihui download is incomplete: $HUIHUI_PARTIAL"
-  mv "$HUIHUI_PARTIAL" "$HUIHUI_MODEL_FILE"
+if grep -q '^AI_GPU_COMPATIBLE=' "$ENV_FILE"; then
+  sed -i "s/^AI_GPU_COMPATIBLE=.*/AI_GPU_COMPATIBLE=$GPU_CUDA_READY/" "$ENV_FILE"
+else
+  printf 'AI_GPU_COMPATIBLE=%s\n' "$GPU_CUDA_READY" >> "$ENV_FILE"
 fi
-# Keep every selectable GGUF model available after a fresh installation.
-# hf resumes incomplete files in the model directory and verifies Hub metadata.
-download_gguf() {
-  local repository=$1 filename=$2
-  [[ -s "$HUIHUI_MODEL_DIR/$filename" ]] && return 0
-  info "Downloading $filename to $HUIHUI_MODEL_DIR"
-  sudo docker run --rm -e HF_HOME=/tmp/hf \
-    -v "$HUIHUI_MODEL_DIR:/models" --entrypoint hf \
-    vllm/vllm-openai:v0.32.0-ubuntu2404 \
-    download "$repository" "$filename" --local-dir /models
-  [[ -s "$HUIHUI_MODEL_DIR/$filename" ]] || die "Model download failed: $filename"
-}
-download_gguf bartowski/RecursiveSI_flint-GGUF RecursiveSI_flint-IQ4_XS.gguf
-download_gguf bartowski/RecursiveSI_flint-GGUF RecursiveSI_flint-Q3_K_M.gguf
-download_gguf mradermacher/DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic-GGUF DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic.Q5_K_M.gguf
-download_gguf IsValorum/Qwen3.8-35B-A3B-Distill-MTP-APEX-I-MiniPlus-V2.1-Abliterated-GGUF Qwen3.8-35B-A3B-Distill.APEX-I-MiniPlus-V2.1-Abliterated.gguf
-download_gguf bullerwins/Huihui-gemma-4-26B-A4B-it-abliterated-GGUF Huihui-gemma-4-26B-A4B-it-abliterated-Q4_K_M.gguf
-
+info 'Selecting models for detected hardware'
+python3 "$INSTALL_DIR/gpu_control/install_profile.py" "$ENV_FILE" "$HOST_RAM_GIB" "$GPU_VRAM_MIB"
+bash "$INSTALL_DIR/gpu_control/install_models.sh" "$INSTALL_DIR"
 SWITCH_PASSWORD=$(sed -n 's/^AI_SWITCH_PASSWORD=//p' "$ENV_FILE" | head -n 1)
 printf 'operator:%s\n' "$(printf '%s' "$SWITCH_PASSWORD" | openssl passwd -apr1 -stdin)" > "$INSTALL_DIR/secure_proxy/.htpasswd"
 # Nginx's unprivileged worker reads this file on each authenticated request.
@@ -5425,37 +5705,23 @@ bind_ip=$(sed -n 's/^AI_BIND_IP=//p' .env | head -n 1)
 key=$(sed -n 's/^AI_API_KEY=//p' .env | head -n 1)
 case "${1:-help}" in
   start)
-    stop_managed_models
-    docker_cmd --profile media --profile vision --profile huihui --profile qwen4b --profile flint --profile deepseek --profile qwen38 --profile gemma4 stop comfyui vision huihui qwen4b flint-iq4 flint-q3 deepseek-v4-distill qwen38-ablit gemma4-ablit
-    docker_cmd up -d
-    docker_cmd --profile media create comfyui
-    docker_cmd --profile vision create vision
-    docker_cmd --profile huihui create huihui
-    docker_cmd --profile qwen4b create qwen4b
-    docker_cmd --profile flint create flint-iq4 flint-q3
-    docker_cmd --profile deepseek create deepseek-v4-distill
-    docker_cmd --profile qwen38 create qwen38-ablit
-    docker_cmd --profile gemma4 create gemma4-ablit
+    bash "$DIR/start-selected.sh"
     echo "API: http://$bind_ip:$port/v1"
     echo "WebUI: http://$bind_ip:$web_port"
-    echo "GPU switch: http://$bind_ip:$control_port"
+    echo "Model switcher: http://$bind_ip:$control_port"
     ;;
-  stop) stop_managed_models; docker_cmd --profile media --profile vision --profile huihui --profile qwen4b --profile flint --profile deepseek --profile qwen38 --profile gemma4 down ;;
+  stop) stop_managed_models; docker_cmd --profile coder --profile cpu-tiny --profile cpu-4b --profile media --profile vision --profile huihui --profile qwen4b --profile flint --profile deepseek --profile qwen38 --profile gemma4 down ;;
   restart)
     stop_managed_models
-    docker_cmd --profile media --profile vision --profile huihui --profile qwen4b --profile flint --profile deepseek --profile qwen38 --profile gemma4 down
-    docker_cmd up -d
-    docker_cmd --profile media create comfyui
-    docker_cmd --profile vision create vision
-    docker_cmd --profile huihui create huihui
-    docker_cmd --profile qwen4b create qwen4b
-    docker_cmd --profile flint create flint-iq4 flint-q3
-    docker_cmd --profile deepseek create deepseek-v4-distill
-    docker_cmd --profile qwen38 create qwen38-ablit
-    docker_cmd --profile gemma4 create gemma4-ablit
+    docker_cmd --profile coder --profile cpu-tiny --profile cpu-4b --profile media --profile vision --profile huihui --profile qwen4b --profile flint --profile deepseek --profile qwen38 --profile gemma4 down
+    bash "$DIR/start-selected.sh"
     ;;
-  status) docker_cmd --profile media --profile vision --profile huihui --profile qwen4b --profile flint --profile deepseek --profile qwen38 --profile gemma4 ps -a; sudo docker ps -a --filter label=local-ai.model-manager=1 --format 'Managed model: {{.Names}} {{.Status}}'; nvidia-smi ;;
+  status) docker_cmd --profile coder --profile cpu-tiny --profile cpu-4b --profile media --profile vision --profile huihui --profile qwen4b --profile flint --profile deepseek --profile qwen38 --profile gemma4 ps -a; sudo docker ps -a --filter label=local-ai.model-manager=1 --format 'Managed model: {{.Names}} {{.Status}}'; if command -v nvidia-smi >/dev/null; then nvidia-smi || true; else echo 'No NVIDIA GPU detected'; fi ;;
   context)
+    cpu_tiny_context=$(sed -n 's/^AI_CPU_TINY_CONTEXT_TOKENS=//p' .env | head -n 1)
+    cpu_4b_context=$(sed -n 's/^AI_CPU_4B_CONTEXT_TOKENS=//p' .env | head -n 1)
+    printf 'CPU 0.6B context: %s tokens\n' "${cpu_tiny_context:-4096}"
+    printf 'CPU 4B context: %s tokens\n' "${cpu_4b_context:-8192}"
     printf 'Context: %s tokens (prompt and output combined)\n' "$(sed -n 's/^AI_CONTEXT_TOKENS=//p' .env | head -n 1)"
     printf 'GPU memory utilization: %s\n' "$(sed -n 's/^AI_GPU_MEMORY_UTILIZATION=//p' .env | head -n 1)"
     printf 'CPU weight offload: %s GiB\n' "$(sed -n 's/^AI_CPU_OFFLOAD_GB=//p' .env | head -n 1)"
@@ -5468,7 +5734,18 @@ case "${1:-help}" in
     printf 'Qwen3.8 distill context: %s tokens\n' "${AI_QWEN38_CONTEXT_TOKENS:-131072}"
     printf 'Gemma 4 abliterated context: %s tokens\n' "${AI_GEMMA4_CONTEXT_TOKENS:-32768}"
     ;;
-  logs) docker_cmd logs -f --tail=100 llm ;;
+  logs)
+    active=$(sed -n 's/^AI_START_MODEL=//p' .env | head -n 1)
+    case "$active" in
+      cpu-tiny|cpu-4b|qwen4b|huihui|flint-iq4|flint-q3|vision) service=$active ;;
+      deepseek) service=deepseek-v4-distill ;;
+      qwen38) service=qwen38-ablit ;;
+      gemma4) service=gemma4-ablit ;;
+      *) service=llm ;;
+    esac
+    docker_cmd --profile coder --profile cpu-tiny --profile cpu-4b --profile qwen4b --profile huihui --profile flint --profile deepseek --profile qwen38 --profile gemma4 --profile vision logs -f --tail=100 "$service" ;;
+  cpu-tiny-logs) docker_cmd --profile cpu-tiny logs -f --tail=100 cpu-tiny ;;
+  cpu-4b-logs) docker_cmd --profile cpu-4b logs -f --tail=100 cpu-4b ;;
   huihui-logs) docker_cmd --profile huihui logs -f --tail=100 huihui ;;
   qwen4b-logs) docker_cmd --profile qwen4b logs -f --tail=100 qwen4b ;;
   flint-iq4-logs) docker_cmd --profile flint logs -f --tail=100 flint-iq4 ;;
@@ -5515,50 +5792,54 @@ case "${1:-help}" in
       -d '{"model":"local-coder","input":"Call echo_value with the text hello.","tools":[{"type":"function","name":"echo_value","description":"Echo the supplied text","parameters":{"type":"object","properties":{"text":{"type":"string"}},"required":["text"],"additionalProperties":false}}],"tool_choice":"required","max_output_tokens":128}' | \
       python3 -c 'import json,sys; d=json.load(sys.stdin); calls=[x for x in d.get("output",[]) if x.get("type")=="function_call"]; print(json.dumps(calls or d, indent=2)); sys.exit(0 if calls else 1)'
     ;;
-  help|-h|--help) echo 'Usage: ai-control.sh {start|stop|restart|status|context|logs|qwen4b-logs|flint-iq4-logs|flint-q3-logs|deepseek-logs|qwen38-logs|gemma4-logs|huihui-logs|huihui-files|huihui-test|vision-logs|vision-test|media-logs|web-logs|web-test|terminal-test|test|tool-test|codex-test|key|terminal-key|switch-password|switch-url|comfy-url}' ;;
+  help|-h|--help) echo 'Usage: ai-control.sh {start|stop|restart|status|context|logs|cpu-tiny-logs|cpu-4b-logs|qwen4b-logs|flint-iq4-logs|flint-q3-logs|deepseek-logs|qwen38-logs|gemma4-logs|huihui-logs|huihui-files|huihui-test|vision-logs|vision-test|media-logs|web-logs|web-test|terminal-test|test|tool-test|codex-test|key|terminal-key|switch-password|switch-url|comfy-url}' ;;
   *) echo "Unknown command: $1" >&2; exit 2 ;;
 esac
 CONTROL
 chmod 755 "$INSTALL_DIR/ai-control.sh"
 
-info 'Building ComfyUI and starting the LLM (downloads may take a while)'
+info 'Starting selected workloads (downloads may take a while)'
 cd "$INSTALL_DIR"
 sudo docker compose --env-file .env config -q
-sudo docker compose --env-file .env --profile media build comfyui
-sudo docker ps -q --filter label=local-ai.model-manager=1 | xargs -r sudo docker stop
-sudo docker compose --env-file .env --profile media --profile vision --profile huihui --profile qwen4b --profile flint --profile deepseek --profile qwen38 --profile gemma4 stop comfyui vision huihui qwen4b flint-iq4 flint-q3 deepseek-v4-distill qwen38-ablit gemma4-ablit
-sudo docker compose --env-file .env up -d
-sudo docker compose --env-file .env --profile media create comfyui
-sudo docker compose --env-file .env --profile vision create vision
-sudo docker compose --env-file .env --profile huihui create huihui
-sudo docker compose --env-file .env --profile qwen4b create qwen4b
-sudo docker compose --env-file .env --profile flint create flint-iq4 flint-q3
-sudo docker compose --env-file .env --profile deepseek create deepseek-v4-distill
-sudo docker compose --env-file .env --profile qwen38 create qwen38-ablit
-sudo docker compose --env-file .env --profile gemma4 create gemma4-ablit
+bash "$INSTALL_DIR/start-selected.sh"
 READY_PORT=$(sed -n 's/^AI_PORT=//p' .env | head -n 1)
 READY_WEB_PORT=$(sed -n 's/^AI_WEB_PORT=//p' .env | head -n 1)
 READY_CONTROL_PORT=$(sed -n 's/^AI_CONTROL_PORT=//p' .env | head -n 1)
 READY_COMFY_PORT=$(sed -n 's/^AI_COMFY_PORT=//p' .env | head -n 1)
 READY_BIND_IP=$(sed -n 's/^AI_BIND_IP=//p' .env | head -n 1)
 READY_KEY=$(sed -n 's/^AI_API_KEY=//p' .env | head -n 1)
+READY_SERVICE=$(sed -n 's/^AI_START_MODEL=//p' .env | head -n 1)
+case "$READY_SERVICE" in
+  cpu-tiny) READY_ALIAS=local-cpu-tiny; READY_COMPOSE_SERVICE=cpu-tiny ;;
+  cpu-4b) READY_ALIAS=local-cpu-4b; READY_COMPOSE_SERVICE=cpu-4b ;;
+  llm) READY_ALIAS=local-coder; READY_COMPOSE_SERVICE=llm ;;
+  qwen4b) READY_ALIAS=local-qwen4b; READY_COMPOSE_SERVICE=qwen4b ;;
+  huihui) READY_ALIAS=local-huihui; READY_COMPOSE_SERVICE=huihui ;;
+  flint-iq4) READY_ALIAS=local-flint-iq4; READY_COMPOSE_SERVICE=flint-iq4 ;;
+  flint-q3) READY_ALIAS=local-flint-q3; READY_COMPOSE_SERVICE=flint-q3 ;;
+  deepseek) READY_ALIAS=local-deepseek-v4-distill; READY_COMPOSE_SERVICE=deepseek-v4-distill ;;
+  qwen38) READY_ALIAS=local-qwen38-ablit; READY_COMPOSE_SERVICE=qwen38-ablit ;;
+  gemma4) READY_ALIAS=local-gemma4-ablit; READY_COMPOSE_SERVICE=gemma4-ablit ;;
+  vision) READY_ALIAS=local-vision; READY_COMPOSE_SERVICE=vision ;;
+  *) die "Unknown initial workload: $READY_SERVICE" ;;
+esac
 info 'Waiting for the model API to become ready'
 ready=0
 for attempt in $(seq 1 180); do
   if curl -fsS --max-time 5 -H "Authorization: Bearer $READY_KEY" \
-      "http://$READY_BIND_IP:$READY_PORT/v1/models" 2>/dev/null | grep -q 'local-coder'; then
+      "http://$READY_BIND_IP:$READY_PORT/v1/models" 2>/dev/null | grep -Fq "\"$READY_ALIAS\""; then
     ready=1
     break
   fi
-  if ! sudo docker compose --env-file .env ps --status running --services | grep -qx llm; then
-    sudo docker compose --env-file .env logs --tail=80 llm >&2
+  if ! sudo docker compose --env-file .env --profile coder --profile cpu-tiny --profile cpu-4b --profile qwen4b --profile huihui --profile flint --profile deepseek --profile qwen38 --profile gemma4 --profile vision ps --status running --services | grep -qx "$READY_COMPOSE_SERVICE"; then
+    sudo docker compose --env-file .env --profile coder --profile cpu-tiny --profile cpu-4b --profile qwen4b --profile huihui --profile flint --profile deepseek --profile qwen38 --profile gemma4 --profile vision logs --tail=80 "$READY_COMPOSE_SERVICE" >&2
     die 'The LLM container stopped before becoming ready.'
   fi
   if (( attempt % 6 == 0 )); then printf 'Still loading model (%s minutes)...\n' "$((attempt / 6))"; fi
   sleep 10
 done
 if (( ! ready )); then
-  sudo docker compose --env-file .env logs --tail=80 llm >&2
+  sudo docker compose --env-file .env --profile coder --profile cpu-tiny --profile cpu-4b --profile qwen4b --profile huihui --profile flint --profile deepseek --profile qwen38 --profile gemma4 --profile vision logs --tail=80 "$READY_COMPOSE_SERVICE" >&2
   die 'The LLM did not become ready within 30 minutes. Check logs and available disk space.'
 fi
 info 'Waiting for Open WebUI health endpoint to become ready'
@@ -5594,12 +5875,11 @@ printf 'Logs: %s/ai-control.sh logs\n' "$INSTALL_DIR"
 printf 'LAN URL: http://%s:%s/v1\n' "$READY_BIND_IP" "$READY_PORT"
 printf 'Vision URL when active: http://%s:%s/vision/v1\n' "$READY_BIND_IP" "$READY_PORT"
 printf 'Web interface: http://%s:%s\n' "$READY_BIND_IP" "$READY_WEB_PORT"
-printf 'GPU switch: http://%s:%s (user: operator; password: %s/ai-control.sh switch-password)\n' "$READY_BIND_IP" "$READY_CONTROL_PORT" "$INSTALL_DIR"
+printf 'Model switcher: http://%s:%s (user: operator; password: %s/ai-control.sh switch-password)\n' "$READY_BIND_IP" "$READY_CONTROL_PORT" "$INSTALL_DIR"
 printf 'ComfyUI when media mode is active: http://%s:%s\n' "$READY_BIND_IP" "$READY_COMFY_PORT"
 printf 'API key: %s/ai-control.sh key\n' "$INSTALL_DIR"
 printf 'Host RAM visible to Ubuntu: %s GiB\n' "$HOST_RAM_GIB"
 printf 'Benchmarks: http://%s:%s/benchmarks\n' "$READY_BIND_IP" "$READY_CONTROL_PORT"
-printf 'Model name: local-coder\n'
-printf 'Huihui model name: local-huihui (select it on the GPU switch)\n'
-printf 'Vision model name: local-vision (select Use Vision on the GPU switch)\n'
+printf 'Initial model: %s (%s)\n' "$READY_SERVICE" "$READY_ALIAS"
+printf 'Chosen models: %s\n' "$(sed -n 's/^AI_SELECTED_MODELS=//p' .env | head -n 1)"
 

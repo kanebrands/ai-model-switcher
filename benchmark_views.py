@@ -1,5 +1,6 @@
 """Escaped, no-JavaScript pages for persisted benchmark results."""
 import html
+import os
 import json
 import statistics
 import urllib.parse
@@ -144,7 +145,10 @@ def index(runs, csrf, message="", active_mode=None, sort="tokens_per_second", di
         sort = "tokens_per_second"
     if direction not in ("asc", "desc"):
         direction = "desc"
-    options = "".join(f'<option value="{esc(mode)}" {"selected" if mode == active_mode else ""}>{esc(alias)} ({esc(mode)})</option>' for mode, (alias, _) in MODELS.items())
+    selected_modes = {value for value in os.environ.get("AI_SELECTED_MODELS", "").split(",") if value}
+    options = "".join(f'<option value="{esc(mode)}" {"selected" if mode == active_mode else ""}>{esc(alias)} ({esc(mode)})</option>'
+                      for mode, (alias, _) in MODELS.items()
+                      if not selected_modes or mode in selected_modes or mode.startswith("hf-"))
     headers = []
     for key, title in COLUMNS:
         next_direction = ("asc" if direction == "desc" else "desc") if key == sort else ("asc" if key in TEXT_ASCENDING else "desc")

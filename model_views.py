@@ -23,6 +23,14 @@ def index(hardware, suggestions, installed, jobs, csrf, prefer_ablit=True,
                      'CPU details are shown, but CPU upgrades do not increase the GPU memory available to models.</p>'
                      f'<form method="post" action="/models/hardware/rescan"><input type="hidden" name="token" value="{esc(csrf)}">'
                      '<button type="submit">Rescan hardware and suggestions</button></form>')
+    if not hardware.get("vram_mib"):
+        body = ('<section class="card">' + hardware_line + '</section>'
+                '<section class="card"><h2>CPU model choices</h2>'
+                '<p>The current installation has no compatible NVIDIA GPU. The installer offers CPU models according to detected RAM. '
+                'Installed choices are available on the switcher home page. To change the selection, rerun the installer with '
+                '<code>AI_MODEL_SELECTION=cpu-tiny,cpu-4b</code> after checking which choices fit this host. '
+                'The GPU catalog and engine updates appear when a supported GPU is detected and the installer is rerun.</p></section>')
+        return shell("Hardware and model choices", body, wide=True)
     discovery = discovery or {"status": "not checked", "items": [], "query": "", "error": None}
     engine = engine or {"checked_at": None, "checking": False, "update_available": None,
                         "local_build": None, "error": None, "job": None, "busy": False}

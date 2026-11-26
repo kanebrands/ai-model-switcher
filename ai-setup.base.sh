@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Ubuntu 24.04, one RTX 3090: Docker + NVIDIA runtime + vLLM + ComfyUI + Open WebUI + nginx.
+# Ubuntu 24.04: Docker, a hardware-selected local model, Open WebUI, and nginx.
 set -Eeuo pipefail
 
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
@@ -56,29 +56,48 @@ mkdir -p "$INSTALL_DIR/secure_proxy" "$INSTALL_DIR/comfyui" "$INSTALL_DIR/gpu_co
   "$MEDIA_DIR/models" "$MEDIA_DIR/input" "$MEDIA_DIR/output" "$MEDIA_DIR/user" "$MEDIA_DIR/temp"
 chmod 700 "$INSTALL_DIR/secure_proxy"
 
-info 'Checking NVIDIA driver'
-if ! nvidia-smi >/dev/null 2>&1; then
-  if dpkg-query -W -f='${Status}' 'nvidia-driver-*' 2>/dev/null | grep -q 'install ok installed'; then
-    die 'An NVIDIA driver is installed but nvidia-smi fails. Reboot, then rerun. Check Secure Boot and driver status if it still fails.'
+info 'Detecting available compute hardware'
+NVIDIA_PCI=0
+for device in /sys/bus/pci/devices/*; do
+  [[ -f $device/vendor && -f $device/class ]] || continue
+  [[ $(<"$device/vendor") == 0x10de && $(<"$device/class") == 0x03* ]] && NVIDIA_PCI=1
+done
+GPU_NAME='none'
+GPU_VRAM_MIB=0
+GPU_COMPUTE_CAP=0
+GPU_CUDA_READY=0
+if command -v nvidia-smi >/dev/null && nvidia-smi >/dev/null 2>&1; then
+  GPU_DETAILS=$(nvidia-smi --query-gpu=name,memory.total,compute_cap,driver_version --format=csv,noheader,nounits 2>/dev/null | head -n 1 || true)
+  IFS=, read -r GPU_NAME GPU_VRAM_MIB GPU_COMPUTE_CAP DRIVER_VERSION <<< "$GPU_DETAILS"
+  GPU_NAME=${GPU_NAME## }
+  GPU_VRAM_MIB=${GPU_VRAM_MIB//[[:space:]]/}
+  GPU_COMPUTE_CAP=${GPU_COMPUTE_CAP//[[:space:]]/}
+  DRIVER_VERSION=${DRIVER_VERSION//[[:space:]]/}
+  if [[ $GPU_VRAM_MIB =~ ^[0-9]+$ && $GPU_COMPUTE_CAP =~ ^[0-9]+\.[0-9]+$ && $DRIVER_VERSION =~ ^[0-9]+(\.[0-9]+)+$ ]] && dpkg --compare-versions "$GPU_COMPUTE_CAP" ge 7.5; then
+    if dpkg --compare-versions "$DRIVER_VERSION" lt 580.65.06; then
+      sudo apt-get update
+      sudo apt-get install -y ubuntu-drivers-common
+      sudo ubuntu-drivers install
+      printf '\nUpdated NVIDIA driver for CUDA 13. Reboot, then run this script again.\n'
+      exit 0
+    fi
+    GPU_CUDA_READY=1
+  else
+    GPU_VRAM_MIB=0
+    info "GPU $GPU_NAME cannot run the included CUDA 13 profiles; CPU models remain available"
   fi
+elif (( NVIDIA_PCI )); then
   sudo apt-get update
   sudo apt-get install -y ubuntu-drivers-common
   sudo ubuntu-drivers install
-  printf '\nNVIDIA driver installed. Reboot Ubuntu, then run this same script again.\n'
+  printf '\nNVIDIA driver installed. Reboot, then run this script again.\n'
   exit 0
+else
+  info 'No NVIDIA GPU detected; installing a CPU inference profile'
 fi
-GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -n 1)
-[[ $GPU_NAME == *3090* ]] || die "Expected an RTX 3090; found: $GPU_NAME"
-GPU_COUNT=$(nvidia-smi --query-gpu=uuid --format=csv,noheader | wc -l)
-(( GPU_COUNT == 1 )) || die "Expected exactly one GPU; found $GPU_COUNT"
-DRIVER_VERSION=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -n 1)
-if dpkg --compare-versions "$DRIVER_VERSION" lt 580.65.06; then
-  sudo apt-get update
-  sudo apt-get install -y ubuntu-drivers-common
-  sudo ubuntu-drivers install
-  printf '\nCUDA 13.0 needs an NVIDIA driver at least 580.65.06. Reboot, then rerun this script.\n'
-  exit 0
-fi
+HOST_RAM_GIB=$(awk '/^MemTotal:/ {printf "%.1f", $2 / 1048576}' /proc/meminfo)
+[[ -n $HOST_RAM_GIB ]] || die 'Could not read host RAM from /proc/meminfo.'
+info "Ubuntu reports $HOST_RAM_GIB GiB of usable RAM"
 
 info 'Installing Docker Engine and Compose from the official repository'
 sudo apt-get update
@@ -100,17 +119,19 @@ EOF
 fi
 sudo systemctl enable --now docker
 
-info 'Installing NVIDIA Container Toolkit'
-if ! dpkg-query -W -f='${Status}' nvidia-container-toolkit 2>/dev/null | grep -q 'install ok installed'; then
-  curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor --yes -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
-  curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
-    sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
-    sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list >/dev/null
-  sudo apt-get update
-  sudo apt-get install -y nvidia-container-toolkit
+if (( GPU_CUDA_READY )); then
+  info 'Installing NVIDIA Container Toolkit'
+  if ! dpkg-query -W -f='${Status}' nvidia-container-toolkit 2>/dev/null | grep -q 'install ok installed'; then
+    curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor --yes -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+    curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
+      sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
+      sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list >/dev/null
+    sudo apt-get update
+    sudo apt-get install -y nvidia-container-toolkit
+  fi
+  sudo nvidia-ctk runtime configure --runtime=docker
+  sudo systemctl restart docker
 fi
-sudo nvidia-ctk runtime configure --runtime=docker
-sudo systemctl restart docker
 
 info 'Writing the Compose stack, Open WebUI, and nginx proxy'
 cat > "$INSTALL_DIR/docker-compose.yml" <<'COMPOSE'
@@ -781,22 +802,19 @@ ACTUAL_MEDIA_DIR=$(sed -n 's/^AI_MEDIA_DIR=//p' "$ENV_FILE" | head -n 1)
 mkdir -p "$ACTUAL_MEDIA_DIR/models" "$ACTUAL_MEDIA_DIR/input" "$ACTUAL_MEDIA_DIR/output" "$ACTUAL_MEDIA_DIR/user" "$ACTUAL_MEDIA_DIR/temp"
 ACTUAL_MODEL_CACHE=$(sed -n 's/^AI_MODEL_CACHE=//p' "$ENV_FILE" | head -n 1)
 [[ $ACTUAL_MODEL_CACHE == /* ]] || die 'AI_MODEL_CACHE in .env must be an absolute path.'
-HUIHUI_MODEL_DIR="$ACTUAL_MODEL_CACHE/gguf"
-HUIHUI_MODEL_FILE="$HUIHUI_MODEL_DIR/huihui-qwen3.6-35b-a3b-q3_k.gguf"
-HUIHUI_PARTIAL="$HUIHUI_MODEL_FILE.part"
-mkdir -p "$HUIHUI_MODEL_DIR"
-if [[ -f $HUIHUI_MODEL_FILE && $(stat -c %s "$HUIHUI_MODEL_FILE") -lt 16000000000 ]]; then
-  mv "$HUIHUI_MODEL_FILE" "$HUIHUI_PARTIAL"
+CPU_THREADS=$(nproc)
+(( CPU_THREADS > 2 )) && CPU_THREADS=$((CPU_THREADS - 2))
+if ! grep -q '^AI_CPU_THREADS=' "$ENV_FILE"; then
+  printf 'AI_CPU_THREADS=%s\n' "$CPU_THREADS" >> "$ENV_FILE"
 fi
-if [[ ! -s $HUIHUI_MODEL_FILE ]]; then
-  info 'Downloading Huihui Qwen3.6 35B-A3B Q3_K GGUF (17.2 GB; resumable)'
-  printf 'Download progress file: %s\n' "$HUIHUI_PARTIAL"
-  curl --fail --location --retry 5 --retry-delay 3 --continue-at - \
-    --output "$HUIHUI_PARTIAL" \
-    'https://huggingface.co/huihui-ai/Huihui-Qwen3.6-35B-A3B-abliterated-MTP-GGUF/resolve/main/Huihui-Qwen3.6-35B-A3B-abliterated-ggml-model-Q3_K.gguf'
-  [[ $(stat -c %s "$HUIHUI_PARTIAL") -ge 16000000000 ]] || die "Huihui download is incomplete: $HUIHUI_PARTIAL"
-  mv "$HUIHUI_PARTIAL" "$HUIHUI_MODEL_FILE"
+if grep -q '^AI_GPU_COMPATIBLE=' "$ENV_FILE"; then
+  sed -i "s/^AI_GPU_COMPATIBLE=.*/AI_GPU_COMPATIBLE=$GPU_CUDA_READY/" "$ENV_FILE"
+else
+  printf 'AI_GPU_COMPATIBLE=%s\n' "$GPU_CUDA_READY" >> "$ENV_FILE"
 fi
+info 'Selecting models for detected hardware'
+python3 "$INSTALL_DIR/gpu_control/install_profile.py" "$ENV_FILE" "$HOST_RAM_GIB" "$GPU_VRAM_MIB"
+bash "$INSTALL_DIR/gpu_control/install_models.sh" "$INSTALL_DIR"
 SWITCH_PASSWORD=$(sed -n 's/^AI_SWITCH_PASSWORD=//p' "$ENV_FILE" | head -n 1)
 printf 'operator:%s\n' "$(printf '%s' "$SWITCH_PASSWORD" | openssl passwd -apr1 -stdin)" > "$INSTALL_DIR/secure_proxy/.htpasswd"
 # Nginx's unprivileged worker reads this file on each authenticated request.
@@ -905,23 +923,38 @@ READY_CONTROL_PORT=$(sed -n 's/^AI_CONTROL_PORT=//p' .env | head -n 1)
 READY_COMFY_PORT=$(sed -n 's/^AI_COMFY_PORT=//p' .env | head -n 1)
 READY_BIND_IP=$(sed -n 's/^AI_BIND_IP=//p' .env | head -n 1)
 READY_KEY=$(sed -n 's/^AI_API_KEY=//p' .env | head -n 1)
+READY_SERVICE=$(sed -n 's/^AI_START_MODEL=//p' .env | head -n 1)
+case "$READY_SERVICE" in
+  cpu-tiny) READY_ALIAS=local-cpu-tiny; READY_COMPOSE_SERVICE=cpu-tiny ;;
+  cpu-4b) READY_ALIAS=local-cpu-4b; READY_COMPOSE_SERVICE=cpu-4b ;;
+  llm) READY_ALIAS=local-coder; READY_COMPOSE_SERVICE=llm ;;
+  qwen4b) READY_ALIAS=local-qwen4b; READY_COMPOSE_SERVICE=qwen4b ;;
+  huihui) READY_ALIAS=local-huihui; READY_COMPOSE_SERVICE=huihui ;;
+  flint-iq4) READY_ALIAS=local-flint-iq4; READY_COMPOSE_SERVICE=flint-iq4 ;;
+  flint-q3) READY_ALIAS=local-flint-q3; READY_COMPOSE_SERVICE=flint-q3 ;;
+  deepseek) READY_ALIAS=local-deepseek-v4-distill; READY_COMPOSE_SERVICE=deepseek-v4-distill ;;
+  qwen38) READY_ALIAS=local-qwen38-ablit; READY_COMPOSE_SERVICE=qwen38-ablit ;;
+  gemma4) READY_ALIAS=local-gemma4-ablit; READY_COMPOSE_SERVICE=gemma4-ablit ;;
+  vision) READY_ALIAS=local-vision; READY_COMPOSE_SERVICE=vision ;;
+  *) die "Unknown initial workload: $READY_SERVICE" ;;
+esac
 info 'Waiting for the model API to become ready'
 ready=0
 for attempt in $(seq 1 180); do
   if curl -fsS --max-time 5 -H "Authorization: Bearer $READY_KEY" \
-      "http://$READY_BIND_IP:$READY_PORT/v1/models" 2>/dev/null | grep -q 'local-coder'; then
+      "http://$READY_BIND_IP:$READY_PORT/v1/models" 2>/dev/null | grep -Fq "\"$READY_ALIAS\""; then
     ready=1
     break
   fi
-  if ! sudo docker compose --env-file .env ps --status running --services | grep -qx llm; then
-    sudo docker compose --env-file .env logs --tail=80 llm >&2
+  if ! sudo docker compose --env-file .env --profile coder --profile cpu-tiny --profile cpu-4b --profile qwen4b --profile huihui --profile flint --profile deepseek --profile qwen38 --profile gemma4 --profile vision ps --status running --services | grep -qx "$READY_COMPOSE_SERVICE"; then
+    sudo docker compose --env-file .env --profile coder --profile cpu-tiny --profile cpu-4b --profile qwen4b --profile huihui --profile flint --profile deepseek --profile qwen38 --profile gemma4 --profile vision logs --tail=80 "$READY_COMPOSE_SERVICE" >&2
     die 'The LLM container stopped before becoming ready.'
   fi
   if (( attempt % 6 == 0 )); then printf 'Still loading model (%s minutes)...\n' "$((attempt / 6))"; fi
   sleep 10
 done
 if (( ! ready )); then
-  sudo docker compose --env-file .env logs --tail=80 llm >&2
+  sudo docker compose --env-file .env --profile coder --profile cpu-tiny --profile cpu-4b --profile qwen4b --profile huihui --profile flint --profile deepseek --profile qwen38 --profile gemma4 --profile vision logs --tail=80 "$READY_COMPOSE_SERVICE" >&2
   die 'The LLM did not become ready within 30 minutes. Check logs and available disk space.'
 fi
 info 'Waiting for Open WebUI health endpoint to become ready'
@@ -957,10 +990,9 @@ printf 'Logs: %s/ai-control.sh logs\n' "$INSTALL_DIR"
 printf 'LAN URL: http://%s:%s/v1\n' "$READY_BIND_IP" "$READY_PORT"
 printf 'Vision URL when active: http://%s:%s/vision/v1\n' "$READY_BIND_IP" "$READY_PORT"
 printf 'Web interface: http://%s:%s\n' "$READY_BIND_IP" "$READY_WEB_PORT"
-printf 'GPU switch: http://%s:%s (user: operator; password: %s/ai-control.sh switch-password)\n' "$READY_BIND_IP" "$READY_CONTROL_PORT" "$INSTALL_DIR"
+printf 'Model switcher: http://%s:%s (user: operator; password: %s/ai-control.sh switch-password)\n' "$READY_BIND_IP" "$READY_CONTROL_PORT" "$INSTALL_DIR"
 printf 'ComfyUI when media mode is active: http://%s:%s\n' "$READY_BIND_IP" "$READY_COMFY_PORT"
 printf 'API key: %s/ai-control.sh key\n' "$INSTALL_DIR"
 printf 'Model name: local-coder\n'
-printf 'Huihui model name: local-huihui (select it on the GPU switch)\n'
-printf 'Vision model name: local-vision (select Use Vision on the GPU switch)\n'
+printf 'Chosen models: %s\n' "$(sed -n 's/^AI_SELECTED_MODELS=//p' .env | head -n 1)"
 

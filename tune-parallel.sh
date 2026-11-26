@@ -6,6 +6,8 @@ action=${1:-}
 service=${2:-}
 slots=${3:-}
 case "$service" in
+  cpu-tiny) key=AI_CPU_TINY_PARALLEL_SLOTS ;;
+  cpu-4b) key=AI_CPU_4B_PARALLEL_SLOTS ;;
   llm) key=AI_CODER_PARALLEL_SLOTS ;;
   qwen4b) key=AI_QWEN4B_PARALLEL_SLOTS ;;
   huihui) key=AI_HUIHUI_PARALLEL_SLOTS ;;
@@ -35,7 +37,7 @@ save_slots() {
 }
 
 compose() {
-  env "$key=$slots" docker compose --env-file .env --profile qwen4b --profile huihui \
+  env "$key=$slots" docker compose --env-file .env --profile coder --profile cpu-tiny --profile cpu-4b --profile qwen4b --profile huihui \
     --profile flint --profile deepseek --profile qwen38 --profile gemma4 --profile vision \
     up -d --no-deps --force-recreate --pull never "$service"
 }
