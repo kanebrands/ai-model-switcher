@@ -1,0 +1,494 @@
+name: local-ai
+services:
+  llm:
+    image: vllm/vllm-openai:v0.32.0-ubuntu2404
+    container_name: local-ai-llm
+    restart: unless-stopped
+    ipc: host
+    environment:
+      HF_HOME: /root/.cache/huggingface
+    volumes:
+      - ${AI_MODEL_CACHE:?set AI_MODEL_CACHE in .env}:/root/.cache/huggingface
+      - vllm_cache:/root/.cache/vllm
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    command:
+      - --model
+      - cyankiwi/Qwen3-Coder-30B-A3B-Instruct-AWQ-4bit
+      - --served-model-name
+      - local-coder
+      - --host
+      - 0.0.0.0
+      - --port
+      - '8000'
+      - --gpu-memory-utilization
+      - "${AI_GPU_MEMORY_UTILIZATION:-0.95}"
+      - --max-model-len
+      - "${AI_CONTEXT_TOKENS:-32768}"
+      - --max-num-seqs
+      - "${AI_CODER_PARALLEL_SLOTS:-1}"
+      - --cpu-offload-gb
+      - "${AI_CPU_OFFLOAD_GB:-0}"
+      - --enable-auto-tool-choice
+      - --tool-call-parser
+      - qwen3_coder
+      - --api-key
+      - ${AI_API_KEY:?set AI_API_KEY in .env}
+    networks: [ai_internal]
+  qwen4b:
+    profiles: [qwen4b]
+    image: vllm/vllm-openai:v0.32.0-ubuntu2404
+    container_name: local-ai-qwen4b
+    restart: unless-stopped
+    ipc: host
+    environment:
+      HF_HOME: /root/.cache/huggingface
+    volumes:
+      - ${AI_MODEL_CACHE:?set AI_MODEL_CACHE in .env}:/root/.cache/huggingface
+      - vllm_cache:/root/.cache/vllm
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    command:
+      - --model
+      - Qwen/Qwen3-4B-Instruct-2507
+      - --served-model-name
+      - local-qwen4b
+      - --host
+      - 0.0.0.0
+      - --port
+      - '8000'
+      - --gpu-memory-utilization
+      - "${AI_QWEN4B_GPU_UTILIZATION:-0.85}"
+      - --max-model-len
+      - "${AI_QWEN4B_CONTEXT_TOKENS:-32768}"
+      - --max-num-seqs
+      - "${AI_QWEN4B_PARALLEL_SLOTS:-4}"
+      - --api-key
+      - ${AI_API_KEY:?set AI_API_KEY in .env}
+    networks: [ai_internal]
+  huihui:
+    logging:
+      driver: json-file
+      options:
+        max-size: "${AI_LOG_MAX_SIZE:-10m}"
+        max-file: "${AI_LOG_MAX_FILES:-3}"
+    profiles: [huihui]
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda13
+    container_name: local-ai-huihui
+    restart: unless-stopped
+    environment:
+      LLAMA_API_KEY: ${AI_API_KEY:?set AI_API_KEY in .env}
+    volumes:
+      - ${AI_MODEL_CACHE:?set AI_MODEL_CACHE in .env}/gguf:/models:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    command:
+      - --model
+      - /models/huihui-qwen3.6-35b-a3b-q3_k.gguf
+      - --alias
+      - local-huihui
+      - --host
+      - 0.0.0.0
+      - --port
+      - '8080'
+      - --ctx-size
+      - "${AI_HUIHUI_CONTEXT_TOKENS:-32768}"
+      - --n-gpu-layers
+      - auto
+      - --fit-target
+      - '2048'
+      - --flash-attn
+      - 'on'
+      - --parallel
+      - "${AI_HUIHUI_PARALLEL_SLOTS:-1}"
+      - --spec-type
+      - draft-mtp
+      - --spec-draft-n-max
+      - '4'
+    networks: [ai_internal]
+  flint-iq4:
+    profiles: [flint]
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda13
+    container_name: local-ai-flint-iq4
+    restart: unless-stopped
+    environment:
+      LLAMA_API_KEY: ${AI_API_KEY:?set AI_API_KEY in .env}
+    volumes:
+      - ${AI_MODEL_CACHE:?set AI_MODEL_CACHE in .env}/gguf:/models:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    command:
+      - --model
+      - /models/RecursiveSI_flint-IQ4_XS.gguf
+      - --alias
+      - local-flint-iq4
+      - --host
+      - 0.0.0.0
+      - --port
+      - '8080'
+      - --ctx-size
+      - "${AI_FLINT_IQ4_CONTEXT_TOKENS:-16384}"
+      - --n-gpu-layers
+      - auto
+      - --fit-target
+      - '1536'
+      - --flash-attn
+      - 'on'
+      - --parallel
+      - "${AI_FLINT_IQ4_PARALLEL_SLOTS:-1}"
+    networks: [ai_internal]
+  flint-q3:
+    profiles: [flint]
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda13
+    container_name: local-ai-flint-q3
+    restart: unless-stopped
+    environment:
+      LLAMA_API_KEY: ${AI_API_KEY:?set AI_API_KEY in .env}
+    volumes:
+      - ${AI_MODEL_CACHE:?set AI_MODEL_CACHE in .env}/gguf:/models:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    command:
+      - --model
+      - /models/RecursiveSI_flint-Q3_K_M.gguf
+      - --alias
+      - local-flint-q3
+      - --host
+      - 0.0.0.0
+      - --port
+      - '8080'
+      - --ctx-size
+      - "${AI_FLINT_Q3_CONTEXT_TOKENS:-32768}"
+      - --n-gpu-layers
+      - auto
+      - --fit-target
+      - '1536'
+      - --flash-attn
+      - 'on'
+      - --parallel
+      - "${AI_FLINT_Q3_PARALLEL_SLOTS:-1}"
+    networks: [ai_internal]
+  deepseek-v4-distill:
+    profiles: [deepseek]
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda13
+    container_name: local-ai-deepseek-v4-distill
+    restart: unless-stopped
+    environment:
+      LLAMA_API_KEY: ${AI_API_KEY:?set AI_API_KEY in .env}
+    volumes:
+      - ${AI_MODEL_CACHE:?set AI_MODEL_CACHE in .env}/gguf:/models:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    command:
+      - --model
+      - /models/DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic.Q5_K_M.gguf
+      - --alias
+      - local-deepseek-v4-distill
+      - --host
+      - 0.0.0.0
+      - --port
+      - '8080'
+      - --ctx-size
+      - "${AI_DEEPSEEK_CONTEXT_TOKENS:-65536}"
+      - --n-gpu-layers
+      - auto
+      - --fit-target
+      - '1536'
+      - --flash-attn
+      - 'on'
+      - --parallel
+      - "${AI_DEEPSEEK_PARALLEL_SLOTS:-1}"
+    networks: [ai_internal]
+  qwen38-ablit:
+    profiles: [qwen38]
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda13
+    container_name: local-ai-qwen38-ablit
+    restart: unless-stopped
+    environment:
+      LLAMA_API_KEY: ${AI_API_KEY:?set AI_API_KEY in .env}
+    volumes:
+      - ${AI_MODEL_CACHE:?set AI_MODEL_CACHE in .env}/gguf:/models:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    command:
+      - --model
+      - /models/Qwen3.8-35B-A3B-Distill.APEX-I-MiniPlus-V2.1-Abliterated.gguf
+      - --alias
+      - local-qwen38-ablit
+      - --host
+      - 0.0.0.0
+      - --port
+      - '8080'
+      - --ctx-size
+      - "${AI_QWEN38_CONTEXT_TOKENS:-131072}"
+      - --n-gpu-layers
+      - auto
+      - --fit-target
+      - '2048'
+      - --flash-attn
+      - 'on'
+      - --cache-type-k
+      - q8_0
+      - --cache-type-v
+      - q8_0
+      - --parallel
+      - "${AI_QWEN38_PARALLEL_SLOTS:-1}"
+    networks: [ai_internal]
+  gemma4-ablit:
+    profiles: [gemma4]
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda13
+    container_name: local-ai-gemma4-ablit
+    restart: unless-stopped
+    environment:
+      LLAMA_API_KEY: ${AI_API_KEY:?set AI_API_KEY in .env}
+    volumes:
+      - ${AI_MODEL_CACHE:?set AI_MODEL_CACHE in .env}/gguf:/models:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    command:
+      - --model
+      - /models/Huihui-gemma-4-26B-A4B-it-abliterated-Q4_K_M.gguf
+      - --alias
+      - local-gemma4-ablit
+      - --host
+      - 0.0.0.0
+      - --port
+      - '8080'
+      - --ctx-size
+      - "${AI_GEMMA4_CONTEXT_TOKENS:-32768}"
+      - --n-gpu-layers
+      - auto
+      - --fit-target
+      - '2048'
+      - --flash-attn
+      - 'on'
+      - --cache-type-k
+      - q8_0
+      - --cache-type-v
+      - q8_0
+      - --parallel
+      - "${AI_GEMMA4_PARALLEL_SLOTS:-1}"
+    networks: [ai_internal]
+  vision:
+    profiles: [vision]
+    image: vllm/vllm-openai:v0.32.0-ubuntu2404
+    container_name: local-ai-vision
+    restart: unless-stopped
+    ipc: host
+    environment:
+      HF_HOME: /root/.cache/huggingface
+    volumes:
+      - ${AI_MODEL_CACHE:?set AI_MODEL_CACHE in .env}:/root/.cache/huggingface
+      - vllm_cache:/root/.cache/vllm
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    command:
+      - --model
+      - QuantTrio/Qwen3-VL-30B-A3B-Instruct-AWQ
+      - --served-model-name
+      - local-vision
+      - --host
+      - 0.0.0.0
+      - --port
+      - '8000'
+      - --gpu-memory-utilization
+      - "${AI_VISION_GPU_UTILIZATION:-0.92}"
+      - --max-model-len
+      - "${AI_VISION_CONTEXT_TOKENS:-8192}"
+      - --max-num-seqs
+      - "${AI_VISION_PARALLEL_SLOTS:-1}"
+      - --enable-auto-tool-choice
+      - --tool-call-parser
+      - qwen3_coder
+      - --api-key
+      - ${AI_API_KEY:?set AI_API_KEY in .env}
+    networks: [ai_internal]
+  comfyui:
+    profiles: [media]
+    build:
+      context: ./comfyui
+    image: local-ai/comfyui:v0.43.0-cu130
+    container_name: local-ai-comfyui
+    restart: unless-stopped
+    user: ${AI_UID:?set AI_UID in .env}:${AI_GID:?set AI_GID in .env}
+    environment:
+      HOME: /tmp
+      XDG_CACHE_HOME: /tmp/.cache
+    volumes:
+      - ${AI_MEDIA_DIR:?set AI_MEDIA_DIR in .env}/models:/opt/ComfyUI/models
+      - ${AI_MEDIA_DIR:?set AI_MEDIA_DIR in .env}/input:/opt/ComfyUI/input
+      - ${AI_MEDIA_DIR:?set AI_MEDIA_DIR in .env}/output:/opt/ComfyUI/output
+      - ${AI_MEDIA_DIR:?set AI_MEDIA_DIR in .env}/user:/opt/ComfyUI/user
+      - ${AI_MEDIA_DIR:?set AI_MEDIA_DIR in .env}/temp:/opt/ComfyUI/temp
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8188/system_stats', timeout=5).close()"]
+      interval: 15s
+      timeout: 8s
+      start_period: 180s
+      retries: 3
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    networks: [ai_internal]
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    restart: unless-stopped
+    environment:
+      ENABLE_OLLAMA_API: "false"
+      OPENAI_API_BASE_URL: http://nginx:8080/v1
+      OPENAI_API_KEY: ${AI_API_KEY:?set AI_API_KEY in .env}
+      OPENAI_API_BASE_URLS: http://nginx:8080/v1;http://vision:8000/v1
+      OPENAI_API_KEYS: ${AI_API_KEY:?set AI_API_KEY in .env};${AI_API_KEY:?set AI_API_KEY in .env}
+      WEBUI_SECRET_KEY: ${AI_WEBUI_SECRET_KEY:?set AI_WEBUI_SECRET_KEY in .env}
+      WEBUI_URL: http://${AI_BIND_IP:?set AI_BIND_IP in .env}:${AI_WEB_PORT:-3000}
+      CORS_ALLOW_ORIGIN: http://${AI_BIND_IP:?set AI_BIND_IP in .env}:${AI_WEB_PORT:-3000}
+      ENABLE_WEB_SEARCH: "true"
+      WEB_SEARCH_ENGINE: duckduckgo
+      WEB_SEARCH_RESULT_COUNT: "5"
+      WEB_FETCH_MAX_CONTENT_LENGTH: "12000"
+      TERMINAL_SERVER_CONNECTIONS: '[{"id":"local-terminal","name":"Project workspace","enabled":true,"url":"http://open-terminal:8000","key":"${AI_TERMINAL_KEY:?set AI_TERMINAL_KEY in .env}","auth_type":"bearer","config":{"access_grants":[],"chat_uploads":"filesystem"}}]'
+    volumes:
+      - webui_data:/app/backend/data
+    networks: [ai_internal]
+  open-terminal:
+    image: ghcr.io/open-webui/open-terminal:latest
+    restart: unless-stopped
+    environment:
+      OPEN_TERMINAL_API_KEY: ${AI_TERMINAL_KEY:?set AI_TERMINAL_KEY in .env}
+      OPEN_TERMINAL_MULTI_USER: "true"
+    volumes:
+      - terminal_home:/home
+    networks: [ai_internal]
+  fairness-gateway:
+    image: python:3.12-alpine
+    restart: unless-stopped
+    environment:
+      BENCHMARK_API_KEY: ${AI_API_KEY:?set AI_API_KEY in .env}
+      BENCHMARK_DB: /app/data/benchmarks.sqlite3
+      PYTHONDONTWRITEBYTECODE: "1"
+    volumes:
+      - ./gpu_control/fairness_gateway.py:/app/fairness_gateway.py:ro
+      - ./gpu_control/sharing.py:/app/sharing.py:ro
+      - ./gpu_control/results:/app/data:ro
+    command: [python, /app/fairness_gateway.py]
+    read_only: true
+    depends_on: [gpu-control]
+    networks: [ai_internal, control_internal]
+  gpu-control:
+    image: python:3.12-alpine
+    restart: unless-stopped
+    environment:
+      CONTROL_ORIGIN: http://${AI_BIND_IP:?set AI_BIND_IP in .env}:${AI_CONTROL_PORT:-3001}
+      WEB_URL: http://${AI_BIND_IP:?set AI_BIND_IP in .env}:${AI_WEB_PORT:-3000}
+      COMFY_URL: http://${AI_BIND_IP:?set AI_BIND_IP in .env}:${AI_COMFY_PORT:-8188}
+      CONTROL_CSRF_TOKEN: ${AI_CONTROL_CSRF_TOKEN:?set AI_CONTROL_CSRF_TOKEN in .env}
+      BENCHMARK_API_KEY: ${AI_API_KEY:?set AI_API_KEY in .env}
+      BENCHMARK_COMFY_PASSWORD: ${AI_SWITCH_PASSWORD:?set AI_SWITCH_PASSWORD in .env}
+      BENCHMARK_DB: /app/data/benchmarks.sqlite3
+      MODEL_HOST_DIR: ${AI_MODEL_CACHE:?set AI_MODEL_CACHE in .env}/gguf
+      MODEL_DIR: /app/models
+      MODEL_NETWORK: local-ai_ai_internal
+      MEDIA_HOST_DIR: ${AI_MEDIA_DIR:?set AI_MEDIA_DIR in .env}/models
+      MEDIA_MODEL_DIR: /app/media_models
+    volumes:
+      - ./gpu_control/server.py:/app/server.py:ro
+      - ./gpu_control/assets:/app/assets:ro
+      - ./gpu_control/benchmarks.py:/app/benchmarks.py:ro
+      - ./gpu_control/benchmark_views.py:/app/benchmark_views.py:ro
+      - ./gpu_control/model_catalog.py:/app/model_catalog.py:ro
+      - ./gpu_control/model_views.py:/app/model_views.py:ro
+      - ./gpu_control/catalog_discovery.py:/app/catalog_discovery.py:ro
+      - ./gpu_control/engine_updates.py:/app/engine_updates.py:ro
+      - ./gpu_control/webui_updates.py:/app/webui_updates.py:ro
+      - ./gpu_control/context_tuning.py:/app/context_tuning.py:ro
+      - ./gpu_control/media_catalog.py:/app/media_catalog.py:ro
+      - ./gpu_control/sharing.py:/app/sharing.py:ro
+      - ./gpu_control/sharing_views.py:/app/sharing_views.py:ro
+      - ./gpu_control/gpu_metrics.py:/app/gpu_metrics.py:ro
+      - ./gpu_control/parallel_tuning.py:/app/parallel_tuning.py:ro
+      - ./gpu_control/tune-parallel.sh:/app/tune-parallel.sh:ro
+      - ./gpu_control/results:/app/data
+      - ${AI_MODEL_CACHE:?set AI_MODEL_CACHE in .env}/gguf:/app/models
+      - ${AI_MEDIA_DIR:?set AI_MEDIA_DIR in .env}/models:/app/media_models
+      - ${AI_MEDIA_DIR:?set AI_MEDIA_DIR in .env}/output:/app/images:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: [python, /app/server.py]
+    read_only: true
+    networks: [control_internal]
+  nginx:
+    logging:
+      driver: json-file
+      options:
+        max-size: "${AI_LOG_MAX_SIZE:-10m}"
+        max-file: "${AI_LOG_MAX_FILES:-3}"
+    image: nginx:stable-alpine
+    restart: unless-stopped
+    ports:
+      - ${AI_BIND_IP:?set AI_BIND_IP in .env}:${AI_PORT:-8080}:8080
+      - ${AI_BIND_IP:?set AI_BIND_IP in .env}:${AI_TLS_PORT:-8443}:8443
+      - ${AI_BIND_IP:?set AI_BIND_IP in .env}:${AI_WEB_PORT:-3000}:3000
+      - ${AI_BIND_IP:?set AI_BIND_IP in .env}:${AI_CONTROL_PORT:-3001}:3001
+      - ${AI_BIND_IP:?set AI_BIND_IP in .env}:${AI_COMFY_PORT:-8188}:8188
+    volumes:
+      - ./secure_proxy/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./secure_proxy/iredmail-ai-tls.conf:/etc/nginx/iredmail-ai-tls.conf:ro
+      - ./secure_proxy/tls:/etc/nginx/tls:ro
+      - ./secure_proxy/.htpasswd:/etc/nginx/.htpasswd:ro
+    depends_on: [open-webui, gpu-control, fairness-gateway]
+    networks: [ai_internal, control_internal]
+networks:
+  ai_internal: {}
+  control_internal: {}
+volumes:
+  vllm_cache: {}
+  webui_data: {}
+  terminal_home: {}

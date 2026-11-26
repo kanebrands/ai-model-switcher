@@ -1,0 +1,24 @@
+name: Validate
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Unit and integration tests
+        run: python3 -m unittest discover -s . -p 'test_*.py' -q
+      - name: Regenerate standalone installer
+        run: |
+          python3 build_installer.py
+          git diff --exit-code -- ai-setup.sh
+      - name: Check shell syntax
+        run: |
+          bash -n ai-setup.base.sh ai-setup.sh ai-control.sh media-models.sh
+          sh -n tune-context.sh tune-parallel.sh update-engine.sh update-webui.sh
