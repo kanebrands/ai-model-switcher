@@ -10,8 +10,7 @@ flowchart LR
     Controller --> Docker[Docker socket]
     Docker --> Engine
     Nginx --> WebUI[Open WebUI :3000]
-    Nginx --> Switcher[Switcher :3001]
-    Switcher --> Controller
+    Nginx --> Controller
     Nginx --> ComfyUI[ComfyUI :8188]
     Controller --> Database[(Benchmark and settings SQLite DB)]
     Gateway --> Database
