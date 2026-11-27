@@ -30,6 +30,8 @@ The switcher and ComfyUI use HTTP Basic authentication. The username is `operato
 
 The switcher's **Find models** page searches public Hugging Face repositories across publishers. It offers single GGUF files, complete GGUF shard sets, and Safetensors repositories with standard configuration and tokenizer files. GGUF runs through llama.cpp on NVIDIA CUDA, AMD/Intel Vulkan when a render device is available, or CPU. Safetensors runs through vLLM on NVIDIA CUDA or CPU. **GPU + system RAM** is enabled by default for new installs: a model exceeding VRAM can use RAM-assisted llama.cpp placement or calculated vLLM CPU weight offload when the estimated combined budget fits. This is slower than keeping weights in VRAM, and it is not physical pooled memory. The selected model is staged and checksum-verified before a stopped serving container is created. **Try anyway** overrides the memory estimate only; disk capacity, file integrity, and engine compatibility remain required. Gated repositories and separate vision projector files are excluded. Model-specific custom Python code is not enabled.
 
+The same page can uninstall switcher-managed Hugging Face text models after you switch away from them. It removes their files and serving containers while retaining benchmark history. Installer-selected built-in models and shared ComfyUI files need separate manual review.
+
 ## What is in this repository
 
 - `ai-setup.sh` is the generated, standalone installer. It embeds the Compose file, controller, gateway, assets, and helper scripts.

@@ -1248,10 +1248,14 @@ class Handler(BaseHTTPRequestHandler):
                     ENGINE_UPDATES.check_async()
                 hardware, suggestions = MODEL_MANAGER.recommendations(prefer_ablit, hardware)
                 media_suggestions = MEDIA_MANAGER.recommendations(hardware, prefer_ablit)
-                self._send_html(model_views.index(hardware, suggestions, MODEL_MANAGER.installed(), MODEL_MANAGER.jobs(), CSRF,
+                installed = MODEL_MANAGER.installed()
+                active_models = {item["candidate_id"] for item in installed if running(item["container"])}
+                self._send_html(model_views.index(hardware, suggestions, installed, MODEL_MANAGER.jobs(), CSRF,
                                                   prefer_ablit, media_suggestions, MEDIA_MANAGER.jobs(), COMFY_URL,
                                                   DISCOVERY.latest(hardware), ENGINE_UPDATES.status(), DISCOVERY.latest_search(hardware),
-                                                  MODEL_MANAGER.hybrid_enabled()))
+                                                  MODEL_MANAGER.hybrid_enabled(), active_models,
+                                                  "Model uninstalled. Benchmarks were retained." if
+                                                  urllib.parse.parse_qs(path.query).get("removed") == ["1"] else ""))
             except Exception as exc:
                 self.send_error(503, f"Recommendations unavailable: {type(exc).__name__}")
             return
@@ -1378,7 +1382,7 @@ class Handler(BaseHTTPRequestHandler):
         self._page()
 
     def do_POST(self):
-        if self.path not in ("/switch", "/benchmark", "/context/tune", "/benchmarks/delete", "/models/install",
+        if self.path not in ("/switch", "/benchmark", "/context/tune", "/benchmarks/delete", "/models/install", "/models/uninstall",
                              "/models/media/install", "/models/refresh", "/models/search", "/models/hardware/rescan", "/models/discovered/install", "/models/hybrid", "/models/hybrid/apply",
                              "/models/engine/check", "/models/engine/update", "/webui/update", "/webui/update/dismiss",
                              "/sharing/save", "/sharing/reset", "/sharing/client", "/sharing/revoke",
@@ -1399,6 +1403,30 @@ class Handler(BaseHTTPRequestHandler):
         fields = urllib.parse.parse_qs(self.rfile.read(length).decode("utf-8"), strict_parsing=True)
         if fields.get("token") != [CSRF]:
             self.send_error(403, "Invalid request")
+            return
+        if self.path == "/models/uninstall":
+            candidate = fields.get("candidate", [])
+            confirmation = fields.get("confirm", [])
+            if len(candidate) != 1 or len(confirmation) != 1:
+                self.send_error(400, "Select one model and confirm its API name")
+                return
+            try:
+                if any((BENCHMARKS.busy, MEDIA_MANAGER.busy, CONTEXT_TUNER.busy,
+                        ENGINE_UPDATES.busy, PARALLEL_TUNER.busy)):
+                    raise RuntimeError("Finish the active benchmark, download, or tuning operation first")
+                with LOCK:
+                    MODEL_MANAGER.uninstall(candidate[0], confirmation[0])
+            except ValueError as exc:
+                self.send_error(400, str(exc))
+                return
+            except RuntimeError as exc:
+                self.send_error(409, str(exc))
+                return
+            self.send_response(303)
+            self.send_header("Location", "/models?removed=1#specific-search")
+            self.send_header("Content-Length", "0")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
             return
         if self.path.startswith("/sharing/"):
             try:
@@ -2687,6 +2715,111 @@ class ModelManager:
         with self.connect() as db:
             return [dict(row) for row in db.execute("SELECT * FROM installed_models ORDER BY installed_at DESC")]
 
+    def uninstall(self, candidate_id, confirmation):
+        """Remove an inactive, switcher-owned model and its serving container.
+
+        Benchmark history is intentionally independent of installed model files.
+        """
+        if not re.fullmatch(r"[a-z0-9-]{2,64}", candidate_id):
+            raise ValueError("Invalid model selection")
+        with self.lock:
+            if self.busy:
+                raise RuntimeError("Finish the current model operation before uninstalling")
+            self.busy = True
+        staged = None
+        destination = None
+        container_removed = False
+        committed = False
+        inspect = None
+        try:
+            with self.connect() as db:
+                row = db.execute("SELECT * FROM installed_models WHERE candidate_id=?", (candidate_id,)).fetchone()
+                if row is None:
+                    raise ValueError("Model is not installed by the switcher")
+                row = dict(row)
+                if confirmation != row["alias"]:
+                    raise ValueError("Enter the exact API name to confirm removal")
+                filename = row["filename"]
+                model_format = row.get("format") or "gguf"
+                if not SAFE_PATH.fullmatch(filename) or ".." in filename.split("/"):
+                    raise ValueError("Stored model path is unsafe")
+                if model_format == "gguf" and "/" not in filename and filename.endswith(".gguf"):
+                    relative = filename
+                elif (model_format in ("gguf-sharded", "safetensors") or model_format == "gguf") and filename.startswith("hf-" + candidate_id + "/"):
+                    relative = "hf-" + candidate_id
+                elif model_format == "safetensors" and filename == "hf-" + candidate_id:
+                    relative = filename
+                else:
+                    raise ValueError("Stored model path does not match a switcher-owned installation")
+                destination = os.path.join(self.model_dir, relative)
+                root = os.path.realpath(self.model_dir)
+                if (os.path.commonpath((root, os.path.realpath(destination))) != root or
+                        os.path.islink(destination) or not os.path.exists(destination)):
+                    raise ValueError("Model files are missing or outside managed storage")
+                others = db.execute("SELECT filename FROM installed_models WHERE candidate_id<>?", (candidate_id,))
+                if any(other["filename"] == relative or other["filename"].startswith(relative + "/")
+                       for other in others):
+                    raise RuntimeError("Another installed model references these files")
+                if os.path.isdir(destination):
+                    manifest = json.loads(row.get("files_json") or "null")
+                    if not isinstance(manifest, list) or not manifest:
+                        raise ValueError("Model file manifest is missing; review this installation manually")
+                    expected = {part["path"] for part in manifest if isinstance(part, dict) and
+                                isinstance(part.get("path"), str) and SAFE_PATH.fullmatch(part["path"])}
+                    actual = set()
+                    for folder, directories, filenames in os.walk(destination, followlinks=False):
+                        for name in directories + filenames:
+                            path = os.path.join(folder, name)
+                            if os.path.islink(path):
+                                raise ValueError("Model folder contains a symbolic link")
+                            if os.path.isfile(path):
+                                actual.add(os.path.relpath(path, destination))
+                    if actual != expected:
+                        raise ValueError("Model folder contains missing or extra files; review it manually")
+                try:
+                    inspect = docker_api("GET", "/containers/" + row["container"] + "/json")
+                except RuntimeError as exc:
+                    if "Docker API 404" not in str(exc):
+                        raise
+                if inspect and inspect["State"].get("Running"):
+                    raise RuntimeError("Switch to another workload before uninstalling this active model")
+                trash = os.path.join(self.model_dir, ".model-removals")
+                os.makedirs(trash, exist_ok=True)
+                if os.path.islink(trash) or os.path.realpath(trash) != os.path.join(root, ".model-removals"):
+                    raise ValueError("Removal staging directory is unsafe")
+                staged = os.path.join(trash, uuid.uuid4().hex)
+                os.replace(destination, staged)
+                if inspect:
+                    docker_api("DELETE", "/containers/" + row["container"] + "?force=0")
+                    container_removed = True
+                db.execute("DELETE FROM installed_models WHERE candidate_id=?", (candidate_id,))
+            committed = True
+            MODELS.pop("hf-" + candidate_id, None)
+            if os.path.isdir(staged):
+                shutil.rmtree(staged)
+            else:
+                os.remove(staged)
+            return row["alias"]
+        except Exception:
+            if committed:
+                raise RuntimeError("Model record was removed, but staged file cleanup needs manual attention")
+            if staged and os.path.lexists(staged) and destination and not os.path.lexists(destination):
+                os.replace(staged, destination)
+            if container_removed:
+                try:
+                    docker_api("POST", "/containers/create?name=" + row["container"],
+                               self.serving_config(row["filename"], row["alias"], row["context_tokens"],
+                                                   image=inspect["Config"]["Image"], parallel_slots=row["parallel_slots"],
+                                                   runtime=row["runtime"], model_format=row["format"],
+                                                   cpu_offload_gb=row["cpu_offload_gb"],
+                                                   hybrid_enabled=bool(row["hybrid_enabled"])))
+                except Exception as rollback_exc:
+                    raise RuntimeError("Removal failed and container restore failed: " + str(rollback_exc)[:180]) from rollback_exc
+            raise
+        finally:
+            with self.lock:
+                self.busy = False
+
     def hybrid_enabled(self):
         with self.connect() as db:
             return bool(db.execute("SELECT hybrid_enabled FROM model_preferences WHERE id=1").fetchone()[0])
@@ -3362,14 +3495,28 @@ def esc(value):
     return html.escape(str(value if value is not None else "—"), quote=True)
 
 
-def specific_search_section(search, installed, jobs, csrf, engine=None, hardware=None, hybrid_enabled=True):
+def uninstall_form(item, csrf, active_models=()):
+    active = item["candidate_id"] in active_models
+    if active:
+        return '<p class="note">Active: switch workloads before uninstalling.</p>'
+    return (f'<form method="post" action="/models/uninstall">'
+            f'<input type="hidden" name="token" value="{esc(csrf)}">'
+            f'<input type="hidden" name="candidate" value="{esc(item["candidate_id"])}">'
+            f'<label>Confirm API name <input type="text" name="confirm" required maxlength="128" '
+            f'autocomplete="off" placeholder="{esc(item["alias"])}" aria-label="Type {esc(item["alias"])} to uninstall"></label> '
+            '<button type="submit">Uninstall</button></form>')
+
+
+def specific_search_section(search, installed, jobs, csrf, engine=None, hardware=None, hybrid_enabled=True,
+                            active_models=()):
     search = search or {"status": "not searched", "items": [], "query": "", "error": None}
     installing = {job["candidate_id"] for job in jobs if job["status"] in ("queued", "running")}
     installed_files = {(item["repo"], item["sha256"]) for item in installed}
+    installed_ids = {item["candidate_id"] for item in installed}
     engine_build = (engine or {}).get("local_build") or 0
     rows = []
     for item in search["items"]:
-        installed_here = item.get("installed") or (item["repo"], item["sha256"]) in installed_files
+        installed_here = item["id"] in installed_ids or (item["repo"], item["sha256"]) in installed_files
         needs_engine = (item.get("runtime") == "gpu" and item.get("format", "gguf").startswith("gguf") and
                         item.get("min_engine_build", 0) > engine_build)
         busy = item["id"] in installing
@@ -3424,7 +3571,7 @@ def specific_search_section(search, installed, jobs, csrf, engine=None, hardware
                               f'<td>{esc(assistance)}</td>'
                               f'<td><form method="post" action="/switch"><input type="hidden" name="token" value="{esc(csrf)}">'
                               f'<button name="mode" value="hf-{esc(item["candidate_id"])}">Activate</button></form>'
-                              f'{apply_form}</td></tr>')
+                              f'{apply_form}{uninstall_form(item, csrf, active_models)}</td></tr>')
     return (f'<section class="card" id="specific-search"><h2>Search a specific Hugging Face model</h2>'
             '<p>Search by model name, exact owner/repository ID, or a Hugging Face repository URL. '
             'Searches any publisher and lists complete GGUF shard sets, single-file GGUF, and Safetensors repositories with standard tokenizer and configuration files. '
@@ -3444,14 +3591,16 @@ def specific_search_section(search, installed, jobs, csrf, engine=None, hardware
             f'<tbody>{"".join(rows) if rows else "<tr><td colspan=6>No search results yet.</td></tr>"}</tbody></table></div>'
             '<h3>Installed Hugging Face models</h3><p class="note">Use Apply saved preference to update an installed model. '
             'A running model is restarted and checked; failure restores its previous container. '
-            'A stopped model is staged with the new setting and checked when activated.</p>'
+            'A stopped model is staged with the new setting and checked when activated. '
+            'Uninstall removes the selected switcher-managed files and serving container; benchmark history stays available. '
+            'Switch away from an active model first. Files you added manually and shared ComfyUI assets are not removed.</p>'
             '<div class="scroll"><table><tr><th>API name</th><th>Repository</th><th>Engine</th><th>Memory setting</th><th>Action</th></tr>'
             f'{"".join(installed_rows) if installed_rows else "<tr><td colspan=5>None yet.</td></tr>"}</table></div></section>')
 
 
 def index(hardware, suggestions, installed, jobs, csrf, prefer_ablit=True,
           media_suggestions=(), media_jobs=(), comfy_url="", discovery=None, engine=None, search=None,
-          hybrid_enabled=True):
+          hybrid_enabled=True, active_models=(), message=""):
     selected_on = " selected" if prefer_ablit else ""
     selected_off = "" if prefer_ablit else " selected"
     hardware_line = (f'<h2>Detected hardware</h2><p>GPU: <strong>{esc(hardware["gpu"] or "unavailable")}</strong> · '
@@ -3465,7 +3614,8 @@ def index(hardware, suggestions, installed, jobs, csrf, prefer_ablit=True,
                      'RAM can hold model weights that do not fit in VRAM, but this does not increase physical VRAM or guarantee speed.</p>'
                      f'<form method="post" action="/models/hardware/rescan"><input type="hidden" name="token" value="{esc(csrf)}">'
                      '<button type="submit">Rescan hardware and suggestions</button></form>')
-    search_section = specific_search_section(search, installed, jobs, csrf, engine, hardware, hybrid_enabled)
+    search_section = specific_search_section(search, installed, jobs, csrf, engine, hardware, hybrid_enabled,
+                                             active_models)
     hybrid_box = (f'<section class="card" id="hybrid-memory"><h2>GPU + system RAM</h2>'
                   f'<p>New model installs: <strong>{"Enabled" if hybrid_enabled else "Disabled"}</strong> (default: enabled).</p>'
                   '<p>When a model exceeds GPU memory, llama.cpp can keep some GGUF layers in system RAM. '
@@ -3480,7 +3630,7 @@ def index(hardware, suggestions, installed, jobs, csrf, prefer_ablit=True,
                   + (f'<p role="status">Latest model operation: {esc(jobs[0]["status"])} · {esc(jobs[0]["stage"])}'
                      f' · {esc(jobs[0].get("error"))}</p>' if jobs else '') + '</section>')
     if not hardware.get("vram_mib"):
-        body = ('<section class="card">' + hardware_line + '</section>' + hybrid_box +
+        body = (f'<p class="message" role="status">{esc(message)}</p>' if message else '') + ('<section class="card">' + hardware_line + '</section>' + hybrid_box +
                 '<section class="card"><h2>CPU model choices</h2>'
                 '<p>No NVIDIA CUDA device was detected. GGUF can use an AMD or Intel Vulkan render device when available; '
                 'Safetensors uses the CPU runtime on this host. The installer offers CPU models according to detected RAM. '
@@ -3539,7 +3689,8 @@ def index(hardware, suggestions, installed, jobs, csrf, prefer_ablit=True,
                 f'<button name="mode" value="{esc(mode)}" type="submit">Activate</button></form>')
         configured_context = f'{item.get("context_tokens") or 32768:,} tokens'
         installed_rows.append(f'<tr><td>{esc(item["alias"])}</td><td>{esc(item["repo"])}</td>'
-                              f'<td>{esc(configured_context)}</td><td>{esc(item["installed_at"])}</td><td>{form}</td></tr>')
+                              f'<td>{esc(configured_context)}</td><td>{esc(item["installed_at"])}</td>'
+                              f'<td>{form}{uninstall_form(item, csrf, active_models)}</td></tr>')
     job_rows = []
     for job in jobs:
         job_rows.append(f'<tr><td>{esc(job["candidate_id"])}</td><td>{esc(job["status"])}</td>'
@@ -3547,14 +3698,16 @@ def index(hardware, suggestions, installed, jobs, csrf, prefer_ablit=True,
     refreshing = any(job["status"] in ("queued", "running") for job in jobs)
     discovery_rows = []
     installing = installing | {job["candidate_id"] for job in jobs if job["status"] in ("queued", "running")}
+    installed_ids = {item["candidate_id"] for item in installed}
     for number, item in enumerate(discovery.get("items", []), 1):
+        installed_here = item["id"] in installed_ids
         required = item.get("min_engine_build") or 0
         blocked = (required and item.get("runtime", "gpu") == "gpu" and
                    (engine.get("local_build") or 0) < required)
-        state = ("Installed" if item.get("installed") else "Installing" if item["id"] in installing
+        state = ("Installed" if installed_here else "Installing" if item["id"] in installing
                  else f"Needs llama.cpp build {required}+" if blocked else
                  "GPU + RAM estimate" if item.get("hybrid_used") else "Untested engine compatibility")
-        disabled = " disabled" if item.get("installed") or item["id"] in installing or blocked else ""
+        disabled = " disabled" if installed_here or item["id"] in installing or blocked else ""
         label = "Download and stage" if not disabled else state
         form = (f'<form method="post" action="/models/discovered/install"><input type="hidden" name="token" value="{esc(csrf)}">'
                 f'<input type="hidden" name="candidate" value="{esc(item["id"])}"><button type="submit"{disabled}>{esc(label)}</button></form>')
@@ -3592,7 +3745,7 @@ def index(hardware, suggestions, installed, jobs, csrf, prefer_ablit=True,
     refreshing = (refreshing or bool(media_installing) or discovery["status"] == "running"
                   or bool(engine.get("checking")) or bool(engine.get("busy")))
     comfy_link = f'<a href="{esc(comfy_url)}">Open ComfyUI</a>' if comfy_url else "Open ComfyUI from the switcher"
-    body = ('<div class="section-links" aria-label="Page sections"><a href="#hybrid-memory">GPU + RAM</a><a href="#specific-search">Search Hugging Face</a><a href="#text-models">Text and code</a><a href="#media-models">Image and video</a><a href="#discovered-models">Recent discoveries</a><a href="#installed-models">Installed</a></div>'
+    body = (f'<p class="message" role="status">{esc(message)}</p>' if message else '') + ('<div class="section-links" aria-label="Page sections"><a href="#hybrid-memory">GPU + RAM</a><a href="#specific-search">Search Hugging Face</a><a href="#text-models">Text and code</a><a href="#media-models">Image and video</a><a href="#discovered-models">Recent discoveries</a><a href="#installed-models">Installed</a></div>'
             + hybrid_box + search_section
             + '<div class="overview-grid"><section class="card" id="hardware">' + hardware_line + '</section><section class="card" id="engine">' + engine_box + '</section></div>'
             + '<h2 id="text-models">Text and code models</h2><p class="note">Top 10 reviewed Hugging Face GGUF candidates, including already installed models. New downloads use the selected GPU/RAM preference and available disk. '

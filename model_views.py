@@ -9,14 +9,28 @@ def esc(value):
     return html.escape(str(value if value is not None else "—"), quote=True)
 
 
-def specific_search_section(search, installed, jobs, csrf, engine=None, hardware=None, hybrid_enabled=True):
+def uninstall_form(item, csrf, active_models=()):
+    active = item["candidate_id"] in active_models
+    if active:
+        return '<p class="note">Active: switch workloads before uninstalling.</p>'
+    return (f'<form method="post" action="/models/uninstall">'
+            f'<input type="hidden" name="token" value="{esc(csrf)}">'
+            f'<input type="hidden" name="candidate" value="{esc(item["candidate_id"])}">'
+            f'<label>Confirm API name <input type="text" name="confirm" required maxlength="128" '
+            f'autocomplete="off" placeholder="{esc(item["alias"])}" aria-label="Type {esc(item["alias"])} to uninstall"></label> '
+            '<button type="submit">Uninstall</button></form>')
+
+
+def specific_search_section(search, installed, jobs, csrf, engine=None, hardware=None, hybrid_enabled=True,
+                            active_models=()):
     search = search or {"status": "not searched", "items": [], "query": "", "error": None}
     installing = {job["candidate_id"] for job in jobs if job["status"] in ("queued", "running")}
     installed_files = {(item["repo"], item["sha256"]) for item in installed}
+    installed_ids = {item["candidate_id"] for item in installed}
     engine_build = (engine or {}).get("local_build") or 0
     rows = []
     for item in search["items"]:
-        installed_here = item.get("installed") or (item["repo"], item["sha256"]) in installed_files
+        installed_here = item["id"] in installed_ids or (item["repo"], item["sha256"]) in installed_files
         needs_engine = (item.get("runtime") == "gpu" and item.get("format", "gguf").startswith("gguf") and
                         item.get("min_engine_build", 0) > engine_build)
         busy = item["id"] in installing
@@ -71,7 +85,7 @@ def specific_search_section(search, installed, jobs, csrf, engine=None, hardware
                               f'<td>{esc(assistance)}</td>'
                               f'<td><form method="post" action="/switch"><input type="hidden" name="token" value="{esc(csrf)}">'
                               f'<button name="mode" value="hf-{esc(item["candidate_id"])}">Activate</button></form>'
-                              f'{apply_form}</td></tr>')
+                              f'{apply_form}{uninstall_form(item, csrf, active_models)}</td></tr>')
     return (f'<section class="card" id="specific-search"><h2>Search a specific Hugging Face model</h2>'
             '<p>Search by model name, exact owner/repository ID, or a Hugging Face repository URL. '
             'Searches any publisher and lists complete GGUF shard sets, single-file GGUF, and Safetensors repositories with standard tokenizer and configuration files. '
@@ -91,14 +105,16 @@ def specific_search_section(search, installed, jobs, csrf, engine=None, hardware
             f'<tbody>{"".join(rows) if rows else "<tr><td colspan=6>No search results yet.</td></tr>"}</tbody></table></div>'
             '<h3>Installed Hugging Face models</h3><p class="note">Use Apply saved preference to update an installed model. '
             'A running model is restarted and checked; failure restores its previous container. '
-            'A stopped model is staged with the new setting and checked when activated.</p>'
+            'A stopped model is staged with the new setting and checked when activated. '
+            'Uninstall removes the selected switcher-managed files and serving container; benchmark history stays available. '
+            'Switch away from an active model first. Files you added manually and shared ComfyUI assets are not removed.</p>'
             '<div class="scroll"><table><tr><th>API name</th><th>Repository</th><th>Engine</th><th>Memory setting</th><th>Action</th></tr>'
             f'{"".join(installed_rows) if installed_rows else "<tr><td colspan=5>None yet.</td></tr>"}</table></div></section>')
 
 
 def index(hardware, suggestions, installed, jobs, csrf, prefer_ablit=True,
           media_suggestions=(), media_jobs=(), comfy_url="", discovery=None, engine=None, search=None,
-          hybrid_enabled=True):
+          hybrid_enabled=True, active_models=(), message=""):
     selected_on = " selected" if prefer_ablit else ""
     selected_off = "" if prefer_ablit else " selected"
     hardware_line = (f'<h2>Detected hardware</h2><p>GPU: <strong>{esc(hardware["gpu"] or "unavailable")}</strong> · '
@@ -112,7 +128,8 @@ def index(hardware, suggestions, installed, jobs, csrf, prefer_ablit=True,
                      'RAM can hold model weights that do not fit in VRAM, but this does not increase physical VRAM or guarantee speed.</p>'
                      f'<form method="post" action="/models/hardware/rescan"><input type="hidden" name="token" value="{esc(csrf)}">'
                      '<button type="submit">Rescan hardware and suggestions</button></form>')
-    search_section = specific_search_section(search, installed, jobs, csrf, engine, hardware, hybrid_enabled)
+    search_section = specific_search_section(search, installed, jobs, csrf, engine, hardware, hybrid_enabled,
+                                             active_models)
     hybrid_box = (f'<section class="card" id="hybrid-memory"><h2>GPU + system RAM</h2>'
                   f'<p>New model installs: <strong>{"Enabled" if hybrid_enabled else "Disabled"}</strong> (default: enabled).</p>'
                   '<p>When a model exceeds GPU memory, llama.cpp can keep some GGUF layers in system RAM. '
@@ -127,7 +144,7 @@ def index(hardware, suggestions, installed, jobs, csrf, prefer_ablit=True,
                   + (f'<p role="status">Latest model operation: {esc(jobs[0]["status"])} · {esc(jobs[0]["stage"])}'
                      f' · {esc(jobs[0].get("error"))}</p>' if jobs else '') + '</section>')
     if not hardware.get("vram_mib"):
-        body = ('<section class="card">' + hardware_line + '</section>' + hybrid_box +
+        body = (f'<p class="message" role="status">{esc(message)}</p>' if message else '') + ('<section class="card">' + hardware_line + '</section>' + hybrid_box +
                 '<section class="card"><h2>CPU model choices</h2>'
                 '<p>No NVIDIA CUDA device was detected. GGUF can use an AMD or Intel Vulkan render device when available; '
                 'Safetensors uses the CPU runtime on this host. The installer offers CPU models according to detected RAM. '
@@ -186,7 +203,8 @@ def index(hardware, suggestions, installed, jobs, csrf, prefer_ablit=True,
                 f'<button name="mode" value="{esc(mode)}" type="submit">Activate</button></form>')
         configured_context = f'{item.get("context_tokens") or 32768:,} tokens'
         installed_rows.append(f'<tr><td>{esc(item["alias"])}</td><td>{esc(item["repo"])}</td>'
-                              f'<td>{esc(configured_context)}</td><td>{esc(item["installed_at"])}</td><td>{form}</td></tr>')
+                              f'<td>{esc(configured_context)}</td><td>{esc(item["installed_at"])}</td>'
+                              f'<td>{form}{uninstall_form(item, csrf, active_models)}</td></tr>')
     job_rows = []
     for job in jobs:
         job_rows.append(f'<tr><td>{esc(job["candidate_id"])}</td><td>{esc(job["status"])}</td>'
@@ -194,14 +212,16 @@ def index(hardware, suggestions, installed, jobs, csrf, prefer_ablit=True,
     refreshing = any(job["status"] in ("queued", "running") for job in jobs)
     discovery_rows = []
     installing = installing | {job["candidate_id"] for job in jobs if job["status"] in ("queued", "running")}
+    installed_ids = {item["candidate_id"] for item in installed}
     for number, item in enumerate(discovery.get("items", []), 1):
+        installed_here = item["id"] in installed_ids
         required = item.get("min_engine_build") or 0
         blocked = (required and item.get("runtime", "gpu") == "gpu" and
                    (engine.get("local_build") or 0) < required)
-        state = ("Installed" if item.get("installed") else "Installing" if item["id"] in installing
+        state = ("Installed" if installed_here else "Installing" if item["id"] in installing
                  else f"Needs llama.cpp build {required}+" if blocked else
                  "GPU + RAM estimate" if item.get("hybrid_used") else "Untested engine compatibility")
-        disabled = " disabled" if item.get("installed") or item["id"] in installing or blocked else ""
+        disabled = " disabled" if installed_here or item["id"] in installing or blocked else ""
         label = "Download and stage" if not disabled else state
         form = (f'<form method="post" action="/models/discovered/install"><input type="hidden" name="token" value="{esc(csrf)}">'
                 f'<input type="hidden" name="candidate" value="{esc(item["id"])}"><button type="submit"{disabled}>{esc(label)}</button></form>')
@@ -239,7 +259,7 @@ def index(hardware, suggestions, installed, jobs, csrf, prefer_ablit=True,
     refreshing = (refreshing or bool(media_installing) or discovery["status"] == "running"
                   or bool(engine.get("checking")) or bool(engine.get("busy")))
     comfy_link = f'<a href="{esc(comfy_url)}">Open ComfyUI</a>' if comfy_url else "Open ComfyUI from the switcher"
-    body = ('<div class="section-links" aria-label="Page sections"><a href="#hybrid-memory">GPU + RAM</a><a href="#specific-search">Search Hugging Face</a><a href="#text-models">Text and code</a><a href="#media-models">Image and video</a><a href="#discovered-models">Recent discoveries</a><a href="#installed-models">Installed</a></div>'
+    body = (f'<p class="message" role="status">{esc(message)}</p>' if message else '') + ('<div class="section-links" aria-label="Page sections"><a href="#hybrid-memory">GPU + RAM</a><a href="#specific-search">Search Hugging Face</a><a href="#text-models">Text and code</a><a href="#media-models">Image and video</a><a href="#discovered-models">Recent discoveries</a><a href="#installed-models">Installed</a></div>'
             + hybrid_box + search_section
             + '<div class="overview-grid"><section class="card" id="hardware">' + hardware_line + '</section><section class="card" id="engine">' + engine_box + '</section></div>'
             + '<h2 id="text-models">Text and code models</h2><p class="note">Top 10 reviewed Hugging Face GGUF candidates, including already installed models. New downloads use the selected GPU/RAM preference and available disk. '

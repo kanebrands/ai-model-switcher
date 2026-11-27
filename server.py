@@ -400,10 +400,14 @@ class Handler(BaseHTTPRequestHandler):
                     ENGINE_UPDATES.check_async()
                 hardware, suggestions = MODEL_MANAGER.recommendations(prefer_ablit, hardware)
                 media_suggestions = MEDIA_MANAGER.recommendations(hardware, prefer_ablit)
-                self._send_html(model_views.index(hardware, suggestions, MODEL_MANAGER.installed(), MODEL_MANAGER.jobs(), CSRF,
+                installed = MODEL_MANAGER.installed()
+                active_models = {item["candidate_id"] for item in installed if running(item["container"])}
+                self._send_html(model_views.index(hardware, suggestions, installed, MODEL_MANAGER.jobs(), CSRF,
                                                   prefer_ablit, media_suggestions, MEDIA_MANAGER.jobs(), COMFY_URL,
                                                   DISCOVERY.latest(hardware), ENGINE_UPDATES.status(), DISCOVERY.latest_search(hardware),
-                                                  MODEL_MANAGER.hybrid_enabled()))
+                                                  MODEL_MANAGER.hybrid_enabled(), active_models,
+                                                  "Model uninstalled. Benchmarks were retained." if
+                                                  urllib.parse.parse_qs(path.query).get("removed") == ["1"] else ""))
             except Exception as exc:
                 self.send_error(503, f"Recommendations unavailable: {type(exc).__name__}")
             return
@@ -530,7 +534,7 @@ class Handler(BaseHTTPRequestHandler):
         self._page()
 
     def do_POST(self):
-        if self.path not in ("/switch", "/benchmark", "/context/tune", "/benchmarks/delete", "/models/install",
+        if self.path not in ("/switch", "/benchmark", "/context/tune", "/benchmarks/delete", "/models/install", "/models/uninstall",
                              "/models/media/install", "/models/refresh", "/models/search", "/models/hardware/rescan", "/models/discovered/install", "/models/hybrid", "/models/hybrid/apply",
                              "/models/engine/check", "/models/engine/update", "/webui/update", "/webui/update/dismiss",
                              "/sharing/save", "/sharing/reset", "/sharing/client", "/sharing/revoke",
@@ -551,6 +555,30 @@ class Handler(BaseHTTPRequestHandler):
         fields = urllib.parse.parse_qs(self.rfile.read(length).decode("utf-8"), strict_parsing=True)
         if fields.get("token") != [CSRF]:
             self.send_error(403, "Invalid request")
+            return
+        if self.path == "/models/uninstall":
+            candidate = fields.get("candidate", [])
+            confirmation = fields.get("confirm", [])
+            if len(candidate) != 1 or len(confirmation) != 1:
+                self.send_error(400, "Select one model and confirm its API name")
+                return
+            try:
+                if any((BENCHMARKS.busy, MEDIA_MANAGER.busy, CONTEXT_TUNER.busy,
+                        ENGINE_UPDATES.busy, PARALLEL_TUNER.busy)):
+                    raise RuntimeError("Finish the active benchmark, download, or tuning operation first")
+                with LOCK:
+                    MODEL_MANAGER.uninstall(candidate[0], confirmation[0])
+            except ValueError as exc:
+                self.send_error(400, str(exc))
+                return
+            except RuntimeError as exc:
+                self.send_error(409, str(exc))
+                return
+            self.send_response(303)
+            self.send_header("Location", "/models?removed=1#specific-search")
+            self.send_header("Content-Length", "0")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
             return
         if self.path.startswith("/sharing/"):
             try:

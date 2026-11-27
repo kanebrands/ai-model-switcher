@@ -162,6 +162,111 @@ class ModelManager:
         with self.connect() as db:
             return [dict(row) for row in db.execute("SELECT * FROM installed_models ORDER BY installed_at DESC")]
 
+    def uninstall(self, candidate_id, confirmation):
+        """Remove an inactive, switcher-owned model and its serving container.
+
+        Benchmark history is intentionally independent of installed model files.
+        """
+        if not re.fullmatch(r"[a-z0-9-]{2,64}", candidate_id):
+            raise ValueError("Invalid model selection")
+        with self.lock:
+            if self.busy:
+                raise RuntimeError("Finish the current model operation before uninstalling")
+            self.busy = True
+        staged = None
+        destination = None
+        container_removed = False
+        committed = False
+        inspect = None
+        try:
+            with self.connect() as db:
+                row = db.execute("SELECT * FROM installed_models WHERE candidate_id=?", (candidate_id,)).fetchone()
+                if row is None:
+                    raise ValueError("Model is not installed by the switcher")
+                row = dict(row)
+                if confirmation != row["alias"]:
+                    raise ValueError("Enter the exact API name to confirm removal")
+                filename = row["filename"]
+                model_format = row.get("format") or "gguf"
+                if not SAFE_PATH.fullmatch(filename) or ".." in filename.split("/"):
+                    raise ValueError("Stored model path is unsafe")
+                if model_format == "gguf" and "/" not in filename and filename.endswith(".gguf"):
+                    relative = filename
+                elif (model_format in ("gguf-sharded", "safetensors") or model_format == "gguf") and filename.startswith("hf-" + candidate_id + "/"):
+                    relative = "hf-" + candidate_id
+                elif model_format == "safetensors" and filename == "hf-" + candidate_id:
+                    relative = filename
+                else:
+                    raise ValueError("Stored model path does not match a switcher-owned installation")
+                destination = os.path.join(self.model_dir, relative)
+                root = os.path.realpath(self.model_dir)
+                if (os.path.commonpath((root, os.path.realpath(destination))) != root or
+                        os.path.islink(destination) or not os.path.exists(destination)):
+                    raise ValueError("Model files are missing or outside managed storage")
+                others = db.execute("SELECT filename FROM installed_models WHERE candidate_id<>?", (candidate_id,))
+                if any(other["filename"] == relative or other["filename"].startswith(relative + "/")
+                       for other in others):
+                    raise RuntimeError("Another installed model references these files")
+                if os.path.isdir(destination):
+                    manifest = json.loads(row.get("files_json") or "null")
+                    if not isinstance(manifest, list) or not manifest:
+                        raise ValueError("Model file manifest is missing; review this installation manually")
+                    expected = {part["path"] for part in manifest if isinstance(part, dict) and
+                                isinstance(part.get("path"), str) and SAFE_PATH.fullmatch(part["path"])}
+                    actual = set()
+                    for folder, directories, filenames in os.walk(destination, followlinks=False):
+                        for name in directories + filenames:
+                            path = os.path.join(folder, name)
+                            if os.path.islink(path):
+                                raise ValueError("Model folder contains a symbolic link")
+                            if os.path.isfile(path):
+                                actual.add(os.path.relpath(path, destination))
+                    if actual != expected:
+                        raise ValueError("Model folder contains missing or extra files; review it manually")
+                try:
+                    inspect = docker_api("GET", "/containers/" + row["container"] + "/json")
+                except RuntimeError as exc:
+                    if "Docker API 404" not in str(exc):
+                        raise
+                if inspect and inspect["State"].get("Running"):
+                    raise RuntimeError("Switch to another workload before uninstalling this active model")
+                trash = os.path.join(self.model_dir, ".model-removals")
+                os.makedirs(trash, exist_ok=True)
+                if os.path.islink(trash) or os.path.realpath(trash) != os.path.join(root, ".model-removals"):
+                    raise ValueError("Removal staging directory is unsafe")
+                staged = os.path.join(trash, uuid.uuid4().hex)
+                os.replace(destination, staged)
+                if inspect:
+                    docker_api("DELETE", "/containers/" + row["container"] + "?force=0")
+                    container_removed = True
+                db.execute("DELETE FROM installed_models WHERE candidate_id=?", (candidate_id,))
+            committed = True
+            MODELS.pop("hf-" + candidate_id, None)
+            if os.path.isdir(staged):
+                shutil.rmtree(staged)
+            else:
+                os.remove(staged)
+            return row["alias"]
+        except Exception:
+            if committed:
+                raise RuntimeError("Model record was removed, but staged file cleanup needs manual attention")
+            if staged and os.path.lexists(staged) and destination and not os.path.lexists(destination):
+                os.replace(staged, destination)
+            if container_removed:
+                try:
+                    docker_api("POST", "/containers/create?name=" + row["container"],
+                               self.serving_config(row["filename"], row["alias"], row["context_tokens"],
+                                                   image=inspect["Config"]["Image"], parallel_slots=row["parallel_slots"],
+                                                   runtime=row["runtime"], model_format=row["format"],
+                                                   cpu_offload_gb=row["cpu_offload_gb"],
+                                                   hybrid_enabled=bool(row["hybrid_enabled"])))
+                except Exception as rollback_exc:
+                    raise RuntimeError("Removal failed and container restore failed: " + str(rollback_exc)[:180]) from rollback_exc
+            raise
+        finally:
+            with self.lock:
+                self.busy = False
+
     def hybrid_enabled(self):
         with self.connect() as db:
             return bool(db.execute("SELECT hybrid_enabled FROM model_preferences WHERE id=1").fetchone()[0])
