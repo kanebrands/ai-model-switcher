@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Streaming OpenAI-compatible proxy with per-client admission control."""
 import http.client
+import datetime as dt
 import json
 import os
 import re
+import sqlite3
 import threading
 import time
 import urllib.request
@@ -15,6 +17,7 @@ from sharing import SharingManager, FIELDS
 DB_PATH = os.environ.get("BENCHMARK_DB", "/app/data/benchmarks.sqlite3")
 LEGACY_KEY = os.environ["BENCHMARK_API_KEY"]
 SHARING = SharingManager(DB_PATH, read_only=True)
+USAGE = None  # Initialized only in the server process, after the database mount is ready.
 HOP_HEADERS = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
                "te", "trailer", "transfer-encoding", "upgrade"}
 BACKEND = re.compile(r"[a-z0-9-]+:(?:8000|8080)\Z")
@@ -46,7 +49,61 @@ def cap_output(path, raw, content_type, maximum):
             raise ValueError(f"{name} must be a positive integer")
         else:
             body[name] = min(value, maximum)
+    if body.get("stream") is True and route.endswith(("/chat/completions", "/completions")):
+        options = body.get("stream_options")
+        if options is None:
+            options = {}
+        if isinstance(options, dict):
+            options["include_usage"] = True
+            body["stream_options"] = options
     return json.dumps(body, separators=(",", ":")).encode()
+
+
+class UsageCollector:
+    """Extract reported usage from JSON or SSE without retaining generated text."""
+    def __init__(self, content_type):
+        self.streaming = "text/event-stream" in (content_type or "").lower()
+        self.buffer = b""
+        self.input_tokens = None
+        self.output_tokens = None
+
+    def _accept(self, payload):
+        if not isinstance(payload, dict):
+            return
+        usage = payload.get("usage") or (payload.get("response") or {}).get("usage")
+        if not isinstance(usage, dict):
+            return
+        incoming = usage.get("prompt_tokens", usage.get("input_tokens"))
+        outgoing = usage.get("completion_tokens", usage.get("output_tokens"))
+        if isinstance(incoming, int) and incoming >= 0:
+            self.input_tokens = incoming
+        if isinstance(outgoing, int) and outgoing >= 0:
+            self.output_tokens = outgoing
+
+    def feed(self, chunk):
+        if not self.streaming:
+            if len(self.buffer) + len(chunk) <= 2 * 1024 * 1024:
+                self.buffer += chunk
+            return
+        self.buffer = (self.buffer + chunk).replace(b"\r\n", b"\n")
+        while b"\n\n" in self.buffer:
+            event, self.buffer = self.buffer.split(b"\n\n", 1)
+            data = b"\n".join(line[5:].strip() for line in event.splitlines() if line.startswith(b"data:"))
+            if data and data != b"[DONE]" and len(data) <= 2 * 1024 * 1024:
+                try:
+                    self._accept(json.loads(data))
+                except (ValueError, UnicodeDecodeError):
+                    pass
+        if len(self.buffer) > 2 * 1024 * 1024:
+            self.buffer = self.buffer[-65536:]
+
+    def result(self):
+        if not self.streaming and self.buffer:
+            try:
+                self._accept(json.loads(self.buffer))
+            except (ValueError, UnicodeDecodeError):
+                pass
+        return self.input_tokens, self.output_tokens
 
 
 class Admission:
@@ -176,6 +233,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 self.reply(429, "Client rate or concurrency limit reached", retry)
                 return
         upstream = None
+        collector = None
+        response_status = 502
+        started_at = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+        started_clock = time.monotonic()
         try:
             path = self.path
             if path.startswith("/vision/v1/"):
@@ -197,6 +258,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
             headers["Connection"] = "close"
             upstream.request(self.command, path, body=raw if self.command == "POST" else None, headers=headers)
             response = upstream.getresponse()
+            response_status = response.status
+            collector = UsageCollector(response.getheader("Content-Type")) if admitted else None
             self.send_response(response.status)
             for key, value in response.getheaders():
                 if key.lower() not in HOP_HEADERS:
@@ -205,6 +268,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
             self.end_headers()
             if self.command != "HEAD":
                 while chunk := response.read1(65536):
+                    if collector:
+                        collector.feed(chunk)
                     self.wfile.write(chunk)
                     self.wfile.flush()
         except (OSError, RuntimeError, ValueError) as exc:
@@ -217,6 +282,13 @@ class GatewayHandler(BaseHTTPRequestHandler):
             if upstream:
                 upstream.close()
             if admitted:
+                try:
+                    if USAGE:
+                        incoming, outgoing = collector.result() if collector else (None, None)
+                        USAGE.record_usage(client_id, started_at, response_status,
+                                           time.monotonic() - started_clock, incoming, outgoing)
+                except (OSError, sqlite3.Error, ValueError, RuntimeError):
+                    pass  # Telemetry must never break a client response or hold its slot.
                 ADMISSION.release(client_id)
 
     def end_headers(self):
@@ -225,4 +297,5 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    USAGE = SharingManager(DB_PATH)
     ThreadingHTTPServer(("0.0.0.0", 8002), GatewayHandler).serve_forever()

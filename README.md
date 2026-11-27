@@ -32,6 +32,8 @@ The switcher's **Find models** page searches public Hugging Face repositories ac
 
 The same page can uninstall switcher-managed Hugging Face text models after you switch away from them. It removes their files and serving containers while retaining benchmark history. Installer-selected built-in models and shared ComfyUI files need separate manual review.
 
+New Hugging Face installations use readable API IDs derived from their model names. Existing IDs remain stable unless you explicitly change one on an inactive model. Text and ComfyUI downloads queue when another download of the same type is running. Progress updates in place without full-page reloads. The **Client sharing** page can show per-key input/output token totals and effective output tokens/s graphs for a selected key and time window; missing engine usage is labeled unmeasured.
+
 ## What is in this repository
 
 - `ai-setup.sh` is the generated, standalone installer. It embeds the Compose file, controller, gateway, assets, and helper scripts.

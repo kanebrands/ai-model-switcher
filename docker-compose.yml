@@ -441,7 +441,7 @@ services:
     volumes:
       - ./gpu_control/fairness_gateway.py:/app/fairness_gateway.py:ro
       - ./gpu_control/sharing.py:/app/sharing.py:ro
-      - ./gpu_control/results:/app/data:ro
+      - ./gpu_control/results:/app/data
     command: [python, /app/fairness_gateway.py]
     read_only: true
     depends_on: [gpu-control]
@@ -466,6 +466,7 @@ services:
       MEDIA_MODEL_DIR: /app/media_models
     volumes:
       - ./gpu_control/server.py:/app/server.py:ro
+      - ./gpu_control/operation_poll.js:/app/operation_poll.js:ro
       - ./gpu_control/assets:/app/assets:ro
       - ./gpu_control/benchmarks.py:/app/benchmarks.py:ro
       - ./gpu_control/benchmark_views.py:/app/benchmark_views.py:ro

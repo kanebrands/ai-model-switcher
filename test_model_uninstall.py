@@ -107,6 +107,27 @@ class ModelUninstallTests(unittest.TestCase):
         self.assertNotIn("/models/uninstall", uninstall_form(row, "csrf", {self.candidate}))
         self.assertIn("/models/uninstall", uninstall_form(row, "csrf"))
 
+    def test_rename_inactive_api_id_and_rollback_on_create_failure(self):
+        self.install_row()
+        inspect = {"State": {"Running": False}, "Config": {"Image": "llama:test"}}
+        with patch("model_catalog.docker_api", return_value=inspect) as docker:
+            new_alias = self.manager.rename_alias(self.candidate, "local-readable-model")
+        self.assertEqual(new_alias, "local-readable-model")
+        self.assertEqual(self.manager.installed()[0]["alias"], new_alias)
+        self.assertEqual(MODELS["hf-" + self.candidate][0], new_alias)
+        self.assertTrue(any(call.args[0] == "DELETE" for call in docker.call_args_list))
+
+        def fail_create(method, path, *args):
+            if path.startswith("/containers/create?"):
+                raise RuntimeError("create failed")
+            return inspect
+        with patch("model_catalog.docker_api", side_effect=fail_create) as docker:
+            with self.assertRaisesRegex(RuntimeError, "create failed"):
+                self.manager.rename_alias(self.candidate, "local-another-model")
+        self.assertEqual(self.manager.installed()[0]["alias"], new_alias)
+        self.assertTrue(any("/rename?name=" + self.container in call.args[1]
+                            for call in docker.call_args_list if call.args[0] == "POST"))
+
 
 if __name__ == "__main__":
     unittest.main()

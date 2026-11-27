@@ -1,5 +1,7 @@
 """Explain and render client fairness settings without browser JavaScript."""
+import datetime as dt
 import html
+import urllib.parse
 
 from benchmark_views import shell
 from sharing import FIELDS, defaults
@@ -7,6 +9,49 @@ from sharing import FIELDS, defaults
 
 def esc(value):
     return html.escape(str(value), quote=True)
+
+
+def usage_graph(usage, key, title, suffix=""):
+    points = usage["points"]
+    peak = max((point[key] or 0 for point in points), default=0) or 1
+    start = dt.datetime.fromisoformat(usage["start"])
+    span = (dt.datetime.fromisoformat(usage["end"]) - start) / len(points)
+    columns = []
+    for number, point in enumerate(points):
+        value = point[key]
+        label = "unmeasured" if value is None else f"{value:,.2f}{suffix}" if isinstance(value, float) else f"{value:,}{suffix}"
+        bucket = (start + span * number).strftime("%Y-%m-%d %H:%M UTC")
+        height = max(0, min(100, (value or 0) / peak * 100))
+        columns.append(f'<span class="usage-bar" style="height:{height:.1f}%" title="{esc(bucket)}: {esc(label)}"></span>')
+    return (f'<div class="usage-chart"><h3>{esc(title)}</h3><div class="usage-bars" role="img" '
+            f'aria-label="{esc(title)} across {len(points)} equal time buckets from {esc(usage["start"])} to {esc(usage["end"])}">'
+            + "".join(columns) + '</div><p class="note">Older → newer; hover bars for each bucket.</p></div>')
+
+
+def usage_panel(usage, label):
+    totals = usage["totals"]
+    choices = "".join(f'<option value="{unit}"{" selected" if unit == usage["unit"] else ""}>{unit.title()}</option>'
+                      for unit in ("minutes", "hours", "days"))
+    rate = f'{totals["tokens_per_second"]:,.2f}' if totals["tokens_per_second"] is not None else "Unmeasured"
+    return (f'<section class="card" id="client-usage"><h2>Usage for {esc(label)}</h2>'
+            '<p class="note">Totals use token counts reported by the serving engine. Streaming Chat Completions request usage explicitly. '
+            'When a model or API route omits token usage, that request remains in the request count but its tokens are unmeasured. '
+            'Tokens/s is reported output tokens divided by measured end-to-end request seconds, weighted across requests; '
+            'it is not a GPU kernel speed measurement.</p>'
+            f'<form method="get" action="/sharing"><input type="hidden" name="client" value="{esc(usage["client_id"])}">'
+            f'<label for="usage-amount">Last</label><input id="usage-amount" type="number" min="1" max="129600" '
+            f'name="amount" value="{usage["amount"]}" required> <select name="unit" aria-label="Usage time unit">{choices}</select> '
+            '<button type="submit">Update usage window</button></form>'
+            f'<p class="note">{esc(usage["start"])} to {esc(usage["end"])} UTC</p>'
+            '<div class="usage-totals">'
+            f'<div><span>Input tokens</span><strong>{totals["input_tokens"]:,}</strong><small>{totals["input_measured"]:,} of {totals["requests"]:,} requests measured</small></div>'
+            f'<div><span>Output tokens</span><strong>{totals["output_tokens"]:,}</strong><small>{totals["output_measured"]:,} of {totals["requests"]:,} requests measured</small></div>'
+            f'<div><span>Effective output tokens/s</span><strong>{rate}</strong><small>Across measured responses</small></div>'
+            '</div><div class="usage-charts">'
+            + usage_graph(usage, "input_tokens", "Input tokens")
+            + usage_graph(usage, "output_tokens", "Output tokens")
+            + usage_graph(usage, "tokens_per_second", "Effective output tokens/s", " tokens/s")
+            + '</div></section>')
 
 
 EXPLAIN = (
@@ -32,7 +77,7 @@ EXPLAIN = (
 
 
 def index(settings, clients, csrf, hardware, server_slots, active_mode=None,
-          parallel_status=None, created=None, message=""):
+          parallel_status=None, created=None, message="", selected_usage=None, selected_client_label=""):
     recommended = defaults(hardware, server_slots)
     parallel_status = parallel_status or {"busy": False, "job": None}
     parallel_job = parallel_status.get("job") or {}
@@ -44,7 +89,7 @@ def index(settings, clients, csrf, hardware, server_slots, active_mode=None,
                      f'<input type="hidden" name="mode" value="{esc(active_mode)}">'
                      f'<label for="parallel-slots">Parallel generation slots for {esc(active_mode)}</label> '
                      f'<input id="parallel-slots" name="slots" type="number" min="1" max="8" step="1" value="{server_slots}" required> '
-                     '<button type="submit">Test and apply slots</button></form>') if active_mode and active_mode != "media" and not parallel_status["busy"] else ('<p>Slot test running. This page refreshes every five seconds.</p>' if parallel_status["busy"] else '<p>Start a text or vision model to change its generation slots.</p>')
+                     '<button type="submit">Test and apply slots</button></form>') if active_mode and active_mode != "media" and not parallel_status["busy"] else ('<p>Slot test running. Progress updates above without reloading this page.</p>' if parallel_status["busy"] else '<p>Start a text or vision model to change its generation slots.</p>')
     fields = "".join(
         f'<div class="setting"><label for="{key}">{esc(title)}</label>'
         f'<input id="{key}" name="{key}" type="number" min="0" step="1" value="{esc(settings[key])}" required>'
@@ -53,6 +98,7 @@ def index(settings, clients, csrf, hardware, server_slots, active_mode=None,
     client_rows = "".join(
         f'<tr><td>{esc(client["label"])}</td><td>{esc(client["created_at"])}</td>'
         f'<td>{"Revoked" if client["revoked_at"] else "Active"}</td><td>'
+        + f'<a href="/sharing?{urllib.parse.urlencode({"client": client["id"]})}#client-usage">View usage</a> '
         + (f'<form method="post" action="/sharing/revoke"><input type="hidden" name="token" value="{esc(csrf)}">'
            f'<input type="hidden" name="client_id" value="{esc(client["id"])}">'
            '<button type="submit">Revoke key</button></form>' if not client["revoked_at"] else '')
@@ -100,6 +146,8 @@ def index(settings, clients, csrf, hardware, server_slots, active_mode=None,
               '<input id="client-label" name="label" maxlength="64" required placeholder="e.g. deck-builder"> '
               '<button type="submit">Create client key</button></form>'
             + '<div class="scroll"><table><tr><th>Client</th><th>Created UTC</th><th>Status</th><th>Action</th></tr>'
-            + (client_rows or '<tr><td colspan="4">No dedicated client keys yet.</td></tr>') + '</table></div></div>')
-    style = """<style>.settings-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1rem}.setting{padding:.8rem;border:1px solid #344b50;border-radius:.6rem;background:#122126}.setting label{display:block;margin-bottom:.3rem}.setting input{width:8rem}.setting p{font-size:.9rem;margin:.5rem 0 0}.secondary{background:#22373a;color:#e6d3b3;border-color:#557070}.secondary:hover{background:#30484b}.new-key{display:block;overflow-wrap:anywhere;padding:1rem;background:#0b181c;border:1px solid #4d696a;border-radius:.5rem}@media(max-width:760px){.settings-grid{grid-template-columns:1fr}}</style>"""
+            + '<tr><td>Shared legacy key</td><td>Before dedicated keys</td><td>Active</td><td><a href="/sharing?client=legacy#client-usage">View usage</a></td></tr>'
+            + client_rows + '</table></div></div>'
+            + (usage_panel(selected_usage, selected_client_label) if selected_usage else ''))
+    style = """<style>.settings-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1rem}.setting{padding:.8rem;border:1px solid #344b50;border-radius:.6rem;background:#122126}.setting label{display:block;margin-bottom:.3rem}.setting input{width:8rem}.setting p{font-size:.9rem;margin:.5rem 0 0}.secondary{background:#22373a;color:#e6d3b3;border-color:#557070}.secondary:hover{background:#30484b}.new-key{display:block;overflow-wrap:anywhere;padding:1rem;background:#0b181c;border:1px solid #4d696a;border-radius:.5rem}.usage-totals{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:.8rem}.usage-totals>div{display:grid;gap:.2rem;background:#102024;border:1px solid #365056;border-radius:.7rem;padding:1rem}.usage-totals strong{font-size:clamp(1.3rem,3vw,2rem);color:#f1bf81}.usage-totals small{color:#b6c6c4}.usage-charts{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:.8rem;margin-top:1rem}.usage-chart{background:#102024;border:1px solid #365056;border-radius:.7rem;padding:1rem;min-width:0}.usage-chart h3{margin:.1rem 0 .8rem}.usage-chart p{font-size:.78rem}.usage-bars{height:9rem;display:flex;align-items:end;gap:2px;border-bottom:1px solid #8ba9a1}.usage-bar{flex:1;min-width:2px;background:linear-gradient(#f1bf81,#a87645);border-radius:3px 3px 0 0}@media(max-width:900px){.usage-charts{grid-template-columns:1fr}}@media(max-width:760px){.settings-grid,.usage-totals{grid-template-columns:1fr}}</style>"""
     return shell("Client sharing and rate limits", style + body, refresh=parallel_status["busy"], wide=True)

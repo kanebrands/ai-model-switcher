@@ -12,6 +12,7 @@ from unittest.mock import patch
 from gpu_metrics import GPUMonitor, parse_samples
 from parallel_tuning import ParallelTuner
 from sharing import SharingManager, defaults, FIELDS
+from sharing_views import index as sharing_page
 
 with patch.dict(os.environ, {"BENCHMARK_API_KEY": "legacy-test-key"}):
     import fairness_gateway as gateway
@@ -58,6 +59,43 @@ class SharingTests(unittest.TestCase):
         capped = gateway.cap_output("/v1/chat/completions", raw, "application/json", 2048)
         self.assertEqual(json.loads(capped)["max_tokens"], 2048)
         self.assertEqual(json.loads(gateway.cap_output("/v1/responses", b'{}', "application/json", 512))["max_output_tokens"], 512)
+        streaming = gateway.cap_output("/v1/chat/completions", b'{"stream":true}', "application/json", 512)
+        self.assertTrue(json.loads(streaming)["stream_options"]["include_usage"])
+
+    def test_usage_collector_reads_json_and_split_sse_without_storing_text(self):
+        collector = gateway.UsageCollector("text/event-stream")
+        collector.feed(b'data: {"choices":[{"delta":{"content":"secret"}}]}\n\ndata: {"usage":{"prompt_tokens":12,')
+        collector.feed(b'"completion_tokens":5}}\n\ndata: [DONE]\n\n')
+        self.assertEqual(collector.result(), (12, 5))
+        responses = gateway.UsageCollector("application/json")
+        responses.feed(b'{"usage":{"input_tokens":20,"output_tokens":7}}')
+        self.assertEqual(responses.result(), (20, 7))
+
+    def test_per_key_window_counts_and_graph_visibility(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = SharingManager(directory + "/sharing.db")
+            client = manager.create_client("Deck Builder")
+            from sharing import now
+            manager.record_usage(client["id"], now(), 200, 2.0, 100, 50)
+            manager.record_usage(client["id"], now(), 200, 1.0, None, None)
+            manager.record_usage("legacy", now(), 200, 1.0, 8, 4)
+            report = manager.usage_summary(client["id"], 1, "hours")
+            self.assertEqual(report["totals"]["requests"], 2)
+            self.assertEqual(report["totals"]["input_tokens"], 100)
+            self.assertEqual(report["totals"]["output_tokens"], 50)
+            self.assertEqual(report["totals"]["tokens_per_second"], 25.0)
+            self.assertEqual(report["totals"]["input_measured"], 1)
+            self.assertEqual(len(report["points"]), 30)
+            hardware = {"vram_mib": 0, "ram_gib": 16, "cpu_threads": 8}
+            settings = manager.settings(hardware, 1)
+            clients = manager.clients()
+            hidden = sharing_page(settings, clients, "csrf", hardware, 1)
+            self.assertNotIn('id="client-usage"', hidden)
+            visible = sharing_page(settings, clients, "csrf", hardware, 1,
+                                   selected_usage=report, selected_client_label="Deck Builder")
+            self.assertIn('id="client-usage"', visible)
+            self.assertIn("25.00", visible)
+            self.assertIn("Input tokens", visible)
 
     def test_gpu_parser_accepts_optional_power_and_multiple_devices(self):
         samples = parse_samples("0, GPU A, 52, 8000, 24000, 61, 210.5\n1, GPU B, 0, 10, 16000, N/A, N/A",
@@ -103,7 +141,7 @@ class GatewayIntegrationTests(unittest.TestCase):
                 length = int(self.headers["Content-Length"])
                 seen["auth"] = self.headers["Authorization"]
                 seen["body"] = json.loads(self.rfile.read(length))
-                data = b'data: {"ok":true}\n\ndata: [DONE]\n\n'
+                data = b'data: {"ok":true}\n\ndata: {"usage":{"prompt_tokens":9,"completion_tokens":4}}\n\ndata: [DONE]\n\n'
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
                 self.send_header("Content-Length", str(len(data)))
@@ -134,6 +172,7 @@ class GatewayIntegrationTests(unittest.TestCase):
                 thread.start()
             try:
                 with patch.object(gateway, "SHARING", manager), \
+                     patch.object(gateway, "USAGE", manager), \
                      patch.object(gateway, "BACKEND", re.compile(r"127\.0\.0\.1:\d+\Z")), \
                      patch.object(gateway.urllib.request, "urlopen", return_value=Route(f"127.0.0.1:{backend.server_port}")):
                     conn = http.client.HTTPConnection("127.0.0.1", gateway_server.server_port, timeout=5)
@@ -146,6 +185,9 @@ class GatewayIntegrationTests(unittest.TestCase):
                     conn.close()
                 self.assertEqual(seen["auth"], "Bearer legacy-test-key")
                 self.assertEqual(seen["body"]["max_tokens"], 8192)
+                self.assertTrue(seen["body"]["stream_options"]["include_usage"])
+                totals = manager.usage_summary(client["id"], 1, "hours")["totals"]
+                self.assertEqual((totals["input_tokens"], totals["output_tokens"]), (9, 4))
             finally:
                 gateway_server.shutdown(); backend.shutdown()
                 gateway_server.server_close(); backend.server_close()

@@ -51,6 +51,11 @@ class SharingManager:
             db.execute("""CREATE TABLE IF NOT EXISTS sharing_clients (
                 id TEXT PRIMARY KEY, label TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE,
                 created_at TEXT NOT NULL, revoked_at TEXT)""")
+            db.execute("""CREATE TABLE IF NOT EXISTS api_usage (
+                id INTEGER PRIMARY KEY, client_id TEXT NOT NULL, started_at TEXT NOT NULL,
+                status INTEGER NOT NULL, duration_seconds REAL NOT NULL,
+                input_tokens INTEGER, output_tokens INTEGER)""")
+            db.execute("CREATE INDEX IF NOT EXISTS api_usage_client_time ON api_usage(client_id,started_at)")
 
     def connect(self):
         db = (sqlite3.connect("file:" + self.db_path + "?mode=ro", uri=True, timeout=20)
@@ -150,3 +155,54 @@ class SharingManager:
         with self.connect() as db:
             row = db.execute("SELECT id FROM sharing_clients WHERE token_hash=? AND revoked_at IS NULL", (digest,)).fetchone()
         return row["id"] if row else None
+
+    def record_usage(self, client_id, started_at, status, duration_seconds, input_tokens=None, output_tokens=None):
+        """Store request metadata and engine-reported tokens, never keys or prompts."""
+        if self.read_only:
+            raise RuntimeError("Usage recording requires writable storage")
+        if not client_id or any(value is not None and (not isinstance(value, int) or value < 0)
+                                for value in (input_tokens, output_tokens)):
+            raise ValueError("Invalid usage record")
+        with self.connect() as db:
+            db.execute("INSERT INTO api_usage(client_id,started_at,status,duration_seconds,input_tokens,output_tokens) "
+                       "VALUES(?,?,?,?,?,?)",
+                       (client_id, started_at, int(status), max(0, float(duration_seconds)), input_tokens, output_tokens))
+
+    def usage_summary(self, client_id, amount=24, unit="hours", buckets=30):
+        """Aggregate one key over a chosen UTC window; missing token counts stay unknown."""
+        seconds_per = {"minutes": 60, "hours": 3600, "days": 86400}
+        if unit not in seconds_per or not isinstance(amount, int) or not 1 <= amount or amount * seconds_per[unit] > 90 * 86400:
+            raise ValueError("Choose a window from one minute through 90 days")
+        if not isinstance(buckets, int) or not 1 <= buckets <= 120:
+            raise ValueError("Invalid graph resolution")
+        end = dt.datetime.now(dt.timezone.utc)
+        start = end - dt.timedelta(seconds=amount * seconds_per[unit])
+        start_text = start.isoformat(timespec="seconds")
+        end_text = end.isoformat(timespec="seconds")
+        bucket_seconds = amount * seconds_per[unit] / buckets
+        with self.connect() as db:
+            rows = db.execute("""SELECT CAST((julianday(started_at)-julianday(?))*86400/? AS INTEGER) AS bucket,
+                COUNT(*) AS requests, COUNT(input_tokens) AS input_measured,
+                COUNT(output_tokens) AS output_measured,
+                COALESCE(SUM(input_tokens),0) AS input_tokens,
+                COALESCE(SUM(output_tokens),0) AS output_tokens,
+                COALESCE(SUM(CASE WHEN output_tokens IS NOT NULL THEN duration_seconds ELSE 0 END),0) AS measured_seconds
+                FROM api_usage WHERE client_id=? AND started_at>=? AND started_at<=? GROUP BY bucket""",
+                (start_text, bucket_seconds, client_id, start_text, end_text)).fetchall()
+        points = [{"requests": 0, "input_measured": 0, "output_measured": 0,
+                   "input_tokens": 0, "output_tokens": 0, "measured_seconds": 0.0, "tokens_per_second": None}
+                  for _ in range(buckets)]
+        for row in rows:
+            position = max(0, min(buckets - 1, row["bucket"]))
+            point = points[position]
+            for key in ("requests", "input_measured", "output_measured", "input_tokens", "output_tokens", "measured_seconds"):
+                point[key] += row[key]
+        for point in points:
+            point["tokens_per_second"] = (round(point["output_tokens"] / point["measured_seconds"], 2)
+                                           if point["output_measured"] and point["measured_seconds"] > 0 else None)
+        totals = {key: sum(point[key] for point in points)
+                  for key in ("requests", "input_measured", "output_measured", "input_tokens", "output_tokens", "measured_seconds")}
+        totals["tokens_per_second"] = (round(totals["output_tokens"] / totals["measured_seconds"], 2)
+                                        if totals["output_measured"] and totals["measured_seconds"] > 0 else None)
+        return {"client_id": client_id, "amount": amount, "unit": unit, "start": start_text,
+                "end": end_text, "totals": totals, "points": points}

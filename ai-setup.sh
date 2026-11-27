@@ -63,7 +63,7 @@ fi
 if [[ -d "$INSTALL_DIR/gpu_control/assets" && ! -w "$INSTALL_DIR/gpu_control/assets" ]]; then
   sudo chown "$(id -u):$(id -g)" "$INSTALL_DIR/gpu_control/assets"
 fi
-for generated in docker-compose.yml gpu_control/server.py gpu_control/benchmarks.py gpu_control/benchmark_views.py gpu_control/harness_views.py gpu_control/model_catalog.py gpu_control/model_artifacts.py gpu_control/hybrid_memory.py gpu_control/model_views.py gpu_control/catalog_discovery.py gpu_control/engine_updates.py gpu_control/webui_updates.py gpu_control/sharing.py gpu_control/sharing_views.py gpu_control/fairness_gateway.py gpu_control/gpu_metrics.py gpu_control/parallel_tuning.py gpu_control/install_profile.py gpu_control/install_models.sh gpu_control/context_tuning.py gpu_control/update-engine.sh gpu_control/update-webui.sh gpu_control/tune-parallel.sh gpu_control/tune-context.sh gpu_control/media_catalog.py gpu_control/assets/gpu-workstation.webp ai-control.sh start-selected.sh; do
+for generated in docker-compose.yml gpu_control/server.py gpu_control/benchmarks.py gpu_control/benchmark_views.py gpu_control/operation_poll.js gpu_control/harness_views.py gpu_control/model_catalog.py gpu_control/model_artifacts.py gpu_control/hybrid_memory.py gpu_control/model_views.py gpu_control/catalog_discovery.py gpu_control/engine_updates.py gpu_control/webui_updates.py gpu_control/sharing.py gpu_control/sharing_views.py gpu_control/fairness_gateway.py gpu_control/gpu_metrics.py gpu_control/parallel_tuning.py gpu_control/install_profile.py gpu_control/install_models.sh gpu_control/context_tuning.py gpu_control/update-engine.sh gpu_control/update-webui.sh gpu_control/tune-parallel.sh gpu_control/tune-context.sh gpu_control/media_catalog.py gpu_control/assets/gpu-workstation.webp ai-control.sh start-selected.sh; do
   if [[ -e "$INSTALL_DIR/$generated" && ! -w "$INSTALL_DIR/$generated" ]]; then
     sudo chown "$(id -u):$(id -g)" "$INSTALL_DIR/$generated"
   fi
@@ -594,7 +594,7 @@ services:
     volumes:
       - ./gpu_control/fairness_gateway.py:/app/fairness_gateway.py:ro
       - ./gpu_control/sharing.py:/app/sharing.py:ro
-      - ./gpu_control/results:/app/data:ro
+      - ./gpu_control/results:/app/data
     command: [python, /app/fairness_gateway.py]
     read_only: true
     depends_on: [gpu-control]
@@ -619,6 +619,7 @@ services:
       MEDIA_MODEL_DIR: /app/media_models
     volumes:
       - ./gpu_control/server.py:/app/server.py:ro
+      - ./gpu_control/operation_poll.js:/app/operation_poll.js:ro
       - ./gpu_control/assets:/app/assets:ro
       - ./gpu_control/benchmarks.py:/app/benchmarks.py:ro
       - ./gpu_control/benchmark_views.py:/app/benchmark_views.py:ro
@@ -863,7 +864,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from benchmarks import BenchmarkManager, MODELS
 import benchmark_views
-from model_catalog import ModelManager
+from model_catalog import BY_ID, ModelManager, model_display_name
 from media_catalog import MediaManager
 from catalog_discovery import CatalogDiscovery
 from engine_updates import EngineUpdates
@@ -1040,7 +1041,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
-        self.send_header("Content-Security-Policy", "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'self'" if embeddable else "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
+        self.send_header("Content-Security-Policy", "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; script-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'self'" if embeddable else "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; script-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         self.wfile.write(data)
@@ -1078,7 +1079,7 @@ class Handler(BaseHTTPRequestHandler):
                   ("Qwen3.8 MoE distill abliterated", qwen38_on),
                   ("Gemma 4 26B-A4B abliterated", gemma4_on),
                   ("ComfyUI", media_on)) if on]
-        active.extend(item["alias"] for item in managed if running(item["container"]))
+        active.extend(model_display_name(item) for item in managed if running(item["container"]))
         mode = active[0] if len(active) == 1 else "Neither" if not active else "Conflict: " + ", ".join(active)
         h = lambda s: html.escape(s, quote=True)
         try:
@@ -1099,7 +1100,7 @@ class Handler(BaseHTTPRequestHandler):
             return which in SELECTED_MODES if SELECTED_MODES else builtin_states.get(which) != "not created"
         model_labels = {**{key: value for key, value in BUILTIN_LABELS.items()
                            if available_builtin(key)},
-                        **{"hf-" + item["candidate_id"]: item["alias"] + " (Hugging Face)" for item in managed}}
+                        **{"hf-" + item["candidate_id"]: model_display_name(item) + " (Hugging Face; API " + item["alias"] + ")" for item in managed}}
         model_options = "".join(
             f'<option value="{h(which)}" {"selected" if contexts.get(which, {}).get("running") else ""}>'
             f'{h(label)} · {h(context_text(which))}</option>'
@@ -1128,7 +1129,7 @@ class Handler(BaseHTTPRequestHandler):
                         f'value="{context_active["tokens"]}" required> '
                         '<button type="submit">Test and save context</button></form>') if context_active else '<p>Start one model to tune its context.</p>'
         if context_status["busy"]:
-            context_form = '<p>Context test running. This page refreshes every five seconds.</p>'
+            context_form = '<p>Context test running. Progress updates above without reloading this page.</p>'
         states = (("cpu-tiny", "Qwen3 0.6B CPU", cpu_tiny_state),
                   ("cpu-4b", "Qwen3 4B CPU", cpu_4b_state),
                   ("llm", "Qwen3 Coder", llm_state),
@@ -1173,10 +1174,10 @@ class Handler(BaseHTTPRequestHandler):
         home_style += ".message-banner{display:flex;align-items:center;justify-content:space-between;gap:1rem}.message-banner p,.message-banner form{margin:0}.message-banner button{min-height:2.2rem;padding:.3rem .7rem;background:transparent;border-color:#c5a976;color:#f8d9a5;white-space:nowrap}.message-banner button:hover{background:#3a4437}@media(max-width:740px){.message-banner{align-items:flex-start;flex-direction:column}}"
         home_style += ".gpu-frame{width:100%;height:345px;border:0;background:#17262a}.gpu-note{font-size:.9rem;color:#b6c6c4}@media(max-width:740px){.gpu-frame{height:440px}}"
         page = f"""<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-{'<meta http-equiv="refresh" content="5">' if context_status['busy'] or webui_status['checking'] or webui_status['busy'] else ''}
 <title>AI Model Switcher</title><style>{benchmark_views.STYLE}{home_style}</style>
 <main><nav aria-label="Main navigation"><a href="/">AI Model Switcher</a><a href="/models">Find models</a><a href="/benchmarks">Benchmarks</a><a href="/sharing">Client sharing</a><a href="/harnesses">Coding harnesses</a></nav>
 <header class="hero"><div class="hero-copy"><div class="eyebrow">Local AI / Control desk</div><h1>AI Model Switcher</h1><p>Manage local workloads and model context from one place.</p><div class="active-line"><span class="active-badge">Active workload</span><strong>{h(mode)}</strong></div></div></header>
+{'<p class="message" role="status" data-operation-monitor="/operations/status?scope=home">Checking operation status…</p><script src="/assets/operation_poll.js" defer></script>' if context_status['busy'] or webui_status['checking'] or webui_status['busy'] else ''}
 {webui_card}
 {webui_result}
 {f'<p class="message" role="status">{h(message)}</p>' if message else ''}
@@ -1196,13 +1197,96 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
-        self.send_header("Content-Security-Policy", "default-src 'none'; img-src 'self'; frame-src 'self'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
+        self.send_header("Content-Security-Policy", "default-src 'none'; img-src 'self'; frame-src 'self'; style-src 'unsafe-inline'; script-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         self.wfile.write(data)
 
     def do_GET(self):
         path = urllib.parse.urlsplit(self.path)
+        if path.path == "/assets/operation_poll.js":
+            try:
+                with open("/app/operation_poll.js", "rb") as script:
+                    data = script.read()
+            except OSError:
+                self.send_error(404)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/javascript; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "public, max-age=3600")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(data)
+            return
+        if path.path == "/operations/status":
+            query = urllib.parse.parse_qs(path.query)
+            scope = query.get("scope", [""])[0]
+            try:
+                if scope == "models":
+                    jobs = MODEL_MANAGER.jobs()
+                    media = MEDIA_MANAGER.jobs()
+                    catalog = DISCOVERY.latest()
+                    search = DISCOVERY.latest_search()
+                    engine = ENGINE_UPDATES.status()
+                    job_names = {item["candidate_id"]: model_display_name(item) for item in MODEL_MANAGER.installed()}
+                    job_names.update({item["id"]: item.get("name") or model_display_name(item)
+                                      for item in catalog["items"] + search["items"]})
+                    job_names.update({item["id"]: item["name"] for item in BY_ID.values()})
+                    active = (any(job["status"] in ("queued", "running") for job in jobs + media) or
+                              catalog["status"] == "running" or search["status"] == "running" or
+                              engine["checking"] or engine["busy"])
+                    lines = [f'Text {job_names.get(job["candidate_id"], "Hugging Face model")}: {job["status"]} · {job["stage"]}'
+                             for job in jobs if job["status"] in ("queued", "running")][:5]
+                    lines += [f'Media {job["candidate_id"]}: {job["status"]} · {job["stage"]}'
+                              for job in media if job["status"] in ("queued", "running")][:5]
+                    if catalog["status"] == "running":
+                        lines.append("Catalog refresh running")
+                    if search["status"] == "running":
+                        lines.append("Hugging Face search running")
+                    if engine["checking"] or engine["busy"]:
+                        lines.append("Engine check or update running")
+                    if not lines:
+                        latest = jobs[0] if jobs else media[0] if media else None
+                        lines = [f'{job_names.get(latest["candidate_id"], latest["candidate_id"])}: {latest["status"]} · {latest["stage"]}' if latest else "Operation finished"]
+                elif scope == "home":
+                    context = CONTEXT_TUNER.status()
+                    webui = WEBUI_UPDATES.status()
+                    active = context["busy"] or webui["checking"] or webui["busy"]
+                    lines = []
+                    if context["job"]:
+                        lines.append(f'Context: {context["job"]["status"]} · {context["job"]["stage"]}')
+                    if webui["job"]:
+                        lines.append(f'Open WebUI: {webui["job"]["status"]} · {webui["job"]["stage"]}')
+                    if webui["checking"]:
+                        lines.append("Checking Open WebUI update")
+                elif scope == "sharing":
+                    slot = PARALLEL_TUNER.status()
+                    active = slot["busy"]
+                    job = slot["job"]
+                    lines = [f'Slot test: {job["status"]} · {job["stage"]}'] if job else []
+                elif scope == "benchmark":
+                    run_id = query.get("run_id", [""])[0]
+                    uuid.UUID(run_id)
+                    run = BENCHMARKS.get_run(run_id)
+                    if not run:
+                        raise ValueError("Benchmark run missing")
+                    active = run["status"] in ("queued", "running")
+                    lines = [f'Benchmark: {run["status"]} · {run["stage"]}']
+                else:
+                    raise ValueError("Unknown operation scope")
+            except (ValueError, KeyError):
+                self.send_error(400, "Invalid operation status request")
+                return
+            data = json.dumps({"active": bool(active), "message": " | ".join(lines) or "Operation finished"}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(data)
+            return
         if path.path == "/harnesses":
             self._send_html(harness_views.index())
             return
@@ -1213,13 +1297,31 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 hardware = MODEL_MANAGER.hardware()
                 settings = SHARING.settings(hardware, active_server_slots())
+                clients = SHARING.clients()
+                query = urllib.parse.parse_qs(path.query)
+                selected = query.get("client", [])
+                usage = None
+                selected_label = ""
+                if selected:
+                    if len(selected) != 1 or selected[0] not in {"legacy", *(item["id"] for item in clients)}:
+                        raise ValueError("Unknown API key")
+                    amount = query.get("amount", ["24"])
+                    unit = query.get("unit", ["hours"])
+                    if len(amount) != 1 or not amount[0].isdecimal() or len(unit) != 1:
+                        raise ValueError("Choose a valid usage window")
+                    usage = SHARING.usage_summary(selected[0], int(amount[0]), unit[0])
+                    selected_label = ("Shared legacy key" if selected[0] == "legacy" else
+                                      next(item["label"] for item in clients if item["id"] == selected[0]))
                 notice = {"limits_saved": "Sharing limits saved and confirmed by the API gateway.",
                           "defaults_restored": "Detected hardware defaults restored and confirmed by the API gateway.",
                           "key_revoked": "Client key revoked. New requests using it are denied.",
                           "slot_test_started": "Model slot test started. This page will report readiness or rollback."}.get(
-                              urllib.parse.parse_qs(path.query).get("status", [""])[0], "")
-                self._send_html(sharing_views.index(settings, SHARING.clients(), CSRF, hardware, active_server_slots(),
-                                                    active_mode(), PARALLEL_TUNER.status(), message=notice))
+                              query.get("status", [""])[0], "")
+                self._send_html(sharing_views.index(settings, clients, CSRF, hardware, active_server_slots(),
+                                                    active_mode(), PARALLEL_TUNER.status(), message=notice,
+                                                    selected_usage=usage, selected_client_label=selected_label))
+            except ValueError as exc:
+                self.send_error(400, str(exc))
             except Exception as exc:
                 self.send_error(503, "Sharing settings unavailable: " + type(exc).__name__)
             return
@@ -1255,7 +1357,9 @@ class Handler(BaseHTTPRequestHandler):
                                                   DISCOVERY.latest(hardware), ENGINE_UPDATES.status(), DISCOVERY.latest_search(hardware),
                                                   MODEL_MANAGER.hybrid_enabled(), active_models,
                                                   "Model uninstalled. Benchmarks were retained." if
-                                                  urllib.parse.parse_qs(path.query).get("removed") == ["1"] else ""))
+                                                  urllib.parse.parse_qs(path.query).get("removed") == ["1"] else
+                                                  "API ID changed. Update API clients and Open WebUI to use the new ID." if
+                                                  urllib.parse.parse_qs(path.query).get("renamed") == ["1"] else ""))
             except Exception as exc:
                 self.send_error(503, f"Recommendations unavailable: {type(exc).__name__}")
             return
@@ -1382,7 +1486,7 @@ class Handler(BaseHTTPRequestHandler):
         self._page()
 
     def do_POST(self):
-        if self.path not in ("/switch", "/benchmark", "/context/tune", "/benchmarks/delete", "/models/install", "/models/uninstall",
+        if self.path not in ("/switch", "/benchmark", "/context/tune", "/benchmarks/delete", "/models/install", "/models/uninstall", "/models/rename",
                              "/models/media/install", "/models/refresh", "/models/search", "/models/hardware/rescan", "/models/discovered/install", "/models/hybrid", "/models/hybrid/apply",
                              "/models/engine/check", "/models/engine/update", "/webui/update", "/webui/update/dismiss",
                              "/sharing/save", "/sharing/reset", "/sharing/client", "/sharing/revoke",
@@ -1424,6 +1528,30 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self.send_response(303)
             self.send_header("Location", "/models?removed=1#specific-search")
+            self.send_header("Content-Length", "0")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            return
+        if self.path == "/models/rename":
+            candidate = fields.get("candidate", [])
+            alias = fields.get("alias", [])
+            if len(candidate) != 1 or len(alias) != 1:
+                self.send_error(400, "Select one model and API ID")
+                return
+            try:
+                if any((BENCHMARKS.busy, MEDIA_MANAGER.busy, CONTEXT_TUNER.busy,
+                        ENGINE_UPDATES.busy, PARALLEL_TUNER.busy)):
+                    raise RuntimeError("Finish the active benchmark, download, or tuning operation first")
+                with LOCK:
+                    MODEL_MANAGER.rename_alias(candidate[0], alias[0])
+            except ValueError as exc:
+                self.send_error(400, str(exc))
+                return
+            except RuntimeError as exc:
+                self.send_error(409, str(exc))
+                return
+            self.send_response(303)
+            self.send_header("Location", "/models?renamed=1#specific-search")
             self.send_header("Content-Length", "0")
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
@@ -2224,19 +2352,23 @@ STYLE = """*{box-sizing:border-box}html{color-scheme:dark}body{font:16px/1.55 sy
 STYLE += """.section-links{display:flex;gap:.5rem;flex-wrap:wrap;margin:1rem 0 1.5rem}.section-links a{display:inline-block;padding:.48rem .75rem;border:1px solid #435a5a;border-radius:99px;background:#17272a;color:#e9c18b;text-decoration:none;font-size:.88rem;font-weight:650}.section-links a:hover{background:#274044}.overview-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1rem}.overview-grid .card{margin:0}.overview-grid h2{margin:.2rem 0 .7rem}@media(max-width:900px){.overview-grid{grid-template-columns:1fr}}"""
 
 
-def shell(title, body, refresh=False, wide=False):
-    meta = '<meta http-equiv="refresh" content="5">' if refresh else ""
+def shell(title, body, refresh=False, wide=False, monitor_url=None):
+    if refresh and not monitor_url:
+        monitor_url = ("/operations/status?scope=models" if title in ("Hugging Face model recommendations", "Hardware and model choices") else
+                       "/operations/status?scope=sharing" if title == "Client sharing and rate limits" else None)
+    monitor = (f'<p class="message" role="status" data-operation-monitor="{esc(monitor_url)}">Checking operation status…</p>'
+               '<script src="/assets/operation_poll.js" defer></script>') if monitor_url else ""
     body_class = ' class="wide"' if wide else ""
     description = ("Compare saved speed and quality results for this machine." if title == "Model benchmarks" else
                    "Find models sized for the hardware in this system." if title == "Hugging Face model recommendations" else
                    "Compare coding agents and connect them to your local API." if title == "Coding harnesses" else
                    "Inspect this model's recorded runs and system details.")
     display_title = "Find models" if title == "Hugging Face model recommendations" else title
-    return (f'<!doctype html><html lang="en"><meta charset="utf-8">{meta}'
+    return (f'<!doctype html><html lang="en"><meta charset="utf-8">'
             f'<meta name="viewport" content="width=device-width,initial-scale=1">'
             f'<title>{esc(title)}</title><style>{STYLE}</style><body{body_class}><main><nav aria-label="Main navigation"><a href="/">AI Model Switcher</a>'
             f'<a href="/benchmarks">Benchmarks</a><a href="/models">Find models</a><a href="/sharing">Client sharing</a><a href="/harnesses">Coding harnesses</a></nav>'
-            f'<header class="hero"><div class="hero-copy"><div class="eyebrow">Local AI / Control desk</div><h1>{esc(display_title)}</h1><p>{description}</p></div></header>{body}</main></body></html>')
+            f'<header class="hero"><div class="hero-copy"><div class="eyebrow">Local AI / Control desk</div><h1>{esc(display_title)}</h1><p>{description}</p></div></header>{monitor}{body}</main></body></html>')
 
 
 def summary(run):
@@ -2436,7 +2568,7 @@ def detail(run):
     if run.get("error"):
         state += f'<p><strong>Error:</strong> {esc(run["error"])}</p>'
     if run["status"] in ("queued", "running"):
-        state += '<p class="note">This page refreshes every five seconds while the benchmark runs.</p>'
+        state += '<p class="note">Progress updates above without reloading this page.</p>'
     state += f'<p><a href="/benchmarks/{esc(run["id"])}.json">Download run JSON</a></p>'
 
     hardware = {
@@ -2492,8 +2624,50 @@ def detail(run):
         if image.get("error") or image.get("reason"):
             body += f'<p>{esc(image.get("error") or image.get("reason"))}</p>'
         body += '</div>'
-    return shell("Benchmark run", body, run["status"] in ("queued", "running"))
+    active = run["status"] in ("queued", "running")
+    return shell("Benchmark run", body, active,
+                 monitor_url="/operations/status?scope=benchmark&run_id=" + urllib.parse.quote(run["id"]) if active else None)
 BENCHMARK_VIEWS
+
+cat > "$INSTALL_DIR/gpu_control/operation_poll.js" <<'OPERATION_POLL'
+/* Update operation progress without navigating or replacing forms in the page. */
+(() => {
+  const monitor = document.querySelector('[data-operation-monitor]');
+  if (!monitor) return;
+  const endpoint = monitor.dataset.operationMonitor;
+  let timer;
+  async function poll() {
+    if (document.hidden) {
+      timer = setTimeout(poll, 5000);
+      return;
+    }
+    try {
+      const response = await fetch(endpoint, {cache: 'no-store', credentials: 'same-origin'});
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const state = await response.json();
+      monitor.replaceChildren(document.createTextNode(state.message || 'Checking operation status…'));
+      if (state.active) {
+        timer = setTimeout(poll, 5000);
+      } else {
+        const link = document.createElement('a');
+        link.href = window.location.href;
+        link.textContent = 'Show updated results';
+        monitor.append(document.createTextNode(' · '), link);
+      }
+    } catch (error) {
+      monitor.textContent = 'Status unavailable; retrying…';
+      timer = setTimeout(poll, 10000);
+    }
+  }
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden && timer) {
+      clearTimeout(timer);
+      timer = setTimeout(poll, 0);
+    }
+  });
+  poll();
+})();
+OPERATION_POLL
 
 cat > "$INSTALL_DIR/gpu_control/harness_views.py" <<'HARNESS_VIEWS'
 """Curated links to coding harnesses that can use a local API."""
@@ -2591,6 +2765,30 @@ CATALOG = (
     {"id": "gemma4-31b", "name": "Gemma 4 31B", "repo": "bartowski/google_gemma-4-31B-it-GGUF", "file": "google_gemma-4-31B-it-Q4_K_M.gguf", "active_b": 31, "moe": False, "ablit": False, "features": "Detailed reasoning, coding, writing; slower dense model", "priority": 72},
 )
 BY_ID = {item["id"]: item for item in CATALOG}
+
+
+def model_display_name(item):
+    """Human-readable name from the source repository and weight variant."""
+    repo = item.get("repo", "").rsplit("/", 1)[-1]
+    repo = re.sub(r"[-_]GGUF$", "", repo, flags=re.I)
+    name = re.sub(r"[-_]+", " ", repo).strip() or "Hugging Face model"
+    filename = item.get("filename") or item.get("file") or ""
+    variant = re.search(r"(?:^|[-_.])(IQ\d_[A-Za-z0-9_]+|Q\d_[A-Za-z0-9_]+|BF16|F16|FP16)(?=\.gguf$|[-_.])",
+                        filename, re.I)
+    return name + (" · " + variant.group(1).upper() if variant else "")
+
+
+def preferred_alias(candidate, used_aliases=()):
+    """Use a recognizable API ID, adding a short suffix only on collision."""
+    repo = re.sub(r"[-_]GGUF$", "", candidate["repo"].rsplit("/", 1)[-1], flags=re.I)
+    stem = re.sub(r"[^a-z0-9]+", "-", repo.lower()).strip("-")[:42].rstrip("-") or "model"
+    variant = re.search(r"(?:^|[-_.])(IQ\d_[A-Za-z0-9_]+|Q\d_[A-Za-z0-9_]+|BF16|F16|FP16)(?=\.gguf$|[-_.])",
+                        candidate.get("file", ""), re.I)
+    suffix = re.sub(r"[^a-z0-9]+", "-", variant.group(1).lower()).strip("-") if variant else ""
+    alias = "local-" + stem + ("-" + suffix if suffix else "")
+    if alias in used_aliases:
+        alias = alias[:55].rstrip("-") + "-" + hashlib.sha256(candidate["id"].encode()).hexdigest()[:8]
+    return alias
 REFERENCE_ACTIVE_B = {"local-coder": (3, True), "local-qwen4b": (4, False),
                       "local-huihui": (3, True), "local-flint-iq4": (2.5, True),
                       "local-flint-q3": (2.5, True), "local-deepseek-v4-distill": (9, False),
@@ -2668,6 +2866,8 @@ class ModelManager:
         self.hardware_cache = None
         self.hardware_cache_at = 0
         self.busy = False
+        self.pending_installs = []
+        self.reserved_bytes = 0
         self.cache = {}
         with self.connect() as db:
             db.execute("""CREATE TABLE IF NOT EXISTS installed_models (
@@ -2715,6 +2915,70 @@ class ModelManager:
         with self.connect() as db:
             return [dict(row) for row in db.execute("SELECT * FROM installed_models ORDER BY installed_at DESC")]
 
+    def _finish_operation(self, released_bytes=0):
+        with self.lock:
+            self.reserved_bytes = max(0, self.reserved_bytes - released_bytes)
+            if self.pending_installs:
+                args = self.pending_installs.pop(0)
+                threading.Thread(target=self._install, args=args, daemon=True).start()
+            else:
+                self.busy = False
+
+    def rename_alias(self, candidate_id, new_alias):
+        """Change one inactive model's served API ID, restoring its container on failure."""
+        if (not re.fullmatch(r"[a-z0-9-]{2,64}", candidate_id or "") or
+                not isinstance(new_alias, str) or len(new_alias) > 64 or
+                not re.fullmatch(r"local-[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", new_alias)):
+            raise ValueError("Use a lowercase API ID beginning with local- (letters, digits, hyphens)")
+        with self.lock:
+            if self.busy:
+                raise RuntimeError("Finish the current model operation first")
+            self.busy = True
+        backup = None
+        created = False
+        try:
+            row = next((item for item in self.installed() if item["candidate_id"] == candidate_id), None)
+            if not row:
+                raise ValueError("Model is not installed")
+            if new_alias == row["alias"]:
+                raise ValueError("This API ID is already in use by the model")
+            if new_alias in {alias for mode, (alias, _) in MODELS.items() if mode != "hf-" + candidate_id}:
+                raise ValueError("Another model already uses that API ID")
+            name = row["container"]
+            inspect = docker_api("GET", "/containers/" + name + "/json")
+            if inspect["State"].get("Running"):
+                raise RuntimeError("Switch to another workload before changing this API ID")
+            backup_name = name + "-alias-rollback-" + uuid.uuid4().hex[:8]
+            docker_api("POST", "/containers/" + name + "/rename?name=" + backup_name)
+            backup = backup_name
+            config = self.serving_config(row["filename"], new_alias, row["context_tokens"],
+                                         image=inspect["Config"]["Image"], parallel_slots=row["parallel_slots"],
+                                         runtime=row["runtime"], model_format=row["format"],
+                                         cpu_offload_gb=row["cpu_offload_gb"],
+                                         hybrid_enabled=bool(row["hybrid_enabled"]))
+            docker_api("POST", "/containers/create?name=" + name, config)
+            created = True
+            with self.connect() as db:
+                db.execute("UPDATE installed_models SET alias=? WHERE candidate_id=?", (new_alias, candidate_id))
+            MODELS["hf-" + candidate_id] = (new_alias, name)
+            try:
+                docker_api("DELETE", "/containers/" + backup + "?force=1")
+            except RuntimeError:
+                pass
+            backup = None
+            return new_alias
+        except Exception:
+            if backup:
+                if created:
+                    try:
+                        docker_api("DELETE", "/containers/" + name + "?force=1")
+                    except RuntimeError:
+                        pass
+                docker_api("POST", "/containers/" + backup + "/rename?name=" + name)
+            raise
+        finally:
+            self._finish_operation()
+
     def uninstall(self, candidate_id, confirmation):
         """Remove an inactive, switcher-owned model and its serving container.
 
@@ -2737,8 +3001,8 @@ class ModelManager:
                 if row is None:
                     raise ValueError("Model is not installed by the switcher")
                 row = dict(row)
-                if confirmation != row["alias"]:
-                    raise ValueError("Enter the exact API name to confirm removal")
+                if confirmation not in (row["alias"], model_display_name(row)):
+                    raise ValueError("Enter the exact model name or API ID to confirm removal")
                 filename = row["filename"]
                 model_format = row.get("format") or "gguf"
                 if not SAFE_PATH.fullmatch(filename) or ".." in filename.split("/"):
@@ -2817,8 +3081,7 @@ class ModelManager:
                     raise RuntimeError("Removal failed and container restore failed: " + str(rollback_exc)[:180]) from rollback_exc
             raise
         finally:
-            with self.lock:
-                self.busy = False
+            self._finish_operation()
 
     def hybrid_enabled(self):
         with self.connect() as db:
@@ -2838,7 +3101,7 @@ class ModelManager:
 
     def jobs(self):
         with self.connect() as db:
-            return [dict(row) for row in db.execute("SELECT * FROM model_jobs ORDER BY started_at DESC LIMIT 10")]
+            return [dict(row) for row in db.execute("SELECT * FROM model_jobs ORDER BY started_at DESC, rowid DESC LIMIT 10")]
 
     def _job(self, job_id, **values):
         with self.connect() as db:
@@ -3031,11 +3294,13 @@ class ModelManager:
         if candidate["id"] != candidate_id or not re.fullmatch(r"[a-z0-9-]{2,64}", candidate_id):
             raise ValueError("Invalid catalog candidate")
         with self.lock:
-            if self.busy:
-                raise RuntimeError("A model download is already running")
             installed = self.installed()
             if any(item["candidate_id"] == candidate_id for item in installed):
                 raise ValueError("Model already installed")
+            with self.connect() as db:
+                if db.execute("SELECT 1 FROM model_jobs WHERE candidate_id=? AND status IN ('queued','running')",
+                              (candidate_id,)).fetchone():
+                    raise ValueError("This model is already queued or downloading")
             metadata = self._metadata(candidate)
             if (candidate.get("revision") and candidate["revision"] != metadata["revision"] or
                     candidate.get("sha256") and candidate["sha256"] != metadata["sha256"]):
@@ -3062,7 +3327,7 @@ class ModelManager:
                 raise ValueError("No compatible GPU is available for this model")
             if not allow_unfit and not plan["fits"]:
                 raise ValueError("Estimated model memory exceeds the available GPU/RAM budget; select Try anyway to override")
-            if metadata["size"] * 1.2 > hardware["disk_free_gib"] * 2**30:
+            if metadata["size"] * 1.2 + self.reserved_bytes > hardware["disk_free_gib"] * 2**30:
                 raise ValueError("Insufficient model storage")
             context_tokens = (context_for_hardware(candidate, metadata["size"], hardware.get("vram_mib"))
                               if runtime == "gpu" and hardware.get("vram_mib") else
@@ -3074,9 +3339,14 @@ class ModelManager:
             job_id = str(uuid.uuid4())
             with self.connect() as db:
                 db.execute("INSERT INTO model_jobs(id,candidate_id,started_at,status,stage) VALUES(?,?,?,?,?)",
-                           (job_id, candidate_id, now(), "queued", "queued"))
-            self.busy = True
-            threading.Thread(target=self._install, args=(job_id, candidate, metadata, context_tokens, runtime, hardware, plan), daemon=True).start()
+                           (job_id, candidate_id, now(), "queued", "queued behind current operation" if self.busy else "queued"))
+            args = (job_id, candidate, metadata, context_tokens, runtime, hardware, plan)
+            self.reserved_bytes += int(metadata["size"] * 1.2)
+            if self.busy:
+                self.pending_installs.append(args)
+            else:
+                self.busy = True
+                threading.Thread(target=self._install, args=args, daemon=True).start()
             return job_id
 
     def start_reconfigure_hybrid(self, candidate_id, allow_unfit=False):
@@ -3176,8 +3446,7 @@ class ModelManager:
                 self._job(job_id, status="failed", ended_at=now(), stage="previous setting restored",
                           error=f"{type(exc).__name__}: {str(exc)[:250]}")
         finally:
-            with self.lock:
-                self.busy = False
+            self._finish_operation()
 
     def _install(self, job_id, candidate, metadata, context_tokens, runtime="gpu", hardware=None, plan=None):
         downloader = None
@@ -3243,7 +3512,7 @@ class ModelManager:
                 filename = folder if model_format == "safetensors" else folder + "/" + candidate["file"]
             self._job(job_id, stage="creating serving container")
             container = "local-ai-hf-" + candidate["id"]
-            alias = "local-hf-" + candidate["id"]
+            alias = preferred_alias(candidate, {item["alias"] for item in self.installed()})
             image = self.runtime_image(model_format, runtime)
             self._ensure_image(image)
             serving_config = self.serving_config(filename, alias, context_tokens, runtime=runtime,
@@ -3266,8 +3535,7 @@ class ModelManager:
                         docker_api("DELETE", f"/containers/{container_id}?force=1")
                     except RuntimeError:
                         pass
-            with self.lock:
-                self.busy = False
+            self._finish_operation(int(metadata["size"] * 1.2))
 
     def _ensure_image(self, image):
         try:
@@ -3489,6 +3757,7 @@ import html
 
 from benchmark_views import shell
 from hybrid_memory import memory_plan
+from model_catalog import BY_ID, model_display_name, preferred_alias
 
 
 def esc(value):
@@ -3502,15 +3771,29 @@ def uninstall_form(item, csrf, active_models=()):
     return (f'<form method="post" action="/models/uninstall">'
             f'<input type="hidden" name="token" value="{esc(csrf)}">'
             f'<input type="hidden" name="candidate" value="{esc(item["candidate_id"])}">'
-            f'<label>Confirm API name <input type="text" name="confirm" required maxlength="128" '
-            f'autocomplete="off" placeholder="{esc(item["alias"])}" aria-label="Type {esc(item["alias"])} to uninstall"></label> '
+            f'<label>Confirm model name <input type="text" name="confirm" required maxlength="128" '
+            f'autocomplete="off" placeholder="{esc(model_display_name(item))}" '
+            f'aria-label="Type {esc(model_display_name(item))} to uninstall"></label> '
             '<button type="submit">Uninstall</button></form>')
+
+
+def rename_form(item, csrf, installed, active_models=()):
+    if item["candidate_id"] in active_models:
+        return ""
+    suggested = preferred_alias({"id": item["candidate_id"], "repo": item["repo"],
+                                 "file": (item.get("filename") or "").split("--")[-1]},
+                                {other["alias"] for other in installed if other["candidate_id"] != item["candidate_id"]})
+    return (f'<form method="post" action="/models/rename">'
+            f'<input type="hidden" name="token" value="{esc(csrf)}">'
+            f'<input type="hidden" name="candidate" value="{esc(item["candidate_id"])}">'
+            f'<label>API ID <input type="text" name="alias" required maxlength="64" value="{esc(suggested)}"></label> '
+            '<button type="submit">Change API ID</button></form>')
 
 
 def specific_search_section(search, installed, jobs, csrf, engine=None, hardware=None, hybrid_enabled=True,
                             active_models=()):
     search = search or {"status": "not searched", "items": [], "query": "", "error": None}
-    installing = {job["candidate_id"] for job in jobs if job["status"] in ("queued", "running")}
+    installing = {job["candidate_id"]: job["status"] for job in jobs if job["status"] in ("queued", "running")}
     installed_files = {(item["repo"], item["sha256"]) for item in installed}
     installed_ids = {item["candidate_id"] for item in installed}
     engine_build = (engine or {}).get("local_build") or 0
@@ -3522,7 +3805,7 @@ def specific_search_section(search, installed, jobs, csrf, engine=None, hardware
         busy = item["id"] in installing
         fit = bool(item.get("fits"))
         disk_fits = item.get("disk_fits", True)
-        state = ("Installed" if installed_here else "Installing" if busy else
+        state = ("Installed" if installed_here else "Queued" if installing.get(item["id"]) == "queued" else "Installing" if busy else
                  "Insufficient disk" if not disk_fits else "Engine update needed" if needs_engine else
                  "Likely fits with RAM assistance" if fit and item.get("hybrid_used") else
                  "Likely fits" if fit else "Memory estimate exceeded")
@@ -3566,12 +3849,14 @@ def specific_search_section(search, installed, jobs, csrf, engine=None, hardware
                           f'<input type="hidden" name="token" value="{esc(csrf)}">'
                           f'<input type="hidden" name="candidate" value="{esc(item["candidate_id"])}">'
                           f'{override}<button type="submit">Apply saved preference</button></form>')
-        installed_rows.append(f'<tr><td>{esc(item["alias"])}</td><td>{esc(item["repo"])}</td>'
+        installed_rows.append(f'<tr><td><strong>{esc(model_display_name(item))}</strong><br>'
+                              f'<small class="note">API ID: {esc(item["alias"])}</small></td><td>{esc(item["repo"])}</td>'
                               f'<td>{esc(item.get("format", "gguf").upper())} / {esc(item.get("runtime", "gpu").upper())}</td>'
                               f'<td>{esc(assistance)}</td>'
                               f'<td><form method="post" action="/switch"><input type="hidden" name="token" value="{esc(csrf)}">'
                               f'<button name="mode" value="hf-{esc(item["candidate_id"])}">Activate</button></form>'
-                              f'{apply_form}{uninstall_form(item, csrf, active_models)}</td></tr>')
+                              f'{apply_form}{rename_form(item, csrf, installed, active_models)}'
+                              f'{uninstall_form(item, csrf, active_models)}</td></tr>')
     return (f'<section class="card" id="specific-search"><h2>Search a specific Hugging Face model</h2>'
             '<p>Search by model name, exact owner/repository ID, or a Hugging Face repository URL. '
             'Searches any publisher and lists complete GGUF shard sets, single-file GGUF, and Safetensors repositories with standard tokenizer and configuration files. '
@@ -3593,8 +3878,9 @@ def specific_search_section(search, installed, jobs, csrf, engine=None, hardware
             'A running model is restarted and checked; failure restores its previous container. '
             'A stopped model is staged with the new setting and checked when activated. '
             'Uninstall removes the selected switcher-managed files and serving container; benchmark history stays available. '
+            'Changing an API ID requires switching away first and will require API clients to use the new ID; old benchmark labels remain as recorded. '
             'Switch away from an active model first. Files you added manually and shared ComfyUI assets are not removed.</p>'
-            '<div class="scroll"><table><tr><th>API name</th><th>Repository</th><th>Engine</th><th>Memory setting</th><th>Action</th></tr>'
+            '<div class="scroll"><table><tr><th>Model</th><th>Repository</th><th>Engine</th><th>Memory setting</th><th>Action</th></tr>'
             f'{"".join(installed_rows) if installed_rows else "<tr><td colspan=5>None yet.</td></tr>"}</table></div></section>')
 
 
@@ -3638,7 +3924,9 @@ def index(hardware, suggestions, installed, jobs, csrf, prefer_ablit=True,
                 '<code>AI_MODEL_SELECTION=cpu-tiny,cpu-4b</code> after checking which choices fit this host. '
                 'The GPU catalog and engine updates appear when a supported GPU is detected and the installer is rerun.</p></section>'
                 + search_section)
-        return shell("Hardware and model choices", body, refresh=(search or {}).get("status") == "running", wide=True)
+        return shell("Hardware and model choices", body,
+                     refresh=(search or {}).get("status") == "running" or
+                     any(job["status"] in ("queued", "running") for job in jobs), wide=True)
     discovery = discovery or {"status": "not checked", "items": [], "query": "", "error": None}
     engine = engine or {"checked_at": None, "checking": False, "update_available": None,
                         "local_build": None, "error": None, "job": None, "busy": False}
@@ -3665,11 +3953,11 @@ def index(hardware, suggestions, installed, jobs, csrf, prefer_ablit=True,
                   + (f'<p>Latest update job: <strong>{esc(engine_job.get("status"))}</strong> · {esc(engine_job.get("stage"))}'
                      f' · {esc(engine_job.get("error"))}</p>' if engine_job else ''))
     rows = []
-    installing = {job["candidate_id"] for job in jobs if job["status"] in ("queued", "running")}
+    installing = {job["candidate_id"]: job["status"] for job in jobs if job["status"] in ("queued", "running")}
     for number, item in enumerate(suggestions, 1):
         source = "https://huggingface.co/" + item["repo"]
         estimate = item["estimated_tps"] + " tokens/s" if item["estimated_tps"] else "No comparable run"
-        state = "Installed" if item["installed"] else "Installing" if item["id"] in installing else "Available"
+        state = "Installed" if item["installed"] else "Queued" if installing.get(item["id"]) == "queued" else "Installing" if item["id"] in installing else "Available"
         context = f'{item["context_tokens"]:,} tokens' if item.get("context_tokens") else "Unknown"
         context += " (configured)" if item["installed"] else " (target)"
         download = f'{item["size_gb"]} GB'
@@ -3688,23 +3976,30 @@ def index(hardware, suggestions, installed, jobs, csrf, prefer_ablit=True,
         form = (f'<form method="post" action="/switch"><input type="hidden" name="token" value="{esc(csrf)}">'
                 f'<button name="mode" value="{esc(mode)}" type="submit">Activate</button></form>')
         configured_context = f'{item.get("context_tokens") or 32768:,} tokens'
-        installed_rows.append(f'<tr><td>{esc(item["alias"])}</td><td>{esc(item["repo"])}</td>'
+        installed_rows.append(f'<tr><td><strong>{esc(model_display_name(item))}</strong><br>'
+                              f'<small class="note">API ID: {esc(item["alias"])}</small></td><td>{esc(item["repo"])}</td>'
                               f'<td>{esc(configured_context)}</td><td>{esc(item["installed_at"])}</td>'
-                              f'<td>{form}{uninstall_form(item, csrf, active_models)}</td></tr>')
+                              f'<td>{form}{rename_form(item, csrf, installed, active_models)}'
+                              f'{uninstall_form(item, csrf, active_models)}</td></tr>')
     job_rows = []
+    job_names = {item["candidate_id"]: model_display_name(item) for item in installed}
+    job_names.update({item["id"]: item.get("name") or model_display_name(item) for item in suggestions})
+    job_names.update({item["id"]: item.get("name") or model_display_name(item)
+                      for item in (discovery or {}).get("items", []) + (search or {}).get("items", [])})
+    job_names.update({item["id"]: item["name"] for item in BY_ID.values()})
     for job in jobs:
-        job_rows.append(f'<tr><td>{esc(job["candidate_id"])}</td><td>{esc(job["status"])}</td>'
+        job_rows.append(f'<tr><td>{esc(job_names.get(job["candidate_id"], "Hugging Face model"))}</td><td>{esc(job["status"])}</td>'
                         f'<td>{esc(job["stage"])}</td><td>{esc(job["error"])}</td></tr>')
     refreshing = any(job["status"] in ("queued", "running") for job in jobs)
     discovery_rows = []
-    installing = installing | {job["candidate_id"] for job in jobs if job["status"] in ("queued", "running")}
+    installing.update({job["candidate_id"]: job["status"] for job in jobs if job["status"] in ("queued", "running")})
     installed_ids = {item["candidate_id"] for item in installed}
     for number, item in enumerate(discovery.get("items", []), 1):
         installed_here = item["id"] in installed_ids
         required = item.get("min_engine_build") or 0
         blocked = (required and item.get("runtime", "gpu") == "gpu" and
                    (engine.get("local_build") or 0) < required)
-        state = ("Installed" if installed_here else "Installing" if item["id"] in installing
+        state = ("Installed" if installed_here else "Queued" if installing.get(item["id"]) == "queued" else "Installing" if item["id"] in installing
                  else f"Needs llama.cpp build {required}+" if blocked else
                  "GPU + RAM estimate" if item.get("hybrid_used") else "Untested engine compatibility")
         disabled = " disabled" if installed_here or item["id"] in installing or blocked else ""
@@ -3720,10 +4015,10 @@ def index(hardware, suggestions, installed, jobs, csrf, prefer_ablit=True,
                         f'Checked UTC: {esc(discovery.get("ended_at") or discovery.get("started_at"))}')
     if discovery.get("error"):
         discovery_status += " · " + esc(discovery["error"])
-    media_installing = {job["candidate_id"] for job in media_jobs if job["status"] in ("queued", "running")}
+    media_installing = {job["candidate_id"]: job["status"] for job in media_jobs if job["status"] in ("queued", "running")}
     media_rows = []
     for number, item in enumerate(media_suggestions, 1):
-        state = ("Installed" if item["installed"] else "Installing" if item["id"] in media_installing
+        state = ("Installed" if item["installed"] else "Queued" if media_installing.get(item["id"]) == "queued" else "Installing" if item["id"] in media_installing
                  else "File conflict" if item.get("conflict") else "Available")
         disabled = " disabled" if state != "Available" else ""
         label = state if disabled else "Download and install"
@@ -3769,7 +4064,7 @@ def index(hardware, suggestions, installed, jobs, csrf, prefer_ablit=True,
               f'<p>Catalog refresh: {discovery_status}</p>'
             + '<div class="scroll"><table class="results-table"><thead><tr><th>#</th><th>Model</th><th>Published UTC</th><th>GGUF file</th><th>Size</th><th>Source type</th><th>Abliterated</th><th>Engine status</th><th>Action</th></tr></thead>'
               f'<tbody>{"".join(discovery_rows) if discovery_rows else "<tr><td colspan=9>No matching, verified GGUF files are in this refresh.</td></tr>"}</tbody></table></div>'
-            + '<h2 id="installed-models">Installed from this page</h2><div class="scroll"><table><tr><th>API name</th><th>Source</th><th>Configured context</th><th>Installed UTC</th><th>Action</th></tr>'
+            + '<h2 id="installed-models">Installed from this page</h2><div class="scroll"><table><tr><th>Model</th><th>Source</th><th>Configured context</th><th>Installed UTC</th><th>Action</th></tr>'
               f'{"".join(installed_rows) if installed_rows else "<tr><td colspan=5>None yet</td></tr>"}</table></div>'
             + '<h2 id="media-models">Image and video models for ComfyUI</h2><p class="note">A separate top 10 chosen for the detected GPU, RAM, and available media storage. '
               'The abliteration selector above also applies here: when preferred, Z-Image uses an abliterated Qwen prompt encoder; other entries have no verified abliterated bundle. '
@@ -4661,6 +4956,11 @@ class SharingManager:
             db.execute("""CREATE TABLE IF NOT EXISTS sharing_clients (
                 id TEXT PRIMARY KEY, label TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE,
                 created_at TEXT NOT NULL, revoked_at TEXT)""")
+            db.execute("""CREATE TABLE IF NOT EXISTS api_usage (
+                id INTEGER PRIMARY KEY, client_id TEXT NOT NULL, started_at TEXT NOT NULL,
+                status INTEGER NOT NULL, duration_seconds REAL NOT NULL,
+                input_tokens INTEGER, output_tokens INTEGER)""")
+            db.execute("CREATE INDEX IF NOT EXISTS api_usage_client_time ON api_usage(client_id,started_at)")
 
     def connect(self):
         db = (sqlite3.connect("file:" + self.db_path + "?mode=ro", uri=True, timeout=20)
@@ -4760,11 +5060,64 @@ class SharingManager:
         with self.connect() as db:
             row = db.execute("SELECT id FROM sharing_clients WHERE token_hash=? AND revoked_at IS NULL", (digest,)).fetchone()
         return row["id"] if row else None
+
+    def record_usage(self, client_id, started_at, status, duration_seconds, input_tokens=None, output_tokens=None):
+        """Store request metadata and engine-reported tokens, never keys or prompts."""
+        if self.read_only:
+            raise RuntimeError("Usage recording requires writable storage")
+        if not client_id or any(value is not None and (not isinstance(value, int) or value < 0)
+                                for value in (input_tokens, output_tokens)):
+            raise ValueError("Invalid usage record")
+        with self.connect() as db:
+            db.execute("INSERT INTO api_usage(client_id,started_at,status,duration_seconds,input_tokens,output_tokens) "
+                       "VALUES(?,?,?,?,?,?)",
+                       (client_id, started_at, int(status), max(0, float(duration_seconds)), input_tokens, output_tokens))
+
+    def usage_summary(self, client_id, amount=24, unit="hours", buckets=30):
+        """Aggregate one key over a chosen UTC window; missing token counts stay unknown."""
+        seconds_per = {"minutes": 60, "hours": 3600, "days": 86400}
+        if unit not in seconds_per or not isinstance(amount, int) or not 1 <= amount or amount * seconds_per[unit] > 90 * 86400:
+            raise ValueError("Choose a window from one minute through 90 days")
+        if not isinstance(buckets, int) or not 1 <= buckets <= 120:
+            raise ValueError("Invalid graph resolution")
+        end = dt.datetime.now(dt.timezone.utc)
+        start = end - dt.timedelta(seconds=amount * seconds_per[unit])
+        start_text = start.isoformat(timespec="seconds")
+        end_text = end.isoformat(timespec="seconds")
+        bucket_seconds = amount * seconds_per[unit] / buckets
+        with self.connect() as db:
+            rows = db.execute("""SELECT CAST((julianday(started_at)-julianday(?))*86400/? AS INTEGER) AS bucket,
+                COUNT(*) AS requests, COUNT(input_tokens) AS input_measured,
+                COUNT(output_tokens) AS output_measured,
+                COALESCE(SUM(input_tokens),0) AS input_tokens,
+                COALESCE(SUM(output_tokens),0) AS output_tokens,
+                COALESCE(SUM(CASE WHEN output_tokens IS NOT NULL THEN duration_seconds ELSE 0 END),0) AS measured_seconds
+                FROM api_usage WHERE client_id=? AND started_at>=? AND started_at<=? GROUP BY bucket""",
+                (start_text, bucket_seconds, client_id, start_text, end_text)).fetchall()
+        points = [{"requests": 0, "input_measured": 0, "output_measured": 0,
+                   "input_tokens": 0, "output_tokens": 0, "measured_seconds": 0.0, "tokens_per_second": None}
+                  for _ in range(buckets)]
+        for row in rows:
+            position = max(0, min(buckets - 1, row["bucket"]))
+            point = points[position]
+            for key in ("requests", "input_measured", "output_measured", "input_tokens", "output_tokens", "measured_seconds"):
+                point[key] += row[key]
+        for point in points:
+            point["tokens_per_second"] = (round(point["output_tokens"] / point["measured_seconds"], 2)
+                                           if point["output_measured"] and point["measured_seconds"] > 0 else None)
+        totals = {key: sum(point[key] for point in points)
+                  for key in ("requests", "input_measured", "output_measured", "input_tokens", "output_tokens", "measured_seconds")}
+        totals["tokens_per_second"] = (round(totals["output_tokens"] / totals["measured_seconds"], 2)
+                                        if totals["output_measured"] and totals["measured_seconds"] > 0 else None)
+        return {"client_id": client_id, "amount": amount, "unit": unit, "start": start_text,
+                "end": end_text, "totals": totals, "points": points}
 SHARING_POLICY
 
 cat > "$INSTALL_DIR/gpu_control/sharing_views.py" <<'SHARING_VIEWS'
 """Explain and render client fairness settings without browser JavaScript."""
+import datetime as dt
 import html
+import urllib.parse
 
 from benchmark_views import shell
 from sharing import FIELDS, defaults
@@ -4772,6 +5125,49 @@ from sharing import FIELDS, defaults
 
 def esc(value):
     return html.escape(str(value), quote=True)
+
+
+def usage_graph(usage, key, title, suffix=""):
+    points = usage["points"]
+    peak = max((point[key] or 0 for point in points), default=0) or 1
+    start = dt.datetime.fromisoformat(usage["start"])
+    span = (dt.datetime.fromisoformat(usage["end"]) - start) / len(points)
+    columns = []
+    for number, point in enumerate(points):
+        value = point[key]
+        label = "unmeasured" if value is None else f"{value:,.2f}{suffix}" if isinstance(value, float) else f"{value:,}{suffix}"
+        bucket = (start + span * number).strftime("%Y-%m-%d %H:%M UTC")
+        height = max(0, min(100, (value or 0) / peak * 100))
+        columns.append(f'<span class="usage-bar" style="height:{height:.1f}%" title="{esc(bucket)}: {esc(label)}"></span>')
+    return (f'<div class="usage-chart"><h3>{esc(title)}</h3><div class="usage-bars" role="img" '
+            f'aria-label="{esc(title)} across {len(points)} equal time buckets from {esc(usage["start"])} to {esc(usage["end"])}">'
+            + "".join(columns) + '</div><p class="note">Older → newer; hover bars for each bucket.</p></div>')
+
+
+def usage_panel(usage, label):
+    totals = usage["totals"]
+    choices = "".join(f'<option value="{unit}"{" selected" if unit == usage["unit"] else ""}>{unit.title()}</option>'
+                      for unit in ("minutes", "hours", "days"))
+    rate = f'{totals["tokens_per_second"]:,.2f}' if totals["tokens_per_second"] is not None else "Unmeasured"
+    return (f'<section class="card" id="client-usage"><h2>Usage for {esc(label)}</h2>'
+            '<p class="note">Totals use token counts reported by the serving engine. Streaming Chat Completions request usage explicitly. '
+            'When a model or API route omits token usage, that request remains in the request count but its tokens are unmeasured. '
+            'Tokens/s is reported output tokens divided by measured end-to-end request seconds, weighted across requests; '
+            'it is not a GPU kernel speed measurement.</p>'
+            f'<form method="get" action="/sharing"><input type="hidden" name="client" value="{esc(usage["client_id"])}">'
+            f'<label for="usage-amount">Last</label><input id="usage-amount" type="number" min="1" max="129600" '
+            f'name="amount" value="{usage["amount"]}" required> <select name="unit" aria-label="Usage time unit">{choices}</select> '
+            '<button type="submit">Update usage window</button></form>'
+            f'<p class="note">{esc(usage["start"])} to {esc(usage["end"])} UTC</p>'
+            '<div class="usage-totals">'
+            f'<div><span>Input tokens</span><strong>{totals["input_tokens"]:,}</strong><small>{totals["input_measured"]:,} of {totals["requests"]:,} requests measured</small></div>'
+            f'<div><span>Output tokens</span><strong>{totals["output_tokens"]:,}</strong><small>{totals["output_measured"]:,} of {totals["requests"]:,} requests measured</small></div>'
+            f'<div><span>Effective output tokens/s</span><strong>{rate}</strong><small>Across measured responses</small></div>'
+            '</div><div class="usage-charts">'
+            + usage_graph(usage, "input_tokens", "Input tokens")
+            + usage_graph(usage, "output_tokens", "Output tokens")
+            + usage_graph(usage, "tokens_per_second", "Effective output tokens/s", " tokens/s")
+            + '</div></section>')
 
 
 EXPLAIN = (
@@ -4797,7 +5193,7 @@ EXPLAIN = (
 
 
 def index(settings, clients, csrf, hardware, server_slots, active_mode=None,
-          parallel_status=None, created=None, message=""):
+          parallel_status=None, created=None, message="", selected_usage=None, selected_client_label=""):
     recommended = defaults(hardware, server_slots)
     parallel_status = parallel_status or {"busy": False, "job": None}
     parallel_job = parallel_status.get("job") or {}
@@ -4809,7 +5205,7 @@ def index(settings, clients, csrf, hardware, server_slots, active_mode=None,
                      f'<input type="hidden" name="mode" value="{esc(active_mode)}">'
                      f'<label for="parallel-slots">Parallel generation slots for {esc(active_mode)}</label> '
                      f'<input id="parallel-slots" name="slots" type="number" min="1" max="8" step="1" value="{server_slots}" required> '
-                     '<button type="submit">Test and apply slots</button></form>') if active_mode and active_mode != "media" and not parallel_status["busy"] else ('<p>Slot test running. This page refreshes every five seconds.</p>' if parallel_status["busy"] else '<p>Start a text or vision model to change its generation slots.</p>')
+                     '<button type="submit">Test and apply slots</button></form>') if active_mode and active_mode != "media" and not parallel_status["busy"] else ('<p>Slot test running. Progress updates above without reloading this page.</p>' if parallel_status["busy"] else '<p>Start a text or vision model to change its generation slots.</p>')
     fields = "".join(
         f'<div class="setting"><label for="{key}">{esc(title)}</label>'
         f'<input id="{key}" name="{key}" type="number" min="0" step="1" value="{esc(settings[key])}" required>'
@@ -4818,6 +5214,7 @@ def index(settings, clients, csrf, hardware, server_slots, active_mode=None,
     client_rows = "".join(
         f'<tr><td>{esc(client["label"])}</td><td>{esc(client["created_at"])}</td>'
         f'<td>{"Revoked" if client["revoked_at"] else "Active"}</td><td>'
+        + f'<a href="/sharing?{urllib.parse.urlencode({"client": client["id"]})}#client-usage">View usage</a> '
         + (f'<form method="post" action="/sharing/revoke"><input type="hidden" name="token" value="{esc(csrf)}">'
            f'<input type="hidden" name="client_id" value="{esc(client["id"])}">'
            '<button type="submit">Revoke key</button></form>' if not client["revoked_at"] else '')
@@ -4865,8 +5262,10 @@ def index(settings, clients, csrf, hardware, server_slots, active_mode=None,
               '<input id="client-label" name="label" maxlength="64" required placeholder="e.g. deck-builder"> '
               '<button type="submit">Create client key</button></form>'
             + '<div class="scroll"><table><tr><th>Client</th><th>Created UTC</th><th>Status</th><th>Action</th></tr>'
-            + (client_rows or '<tr><td colspan="4">No dedicated client keys yet.</td></tr>') + '</table></div></div>')
-    style = """<style>.settings-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1rem}.setting{padding:.8rem;border:1px solid #344b50;border-radius:.6rem;background:#122126}.setting label{display:block;margin-bottom:.3rem}.setting input{width:8rem}.setting p{font-size:.9rem;margin:.5rem 0 0}.secondary{background:#22373a;color:#e6d3b3;border-color:#557070}.secondary:hover{background:#30484b}.new-key{display:block;overflow-wrap:anywhere;padding:1rem;background:#0b181c;border:1px solid #4d696a;border-radius:.5rem}@media(max-width:760px){.settings-grid{grid-template-columns:1fr}}</style>"""
+            + '<tr><td>Shared legacy key</td><td>Before dedicated keys</td><td>Active</td><td><a href="/sharing?client=legacy#client-usage">View usage</a></td></tr>'
+            + client_rows + '</table></div></div>'
+            + (usage_panel(selected_usage, selected_client_label) if selected_usage else ''))
+    style = """<style>.settings-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1rem}.setting{padding:.8rem;border:1px solid #344b50;border-radius:.6rem;background:#122126}.setting label{display:block;margin-bottom:.3rem}.setting input{width:8rem}.setting p{font-size:.9rem;margin:.5rem 0 0}.secondary{background:#22373a;color:#e6d3b3;border-color:#557070}.secondary:hover{background:#30484b}.new-key{display:block;overflow-wrap:anywhere;padding:1rem;background:#0b181c;border:1px solid #4d696a;border-radius:.5rem}.usage-totals{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:.8rem}.usage-totals>div{display:grid;gap:.2rem;background:#102024;border:1px solid #365056;border-radius:.7rem;padding:1rem}.usage-totals strong{font-size:clamp(1.3rem,3vw,2rem);color:#f1bf81}.usage-totals small{color:#b6c6c4}.usage-charts{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:.8rem;margin-top:1rem}.usage-chart{background:#102024;border:1px solid #365056;border-radius:.7rem;padding:1rem;min-width:0}.usage-chart h3{margin:.1rem 0 .8rem}.usage-chart p{font-size:.78rem}.usage-bars{height:9rem;display:flex;align-items:end;gap:2px;border-bottom:1px solid #8ba9a1}.usage-bar{flex:1;min-width:2px;background:linear-gradient(#f1bf81,#a87645);border-radius:3px 3px 0 0}@media(max-width:900px){.usage-charts{grid-template-columns:1fr}}@media(max-width:760px){.settings-grid,.usage-totals{grid-template-columns:1fr}}</style>"""
     return shell("Client sharing and rate limits", style + body, refresh=parallel_status["busy"], wide=True)
 SHARING_VIEWS
 
@@ -4874,9 +5273,11 @@ cat > "$INSTALL_DIR/gpu_control/fairness_gateway.py" <<'FAIRNESS_GATEWAY'
 #!/usr/bin/env python3
 """Streaming OpenAI-compatible proxy with per-client admission control."""
 import http.client
+import datetime as dt
 import json
 import os
 import re
+import sqlite3
 import threading
 import time
 import urllib.request
@@ -4888,6 +5289,7 @@ from sharing import SharingManager, FIELDS
 DB_PATH = os.environ.get("BENCHMARK_DB", "/app/data/benchmarks.sqlite3")
 LEGACY_KEY = os.environ["BENCHMARK_API_KEY"]
 SHARING = SharingManager(DB_PATH, read_only=True)
+USAGE = None  # Initialized only in the server process, after the database mount is ready.
 HOP_HEADERS = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
                "te", "trailer", "transfer-encoding", "upgrade"}
 BACKEND = re.compile(r"[a-z0-9-]+:(?:8000|8080)\Z")
@@ -4919,7 +5321,61 @@ def cap_output(path, raw, content_type, maximum):
             raise ValueError(f"{name} must be a positive integer")
         else:
             body[name] = min(value, maximum)
+    if body.get("stream") is True and route.endswith(("/chat/completions", "/completions")):
+        options = body.get("stream_options")
+        if options is None:
+            options = {}
+        if isinstance(options, dict):
+            options["include_usage"] = True
+            body["stream_options"] = options
     return json.dumps(body, separators=(",", ":")).encode()
+
+
+class UsageCollector:
+    """Extract reported usage from JSON or SSE without retaining generated text."""
+    def __init__(self, content_type):
+        self.streaming = "text/event-stream" in (content_type or "").lower()
+        self.buffer = b""
+        self.input_tokens = None
+        self.output_tokens = None
+
+    def _accept(self, payload):
+        if not isinstance(payload, dict):
+            return
+        usage = payload.get("usage") or (payload.get("response") or {}).get("usage")
+        if not isinstance(usage, dict):
+            return
+        incoming = usage.get("prompt_tokens", usage.get("input_tokens"))
+        outgoing = usage.get("completion_tokens", usage.get("output_tokens"))
+        if isinstance(incoming, int) and incoming >= 0:
+            self.input_tokens = incoming
+        if isinstance(outgoing, int) and outgoing >= 0:
+            self.output_tokens = outgoing
+
+    def feed(self, chunk):
+        if not self.streaming:
+            if len(self.buffer) + len(chunk) <= 2 * 1024 * 1024:
+                self.buffer += chunk
+            return
+        self.buffer = (self.buffer + chunk).replace(b"\r\n", b"\n")
+        while b"\n\n" in self.buffer:
+            event, self.buffer = self.buffer.split(b"\n\n", 1)
+            data = b"\n".join(line[5:].strip() for line in event.splitlines() if line.startswith(b"data:"))
+            if data and data != b"[DONE]" and len(data) <= 2 * 1024 * 1024:
+                try:
+                    self._accept(json.loads(data))
+                except (ValueError, UnicodeDecodeError):
+                    pass
+        if len(self.buffer) > 2 * 1024 * 1024:
+            self.buffer = self.buffer[-65536:]
+
+    def result(self):
+        if not self.streaming and self.buffer:
+            try:
+                self._accept(json.loads(self.buffer))
+            except (ValueError, UnicodeDecodeError):
+                pass
+        return self.input_tokens, self.output_tokens
 
 
 class Admission:
@@ -5049,6 +5505,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 self.reply(429, "Client rate or concurrency limit reached", retry)
                 return
         upstream = None
+        collector = None
+        response_status = 502
+        started_at = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+        started_clock = time.monotonic()
         try:
             path = self.path
             if path.startswith("/vision/v1/"):
@@ -5070,6 +5530,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
             headers["Connection"] = "close"
             upstream.request(self.command, path, body=raw if self.command == "POST" else None, headers=headers)
             response = upstream.getresponse()
+            response_status = response.status
+            collector = UsageCollector(response.getheader("Content-Type")) if admitted else None
             self.send_response(response.status)
             for key, value in response.getheaders():
                 if key.lower() not in HOP_HEADERS:
@@ -5078,6 +5540,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
             self.end_headers()
             if self.command != "HEAD":
                 while chunk := response.read1(65536):
+                    if collector:
+                        collector.feed(chunk)
                     self.wfile.write(chunk)
                     self.wfile.flush()
         except (OSError, RuntimeError, ValueError) as exc:
@@ -5090,6 +5554,13 @@ class GatewayHandler(BaseHTTPRequestHandler):
             if upstream:
                 upstream.close()
             if admitted:
+                try:
+                    if USAGE:
+                        incoming, outgoing = collector.result() if collector else (None, None)
+                        USAGE.record_usage(client_id, started_at, response_status,
+                                           time.monotonic() - started_clock, incoming, outgoing)
+                except (OSError, sqlite3.Error, ValueError, RuntimeError):
+                    pass  # Telemetry must never break a client response or hold its slot.
                 ADMISSION.release(client_id)
 
     def end_headers(self):
@@ -5098,6 +5569,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    USAGE = SharingManager(DB_PATH)
     ThreadingHTTPServer(("0.0.0.0", 8002), GatewayHandler).serve_forever()
 FAIRNESS_GATEWAY
 
@@ -5883,6 +6355,8 @@ class MediaManager:
         self.host_path = os.environ["MEDIA_HOST_DIR"]
         self.lock = threading.Lock()
         self.busy = False
+        self.pending_installs = []
+        self.reserved_bytes = 0
         self.cache = {}
         with self.connect() as db:
             db.execute("""CREATE TABLE IF NOT EXISTS media_jobs (
@@ -5897,7 +6371,7 @@ class MediaManager:
 
     def jobs(self):
         with self.connect() as db:
-            return [dict(row) for row in db.execute("SELECT * FROM media_jobs ORDER BY started_at DESC LIMIT 10")]
+            return [dict(row) for row in db.execute("SELECT * FROM media_jobs ORDER BY started_at DESC, rowid DESC LIMIT 10")]
 
     def _job(self, job_id, **values):
         with self.connect() as db:
@@ -5978,8 +6452,10 @@ class MediaManager:
         if not candidate:
             raise ValueError("Unknown media model")
         with self.lock:
-            if self.busy:
-                raise RuntimeError("A media model download is already running")
+            with self.connect() as db:
+                if db.execute("SELECT 1 FROM media_jobs WHERE candidate_id=? AND status IN ('queued','running')",
+                              (candidate_id,)).fetchone():
+                    raise ValueError("This media model is already queued or downloading")
             if not hardware["vram_mib"] or hardware["vram_mib"] < candidate["vram"] * 1024 or hardware["ram_gib"] < candidate["ram"]:
                 raise ValueError("This model is not recommended for the detected hardware")
             files = self.metadata(candidate)
@@ -5990,14 +6466,19 @@ class MediaManager:
             missing = [item for item in files if not os.path.isfile(self._destination(item)) or os.path.getsize(self._destination(item)) != item["size"]]
             if not missing:
                 raise ValueError("All files are already installed")
-            if sum(item["size"] for item in missing) * 1.15 > shutil.disk_usage(self.path).free:
+            reserve = int(sum(item["size"] for item in missing) * 1.15)
+            if reserve + self.reserved_bytes > shutil.disk_usage(self.path).free:
                 raise ValueError("Insufficient media model storage")
             job_id = str(uuid.uuid4())
             with self.connect() as db:
                 db.execute("INSERT INTO media_jobs(id,candidate_id,started_at,status,stage) VALUES(?,?,?,?,?)",
-                           (job_id, candidate_id, utc_now(), "queued", "queued"))
-            self.busy = True
-            threading.Thread(target=self._install, args=(job_id, missing), daemon=True).start()
+                           (job_id, candidate_id, utc_now(), "queued", "queued behind current download" if self.busy else "queued"))
+            self.reserved_bytes += reserve
+            if self.busy:
+                self.pending_installs.append((job_id, missing, reserve))
+            else:
+                self.busy = True
+                threading.Thread(target=self._install, args=(job_id, missing, reserve), daemon=True).start()
             return job_id
 
     def _verify(self, path, item):
@@ -6010,7 +6491,7 @@ class MediaManager:
         if digest.hexdigest() != item["sha256"]:
             raise ValueError("SHA256 does not match Hugging Face: " + item["destination"])
 
-    def _install(self, job_id, files):
+    def _install(self, job_id, files, reserve=0):
         try:
             self._job(job_id, status="running", stage="checking existing files")
             for number, item in enumerate(files, 1):
@@ -6058,7 +6539,12 @@ class MediaManager:
             self._job(job_id, status="failed", stage="failed", ended_at=utc_now(), error=f"{type(exc).__name__}: {str(exc)[:300]}")
         finally:
             with self.lock:
-                self.busy = False
+                self.reserved_bytes = max(0, self.reserved_bytes - reserve)
+                if self.pending_installs:
+                    args = self.pending_installs.pop(0)
+                    threading.Thread(target=self._install, args=args, daemon=True).start()
+                else:
+                    self.busy = False
 MEDIA_CATALOG
 
 cat > "$INSTALL_DIR/gpu_control/update-engine.sh" <<'ENGINE_UPDATE_SCRIPT'

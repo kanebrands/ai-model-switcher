@@ -18,19 +18,23 @@ STYLE = """*{box-sizing:border-box}html{color-scheme:dark}body{font:16px/1.55 sy
 STYLE += """.section-links{display:flex;gap:.5rem;flex-wrap:wrap;margin:1rem 0 1.5rem}.section-links a{display:inline-block;padding:.48rem .75rem;border:1px solid #435a5a;border-radius:99px;background:#17272a;color:#e9c18b;text-decoration:none;font-size:.88rem;font-weight:650}.section-links a:hover{background:#274044}.overview-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1rem}.overview-grid .card{margin:0}.overview-grid h2{margin:.2rem 0 .7rem}@media(max-width:900px){.overview-grid{grid-template-columns:1fr}}"""
 
 
-def shell(title, body, refresh=False, wide=False):
-    meta = '<meta http-equiv="refresh" content="5">' if refresh else ""
+def shell(title, body, refresh=False, wide=False, monitor_url=None):
+    if refresh and not monitor_url:
+        monitor_url = ("/operations/status?scope=models" if title in ("Hugging Face model recommendations", "Hardware and model choices") else
+                       "/operations/status?scope=sharing" if title == "Client sharing and rate limits" else None)
+    monitor = (f'<p class="message" role="status" data-operation-monitor="{esc(monitor_url)}">Checking operation status…</p>'
+               '<script src="/assets/operation_poll.js" defer></script>') if monitor_url else ""
     body_class = ' class="wide"' if wide else ""
     description = ("Compare saved speed and quality results for this machine." if title == "Model benchmarks" else
                    "Find models sized for the hardware in this system." if title == "Hugging Face model recommendations" else
                    "Compare coding agents and connect them to your local API." if title == "Coding harnesses" else
                    "Inspect this model's recorded runs and system details.")
     display_title = "Find models" if title == "Hugging Face model recommendations" else title
-    return (f'<!doctype html><html lang="en"><meta charset="utf-8">{meta}'
+    return (f'<!doctype html><html lang="en"><meta charset="utf-8">'
             f'<meta name="viewport" content="width=device-width,initial-scale=1">'
             f'<title>{esc(title)}</title><style>{STYLE}</style><body{body_class}><main><nav aria-label="Main navigation"><a href="/">AI Model Switcher</a>'
             f'<a href="/benchmarks">Benchmarks</a><a href="/models">Find models</a><a href="/sharing">Client sharing</a><a href="/harnesses">Coding harnesses</a></nav>'
-            f'<header class="hero"><div class="hero-copy"><div class="eyebrow">Local AI / Control desk</div><h1>{esc(display_title)}</h1><p>{description}</p></div></header>{body}</main></body></html>')
+            f'<header class="hero"><div class="hero-copy"><div class="eyebrow">Local AI / Control desk</div><h1>{esc(display_title)}</h1><p>{description}</p></div></header>{monitor}{body}</main></body></html>')
 
 
 def summary(run):
@@ -230,7 +234,7 @@ def detail(run):
     if run.get("error"):
         state += f'<p><strong>Error:</strong> {esc(run["error"])}</p>'
     if run["status"] in ("queued", "running"):
-        state += '<p class="note">This page refreshes every five seconds while the benchmark runs.</p>'
+        state += '<p class="note">Progress updates above without reloading this page.</p>'
     state += f'<p><a href="/benchmarks/{esc(run["id"])}.json">Download run JSON</a></p>'
 
     hardware = {
@@ -286,4 +290,6 @@ def detail(run):
         if image.get("error") or image.get("reason"):
             body += f'<p>{esc(image.get("error") or image.get("reason"))}</p>'
         body += '</div>'
-    return shell("Benchmark run", body, run["status"] in ("queued", "running"))
+    active = run["status"] in ("queued", "running")
+    return shell("Benchmark run", body, active,
+                 monitor_url="/operations/status?scope=benchmark&run_id=" + urllib.parse.quote(run["id"]) if active else None)

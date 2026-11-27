@@ -3,6 +3,7 @@ import html
 
 from benchmark_views import shell
 from hybrid_memory import memory_plan
+from model_catalog import BY_ID, model_display_name, preferred_alias
 
 
 def esc(value):
@@ -16,15 +17,29 @@ def uninstall_form(item, csrf, active_models=()):
     return (f'<form method="post" action="/models/uninstall">'
             f'<input type="hidden" name="token" value="{esc(csrf)}">'
             f'<input type="hidden" name="candidate" value="{esc(item["candidate_id"])}">'
-            f'<label>Confirm API name <input type="text" name="confirm" required maxlength="128" '
-            f'autocomplete="off" placeholder="{esc(item["alias"])}" aria-label="Type {esc(item["alias"])} to uninstall"></label> '
+            f'<label>Confirm model name <input type="text" name="confirm" required maxlength="128" '
+            f'autocomplete="off" placeholder="{esc(model_display_name(item))}" '
+            f'aria-label="Type {esc(model_display_name(item))} to uninstall"></label> '
             '<button type="submit">Uninstall</button></form>')
+
+
+def rename_form(item, csrf, installed, active_models=()):
+    if item["candidate_id"] in active_models:
+        return ""
+    suggested = preferred_alias({"id": item["candidate_id"], "repo": item["repo"],
+                                 "file": (item.get("filename") or "").split("--")[-1]},
+                                {other["alias"] for other in installed if other["candidate_id"] != item["candidate_id"]})
+    return (f'<form method="post" action="/models/rename">'
+            f'<input type="hidden" name="token" value="{esc(csrf)}">'
+            f'<input type="hidden" name="candidate" value="{esc(item["candidate_id"])}">'
+            f'<label>API ID <input type="text" name="alias" required maxlength="64" value="{esc(suggested)}"></label> '
+            '<button type="submit">Change API ID</button></form>')
 
 
 def specific_search_section(search, installed, jobs, csrf, engine=None, hardware=None, hybrid_enabled=True,
                             active_models=()):
     search = search or {"status": "not searched", "items": [], "query": "", "error": None}
-    installing = {job["candidate_id"] for job in jobs if job["status"] in ("queued", "running")}
+    installing = {job["candidate_id"]: job["status"] for job in jobs if job["status"] in ("queued", "running")}
     installed_files = {(item["repo"], item["sha256"]) for item in installed}
     installed_ids = {item["candidate_id"] for item in installed}
     engine_build = (engine or {}).get("local_build") or 0
@@ -36,7 +51,7 @@ def specific_search_section(search, installed, jobs, csrf, engine=None, hardware
         busy = item["id"] in installing
         fit = bool(item.get("fits"))
         disk_fits = item.get("disk_fits", True)
-        state = ("Installed" if installed_here else "Installing" if busy else
+        state = ("Installed" if installed_here else "Queued" if installing.get(item["id"]) == "queued" else "Installing" if busy else
                  "Insufficient disk" if not disk_fits else "Engine update needed" if needs_engine else
                  "Likely fits with RAM assistance" if fit and item.get("hybrid_used") else
                  "Likely fits" if fit else "Memory estimate exceeded")
@@ -80,12 +95,14 @@ def specific_search_section(search, installed, jobs, csrf, engine=None, hardware
                           f'<input type="hidden" name="token" value="{esc(csrf)}">'
                           f'<input type="hidden" name="candidate" value="{esc(item["candidate_id"])}">'
                           f'{override}<button type="submit">Apply saved preference</button></form>')
-        installed_rows.append(f'<tr><td>{esc(item["alias"])}</td><td>{esc(item["repo"])}</td>'
+        installed_rows.append(f'<tr><td><strong>{esc(model_display_name(item))}</strong><br>'
+                              f'<small class="note">API ID: {esc(item["alias"])}</small></td><td>{esc(item["repo"])}</td>'
                               f'<td>{esc(item.get("format", "gguf").upper())} / {esc(item.get("runtime", "gpu").upper())}</td>'
                               f'<td>{esc(assistance)}</td>'
                               f'<td><form method="post" action="/switch"><input type="hidden" name="token" value="{esc(csrf)}">'
                               f'<button name="mode" value="hf-{esc(item["candidate_id"])}">Activate</button></form>'
-                              f'{apply_form}{uninstall_form(item, csrf, active_models)}</td></tr>')
+                              f'{apply_form}{rename_form(item, csrf, installed, active_models)}'
+                              f'{uninstall_form(item, csrf, active_models)}</td></tr>')
     return (f'<section class="card" id="specific-search"><h2>Search a specific Hugging Face model</h2>'
             '<p>Search by model name, exact owner/repository ID, or a Hugging Face repository URL. '
             'Searches any publisher and lists complete GGUF shard sets, single-file GGUF, and Safetensors repositories with standard tokenizer and configuration files. '
@@ -107,8 +124,9 @@ def specific_search_section(search, installed, jobs, csrf, engine=None, hardware
             'A running model is restarted and checked; failure restores its previous container. '
             'A stopped model is staged with the new setting and checked when activated. '
             'Uninstall removes the selected switcher-managed files and serving container; benchmark history stays available. '
+            'Changing an API ID requires switching away first and will require API clients to use the new ID; old benchmark labels remain as recorded. '
             'Switch away from an active model first. Files you added manually and shared ComfyUI assets are not removed.</p>'
-            '<div class="scroll"><table><tr><th>API name</th><th>Repository</th><th>Engine</th><th>Memory setting</th><th>Action</th></tr>'
+            '<div class="scroll"><table><tr><th>Model</th><th>Repository</th><th>Engine</th><th>Memory setting</th><th>Action</th></tr>'
             f'{"".join(installed_rows) if installed_rows else "<tr><td colspan=5>None yet.</td></tr>"}</table></div></section>')
 
 
@@ -152,7 +170,9 @@ def index(hardware, suggestions, installed, jobs, csrf, prefer_ablit=True,
                 '<code>AI_MODEL_SELECTION=cpu-tiny,cpu-4b</code> after checking which choices fit this host. '
                 'The GPU catalog and engine updates appear when a supported GPU is detected and the installer is rerun.</p></section>'
                 + search_section)
-        return shell("Hardware and model choices", body, refresh=(search or {}).get("status") == "running", wide=True)
+        return shell("Hardware and model choices", body,
+                     refresh=(search or {}).get("status") == "running" or
+                     any(job["status"] in ("queued", "running") for job in jobs), wide=True)
     discovery = discovery or {"status": "not checked", "items": [], "query": "", "error": None}
     engine = engine or {"checked_at": None, "checking": False, "update_available": None,
                         "local_build": None, "error": None, "job": None, "busy": False}
@@ -179,11 +199,11 @@ def index(hardware, suggestions, installed, jobs, csrf, prefer_ablit=True,
                   + (f'<p>Latest update job: <strong>{esc(engine_job.get("status"))}</strong> · {esc(engine_job.get("stage"))}'
                      f' · {esc(engine_job.get("error"))}</p>' if engine_job else ''))
     rows = []
-    installing = {job["candidate_id"] for job in jobs if job["status"] in ("queued", "running")}
+    installing = {job["candidate_id"]: job["status"] for job in jobs if job["status"] in ("queued", "running")}
     for number, item in enumerate(suggestions, 1):
         source = "https://huggingface.co/" + item["repo"]
         estimate = item["estimated_tps"] + " tokens/s" if item["estimated_tps"] else "No comparable run"
-        state = "Installed" if item["installed"] else "Installing" if item["id"] in installing else "Available"
+        state = "Installed" if item["installed"] else "Queued" if installing.get(item["id"]) == "queued" else "Installing" if item["id"] in installing else "Available"
         context = f'{item["context_tokens"]:,} tokens' if item.get("context_tokens") else "Unknown"
         context += " (configured)" if item["installed"] else " (target)"
         download = f'{item["size_gb"]} GB'
@@ -202,23 +222,30 @@ def index(hardware, suggestions, installed, jobs, csrf, prefer_ablit=True,
         form = (f'<form method="post" action="/switch"><input type="hidden" name="token" value="{esc(csrf)}">'
                 f'<button name="mode" value="{esc(mode)}" type="submit">Activate</button></form>')
         configured_context = f'{item.get("context_tokens") or 32768:,} tokens'
-        installed_rows.append(f'<tr><td>{esc(item["alias"])}</td><td>{esc(item["repo"])}</td>'
+        installed_rows.append(f'<tr><td><strong>{esc(model_display_name(item))}</strong><br>'
+                              f'<small class="note">API ID: {esc(item["alias"])}</small></td><td>{esc(item["repo"])}</td>'
                               f'<td>{esc(configured_context)}</td><td>{esc(item["installed_at"])}</td>'
-                              f'<td>{form}{uninstall_form(item, csrf, active_models)}</td></tr>')
+                              f'<td>{form}{rename_form(item, csrf, installed, active_models)}'
+                              f'{uninstall_form(item, csrf, active_models)}</td></tr>')
     job_rows = []
+    job_names = {item["candidate_id"]: model_display_name(item) for item in installed}
+    job_names.update({item["id"]: item.get("name") or model_display_name(item) for item in suggestions})
+    job_names.update({item["id"]: item.get("name") or model_display_name(item)
+                      for item in (discovery or {}).get("items", []) + (search or {}).get("items", [])})
+    job_names.update({item["id"]: item["name"] for item in BY_ID.values()})
     for job in jobs:
-        job_rows.append(f'<tr><td>{esc(job["candidate_id"])}</td><td>{esc(job["status"])}</td>'
+        job_rows.append(f'<tr><td>{esc(job_names.get(job["candidate_id"], "Hugging Face model"))}</td><td>{esc(job["status"])}</td>'
                         f'<td>{esc(job["stage"])}</td><td>{esc(job["error"])}</td></tr>')
     refreshing = any(job["status"] in ("queued", "running") for job in jobs)
     discovery_rows = []
-    installing = installing | {job["candidate_id"] for job in jobs if job["status"] in ("queued", "running")}
+    installing.update({job["candidate_id"]: job["status"] for job in jobs if job["status"] in ("queued", "running")})
     installed_ids = {item["candidate_id"] for item in installed}
     for number, item in enumerate(discovery.get("items", []), 1):
         installed_here = item["id"] in installed_ids
         required = item.get("min_engine_build") or 0
         blocked = (required and item.get("runtime", "gpu") == "gpu" and
                    (engine.get("local_build") or 0) < required)
-        state = ("Installed" if installed_here else "Installing" if item["id"] in installing
+        state = ("Installed" if installed_here else "Queued" if installing.get(item["id"]) == "queued" else "Installing" if item["id"] in installing
                  else f"Needs llama.cpp build {required}+" if blocked else
                  "GPU + RAM estimate" if item.get("hybrid_used") else "Untested engine compatibility")
         disabled = " disabled" if installed_here or item["id"] in installing or blocked else ""
@@ -234,10 +261,10 @@ def index(hardware, suggestions, installed, jobs, csrf, prefer_ablit=True,
                         f'Checked UTC: {esc(discovery.get("ended_at") or discovery.get("started_at"))}')
     if discovery.get("error"):
         discovery_status += " · " + esc(discovery["error"])
-    media_installing = {job["candidate_id"] for job in media_jobs if job["status"] in ("queued", "running")}
+    media_installing = {job["candidate_id"]: job["status"] for job in media_jobs if job["status"] in ("queued", "running")}
     media_rows = []
     for number, item in enumerate(media_suggestions, 1):
-        state = ("Installed" if item["installed"] else "Installing" if item["id"] in media_installing
+        state = ("Installed" if item["installed"] else "Queued" if media_installing.get(item["id"]) == "queued" else "Installing" if item["id"] in media_installing
                  else "File conflict" if item.get("conflict") else "Available")
         disabled = " disabled" if state != "Available" else ""
         label = state if disabled else "Download and install"
@@ -283,7 +310,7 @@ def index(hardware, suggestions, installed, jobs, csrf, prefer_ablit=True,
               f'<p>Catalog refresh: {discovery_status}</p>'
             + '<div class="scroll"><table class="results-table"><thead><tr><th>#</th><th>Model</th><th>Published UTC</th><th>GGUF file</th><th>Size</th><th>Source type</th><th>Abliterated</th><th>Engine status</th><th>Action</th></tr></thead>'
               f'<tbody>{"".join(discovery_rows) if discovery_rows else "<tr><td colspan=9>No matching, verified GGUF files are in this refresh.</td></tr>"}</tbody></table></div>'
-            + '<h2 id="installed-models">Installed from this page</h2><div class="scroll"><table><tr><th>API name</th><th>Source</th><th>Configured context</th><th>Installed UTC</th><th>Action</th></tr>'
+            + '<h2 id="installed-models">Installed from this page</h2><div class="scroll"><table><tr><th>Model</th><th>Source</th><th>Configured context</th><th>Installed UTC</th><th>Action</th></tr>'
               f'{"".join(installed_rows) if installed_rows else "<tr><td colspan=5>None yet</td></tr>"}</table></div>'
             + '<h2 id="media-models">Image and video models for ComfyUI</h2><p class="note">A separate top 10 chosen for the detected GPU, RAM, and available media storage. '
               'The abliteration selector above also applies here: when preferred, Z-Image uses an abliterated Qwen prompt encoder; other entries have no verified abliterated bundle. '

@@ -15,7 +15,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from benchmarks import BenchmarkManager, MODELS
 import benchmark_views
-from model_catalog import ModelManager
+from model_catalog import BY_ID, ModelManager, model_display_name
 from media_catalog import MediaManager
 from catalog_discovery import CatalogDiscovery
 from engine_updates import EngineUpdates
@@ -192,7 +192,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
-        self.send_header("Content-Security-Policy", "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'self'" if embeddable else "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
+        self.send_header("Content-Security-Policy", "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; script-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'self'" if embeddable else "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; script-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         self.wfile.write(data)
@@ -230,7 +230,7 @@ class Handler(BaseHTTPRequestHandler):
                   ("Qwen3.8 MoE distill abliterated", qwen38_on),
                   ("Gemma 4 26B-A4B abliterated", gemma4_on),
                   ("ComfyUI", media_on)) if on]
-        active.extend(item["alias"] for item in managed if running(item["container"]))
+        active.extend(model_display_name(item) for item in managed if running(item["container"]))
         mode = active[0] if len(active) == 1 else "Neither" if not active else "Conflict: " + ", ".join(active)
         h = lambda s: html.escape(s, quote=True)
         try:
@@ -251,7 +251,7 @@ class Handler(BaseHTTPRequestHandler):
             return which in SELECTED_MODES if SELECTED_MODES else builtin_states.get(which) != "not created"
         model_labels = {**{key: value for key, value in BUILTIN_LABELS.items()
                            if available_builtin(key)},
-                        **{"hf-" + item["candidate_id"]: item["alias"] + " (Hugging Face)" for item in managed}}
+                        **{"hf-" + item["candidate_id"]: model_display_name(item) + " (Hugging Face; API " + item["alias"] + ")" for item in managed}}
         model_options = "".join(
             f'<option value="{h(which)}" {"selected" if contexts.get(which, {}).get("running") else ""}>'
             f'{h(label)} · {h(context_text(which))}</option>'
@@ -280,7 +280,7 @@ class Handler(BaseHTTPRequestHandler):
                         f'value="{context_active["tokens"]}" required> '
                         '<button type="submit">Test and save context</button></form>') if context_active else '<p>Start one model to tune its context.</p>'
         if context_status["busy"]:
-            context_form = '<p>Context test running. This page refreshes every five seconds.</p>'
+            context_form = '<p>Context test running. Progress updates above without reloading this page.</p>'
         states = (("cpu-tiny", "Qwen3 0.6B CPU", cpu_tiny_state),
                   ("cpu-4b", "Qwen3 4B CPU", cpu_4b_state),
                   ("llm", "Qwen3 Coder", llm_state),
@@ -325,10 +325,10 @@ class Handler(BaseHTTPRequestHandler):
         home_style += ".message-banner{display:flex;align-items:center;justify-content:space-between;gap:1rem}.message-banner p,.message-banner form{margin:0}.message-banner button{min-height:2.2rem;padding:.3rem .7rem;background:transparent;border-color:#c5a976;color:#f8d9a5;white-space:nowrap}.message-banner button:hover{background:#3a4437}@media(max-width:740px){.message-banner{align-items:flex-start;flex-direction:column}}"
         home_style += ".gpu-frame{width:100%;height:345px;border:0;background:#17262a}.gpu-note{font-size:.9rem;color:#b6c6c4}@media(max-width:740px){.gpu-frame{height:440px}}"
         page = f"""<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-{'<meta http-equiv="refresh" content="5">' if context_status['busy'] or webui_status['checking'] or webui_status['busy'] else ''}
 <title>AI Model Switcher</title><style>{benchmark_views.STYLE}{home_style}</style>
 <main><nav aria-label="Main navigation"><a href="/">AI Model Switcher</a><a href="/models">Find models</a><a href="/benchmarks">Benchmarks</a><a href="/sharing">Client sharing</a><a href="/harnesses">Coding harnesses</a></nav>
 <header class="hero"><div class="hero-copy"><div class="eyebrow">Local AI / Control desk</div><h1>AI Model Switcher</h1><p>Manage local workloads and model context from one place.</p><div class="active-line"><span class="active-badge">Active workload</span><strong>{h(mode)}</strong></div></div></header>
+{'<p class="message" role="status" data-operation-monitor="/operations/status?scope=home">Checking operation status…</p><script src="/assets/operation_poll.js" defer></script>' if context_status['busy'] or webui_status['checking'] or webui_status['busy'] else ''}
 {webui_card}
 {webui_result}
 {f'<p class="message" role="status">{h(message)}</p>' if message else ''}
@@ -348,13 +348,96 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
-        self.send_header("Content-Security-Policy", "default-src 'none'; img-src 'self'; frame-src 'self'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
+        self.send_header("Content-Security-Policy", "default-src 'none'; img-src 'self'; frame-src 'self'; style-src 'unsafe-inline'; script-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         self.wfile.write(data)
 
     def do_GET(self):
         path = urllib.parse.urlsplit(self.path)
+        if path.path == "/assets/operation_poll.js":
+            try:
+                with open("/app/operation_poll.js", "rb") as script:
+                    data = script.read()
+            except OSError:
+                self.send_error(404)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/javascript; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "public, max-age=3600")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(data)
+            return
+        if path.path == "/operations/status":
+            query = urllib.parse.parse_qs(path.query)
+            scope = query.get("scope", [""])[0]
+            try:
+                if scope == "models":
+                    jobs = MODEL_MANAGER.jobs()
+                    media = MEDIA_MANAGER.jobs()
+                    catalog = DISCOVERY.latest()
+                    search = DISCOVERY.latest_search()
+                    engine = ENGINE_UPDATES.status()
+                    job_names = {item["candidate_id"]: model_display_name(item) for item in MODEL_MANAGER.installed()}
+                    job_names.update({item["id"]: item.get("name") or model_display_name(item)
+                                      for item in catalog["items"] + search["items"]})
+                    job_names.update({item["id"]: item["name"] for item in BY_ID.values()})
+                    active = (any(job["status"] in ("queued", "running") for job in jobs + media) or
+                              catalog["status"] == "running" or search["status"] == "running" or
+                              engine["checking"] or engine["busy"])
+                    lines = [f'Text {job_names.get(job["candidate_id"], "Hugging Face model")}: {job["status"]} · {job["stage"]}'
+                             for job in jobs if job["status"] in ("queued", "running")][:5]
+                    lines += [f'Media {job["candidate_id"]}: {job["status"]} · {job["stage"]}'
+                              for job in media if job["status"] in ("queued", "running")][:5]
+                    if catalog["status"] == "running":
+                        lines.append("Catalog refresh running")
+                    if search["status"] == "running":
+                        lines.append("Hugging Face search running")
+                    if engine["checking"] or engine["busy"]:
+                        lines.append("Engine check or update running")
+                    if not lines:
+                        latest = jobs[0] if jobs else media[0] if media else None
+                        lines = [f'{job_names.get(latest["candidate_id"], latest["candidate_id"])}: {latest["status"]} · {latest["stage"]}' if latest else "Operation finished"]
+                elif scope == "home":
+                    context = CONTEXT_TUNER.status()
+                    webui = WEBUI_UPDATES.status()
+                    active = context["busy"] or webui["checking"] or webui["busy"]
+                    lines = []
+                    if context["job"]:
+                        lines.append(f'Context: {context["job"]["status"]} · {context["job"]["stage"]}')
+                    if webui["job"]:
+                        lines.append(f'Open WebUI: {webui["job"]["status"]} · {webui["job"]["stage"]}')
+                    if webui["checking"]:
+                        lines.append("Checking Open WebUI update")
+                elif scope == "sharing":
+                    slot = PARALLEL_TUNER.status()
+                    active = slot["busy"]
+                    job = slot["job"]
+                    lines = [f'Slot test: {job["status"]} · {job["stage"]}'] if job else []
+                elif scope == "benchmark":
+                    run_id = query.get("run_id", [""])[0]
+                    uuid.UUID(run_id)
+                    run = BENCHMARKS.get_run(run_id)
+                    if not run:
+                        raise ValueError("Benchmark run missing")
+                    active = run["status"] in ("queued", "running")
+                    lines = [f'Benchmark: {run["status"]} · {run["stage"]}']
+                else:
+                    raise ValueError("Unknown operation scope")
+            except (ValueError, KeyError):
+                self.send_error(400, "Invalid operation status request")
+                return
+            data = json.dumps({"active": bool(active), "message": " | ".join(lines) or "Operation finished"}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(data)
+            return
         if path.path == "/harnesses":
             self._send_html(harness_views.index())
             return
@@ -365,13 +448,31 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 hardware = MODEL_MANAGER.hardware()
                 settings = SHARING.settings(hardware, active_server_slots())
+                clients = SHARING.clients()
+                query = urllib.parse.parse_qs(path.query)
+                selected = query.get("client", [])
+                usage = None
+                selected_label = ""
+                if selected:
+                    if len(selected) != 1 or selected[0] not in {"legacy", *(item["id"] for item in clients)}:
+                        raise ValueError("Unknown API key")
+                    amount = query.get("amount", ["24"])
+                    unit = query.get("unit", ["hours"])
+                    if len(amount) != 1 or not amount[0].isdecimal() or len(unit) != 1:
+                        raise ValueError("Choose a valid usage window")
+                    usage = SHARING.usage_summary(selected[0], int(amount[0]), unit[0])
+                    selected_label = ("Shared legacy key" if selected[0] == "legacy" else
+                                      next(item["label"] for item in clients if item["id"] == selected[0]))
                 notice = {"limits_saved": "Sharing limits saved and confirmed by the API gateway.",
                           "defaults_restored": "Detected hardware defaults restored and confirmed by the API gateway.",
                           "key_revoked": "Client key revoked. New requests using it are denied.",
                           "slot_test_started": "Model slot test started. This page will report readiness or rollback."}.get(
-                              urllib.parse.parse_qs(path.query).get("status", [""])[0], "")
-                self._send_html(sharing_views.index(settings, SHARING.clients(), CSRF, hardware, active_server_slots(),
-                                                    active_mode(), PARALLEL_TUNER.status(), message=notice))
+                              query.get("status", [""])[0], "")
+                self._send_html(sharing_views.index(settings, clients, CSRF, hardware, active_server_slots(),
+                                                    active_mode(), PARALLEL_TUNER.status(), message=notice,
+                                                    selected_usage=usage, selected_client_label=selected_label))
+            except ValueError as exc:
+                self.send_error(400, str(exc))
             except Exception as exc:
                 self.send_error(503, "Sharing settings unavailable: " + type(exc).__name__)
             return
@@ -407,7 +508,9 @@ class Handler(BaseHTTPRequestHandler):
                                                   DISCOVERY.latest(hardware), ENGINE_UPDATES.status(), DISCOVERY.latest_search(hardware),
                                                   MODEL_MANAGER.hybrid_enabled(), active_models,
                                                   "Model uninstalled. Benchmarks were retained." if
-                                                  urllib.parse.parse_qs(path.query).get("removed") == ["1"] else ""))
+                                                  urllib.parse.parse_qs(path.query).get("removed") == ["1"] else
+                                                  "API ID changed. Update API clients and Open WebUI to use the new ID." if
+                                                  urllib.parse.parse_qs(path.query).get("renamed") == ["1"] else ""))
             except Exception as exc:
                 self.send_error(503, f"Recommendations unavailable: {type(exc).__name__}")
             return
@@ -534,7 +637,7 @@ class Handler(BaseHTTPRequestHandler):
         self._page()
 
     def do_POST(self):
-        if self.path not in ("/switch", "/benchmark", "/context/tune", "/benchmarks/delete", "/models/install", "/models/uninstall",
+        if self.path not in ("/switch", "/benchmark", "/context/tune", "/benchmarks/delete", "/models/install", "/models/uninstall", "/models/rename",
                              "/models/media/install", "/models/refresh", "/models/search", "/models/hardware/rescan", "/models/discovered/install", "/models/hybrid", "/models/hybrid/apply",
                              "/models/engine/check", "/models/engine/update", "/webui/update", "/webui/update/dismiss",
                              "/sharing/save", "/sharing/reset", "/sharing/client", "/sharing/revoke",
@@ -576,6 +679,30 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self.send_response(303)
             self.send_header("Location", "/models?removed=1#specific-search")
+            self.send_header("Content-Length", "0")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            return
+        if self.path == "/models/rename":
+            candidate = fields.get("candidate", [])
+            alias = fields.get("alias", [])
+            if len(candidate) != 1 or len(alias) != 1:
+                self.send_error(400, "Select one model and API ID")
+                return
+            try:
+                if any((BENCHMARKS.busy, MEDIA_MANAGER.busy, CONTEXT_TUNER.busy,
+                        ENGINE_UPDATES.busy, PARALLEL_TUNER.busy)):
+                    raise RuntimeError("Finish the active benchmark, download, or tuning operation first")
+                with LOCK:
+                    MODEL_MANAGER.rename_alias(candidate[0], alias[0])
+            except ValueError as exc:
+                self.send_error(400, str(exc))
+                return
+            except RuntimeError as exc:
+                self.send_error(409, str(exc))
+                return
+            self.send_response(303)
+            self.send_header("Location", "/models?renamed=1#specific-search")
             self.send_header("Content-Length", "0")
             self.send_header("Cache-Control", "no-store")
             self.end_headers()

@@ -38,6 +38,30 @@ CATALOG = (
     {"id": "gemma4-31b", "name": "Gemma 4 31B", "repo": "bartowski/google_gemma-4-31B-it-GGUF", "file": "google_gemma-4-31B-it-Q4_K_M.gguf", "active_b": 31, "moe": False, "ablit": False, "features": "Detailed reasoning, coding, writing; slower dense model", "priority": 72},
 )
 BY_ID = {item["id"]: item for item in CATALOG}
+
+
+def model_display_name(item):
+    """Human-readable name from the source repository and weight variant."""
+    repo = item.get("repo", "").rsplit("/", 1)[-1]
+    repo = re.sub(r"[-_]GGUF$", "", repo, flags=re.I)
+    name = re.sub(r"[-_]+", " ", repo).strip() or "Hugging Face model"
+    filename = item.get("filename") or item.get("file") or ""
+    variant = re.search(r"(?:^|[-_.])(IQ\d_[A-Za-z0-9_]+|Q\d_[A-Za-z0-9_]+|BF16|F16|FP16)(?=\.gguf$|[-_.])",
+                        filename, re.I)
+    return name + (" · " + variant.group(1).upper() if variant else "")
+
+
+def preferred_alias(candidate, used_aliases=()):
+    """Use a recognizable API ID, adding a short suffix only on collision."""
+    repo = re.sub(r"[-_]GGUF$", "", candidate["repo"].rsplit("/", 1)[-1], flags=re.I)
+    stem = re.sub(r"[^a-z0-9]+", "-", repo.lower()).strip("-")[:42].rstrip("-") or "model"
+    variant = re.search(r"(?:^|[-_.])(IQ\d_[A-Za-z0-9_]+|Q\d_[A-Za-z0-9_]+|BF16|F16|FP16)(?=\.gguf$|[-_.])",
+                        candidate.get("file", ""), re.I)
+    suffix = re.sub(r"[^a-z0-9]+", "-", variant.group(1).lower()).strip("-") if variant else ""
+    alias = "local-" + stem + ("-" + suffix if suffix else "")
+    if alias in used_aliases:
+        alias = alias[:55].rstrip("-") + "-" + hashlib.sha256(candidate["id"].encode()).hexdigest()[:8]
+    return alias
 REFERENCE_ACTIVE_B = {"local-coder": (3, True), "local-qwen4b": (4, False),
                       "local-huihui": (3, True), "local-flint-iq4": (2.5, True),
                       "local-flint-q3": (2.5, True), "local-deepseek-v4-distill": (9, False),
@@ -115,6 +139,8 @@ class ModelManager:
         self.hardware_cache = None
         self.hardware_cache_at = 0
         self.busy = False
+        self.pending_installs = []
+        self.reserved_bytes = 0
         self.cache = {}
         with self.connect() as db:
             db.execute("""CREATE TABLE IF NOT EXISTS installed_models (
@@ -162,6 +188,70 @@ class ModelManager:
         with self.connect() as db:
             return [dict(row) for row in db.execute("SELECT * FROM installed_models ORDER BY installed_at DESC")]
 
+    def _finish_operation(self, released_bytes=0):
+        with self.lock:
+            self.reserved_bytes = max(0, self.reserved_bytes - released_bytes)
+            if self.pending_installs:
+                args = self.pending_installs.pop(0)
+                threading.Thread(target=self._install, args=args, daemon=True).start()
+            else:
+                self.busy = False
+
+    def rename_alias(self, candidate_id, new_alias):
+        """Change one inactive model's served API ID, restoring its container on failure."""
+        if (not re.fullmatch(r"[a-z0-9-]{2,64}", candidate_id or "") or
+                not isinstance(new_alias, str) or len(new_alias) > 64 or
+                not re.fullmatch(r"local-[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", new_alias)):
+            raise ValueError("Use a lowercase API ID beginning with local- (letters, digits, hyphens)")
+        with self.lock:
+            if self.busy:
+                raise RuntimeError("Finish the current model operation first")
+            self.busy = True
+        backup = None
+        created = False
+        try:
+            row = next((item for item in self.installed() if item["candidate_id"] == candidate_id), None)
+            if not row:
+                raise ValueError("Model is not installed")
+            if new_alias == row["alias"]:
+                raise ValueError("This API ID is already in use by the model")
+            if new_alias in {alias for mode, (alias, _) in MODELS.items() if mode != "hf-" + candidate_id}:
+                raise ValueError("Another model already uses that API ID")
+            name = row["container"]
+            inspect = docker_api("GET", "/containers/" + name + "/json")
+            if inspect["State"].get("Running"):
+                raise RuntimeError("Switch to another workload before changing this API ID")
+            backup_name = name + "-alias-rollback-" + uuid.uuid4().hex[:8]
+            docker_api("POST", "/containers/" + name + "/rename?name=" + backup_name)
+            backup = backup_name
+            config = self.serving_config(row["filename"], new_alias, row["context_tokens"],
+                                         image=inspect["Config"]["Image"], parallel_slots=row["parallel_slots"],
+                                         runtime=row["runtime"], model_format=row["format"],
+                                         cpu_offload_gb=row["cpu_offload_gb"],
+                                         hybrid_enabled=bool(row["hybrid_enabled"]))
+            docker_api("POST", "/containers/create?name=" + name, config)
+            created = True
+            with self.connect() as db:
+                db.execute("UPDATE installed_models SET alias=? WHERE candidate_id=?", (new_alias, candidate_id))
+            MODELS["hf-" + candidate_id] = (new_alias, name)
+            try:
+                docker_api("DELETE", "/containers/" + backup + "?force=1")
+            except RuntimeError:
+                pass
+            backup = None
+            return new_alias
+        except Exception:
+            if backup:
+                if created:
+                    try:
+                        docker_api("DELETE", "/containers/" + name + "?force=1")
+                    except RuntimeError:
+                        pass
+                docker_api("POST", "/containers/" + backup + "/rename?name=" + name)
+            raise
+        finally:
+            self._finish_operation()
+
     def uninstall(self, candidate_id, confirmation):
         """Remove an inactive, switcher-owned model and its serving container.
 
@@ -184,8 +274,8 @@ class ModelManager:
                 if row is None:
                     raise ValueError("Model is not installed by the switcher")
                 row = dict(row)
-                if confirmation != row["alias"]:
-                    raise ValueError("Enter the exact API name to confirm removal")
+                if confirmation not in (row["alias"], model_display_name(row)):
+                    raise ValueError("Enter the exact model name or API ID to confirm removal")
                 filename = row["filename"]
                 model_format = row.get("format") or "gguf"
                 if not SAFE_PATH.fullmatch(filename) or ".." in filename.split("/"):
@@ -264,8 +354,7 @@ class ModelManager:
                     raise RuntimeError("Removal failed and container restore failed: " + str(rollback_exc)[:180]) from rollback_exc
             raise
         finally:
-            with self.lock:
-                self.busy = False
+            self._finish_operation()
 
     def hybrid_enabled(self):
         with self.connect() as db:
@@ -285,7 +374,7 @@ class ModelManager:
 
     def jobs(self):
         with self.connect() as db:
-            return [dict(row) for row in db.execute("SELECT * FROM model_jobs ORDER BY started_at DESC LIMIT 10")]
+            return [dict(row) for row in db.execute("SELECT * FROM model_jobs ORDER BY started_at DESC, rowid DESC LIMIT 10")]
 
     def _job(self, job_id, **values):
         with self.connect() as db:
@@ -478,11 +567,13 @@ class ModelManager:
         if candidate["id"] != candidate_id or not re.fullmatch(r"[a-z0-9-]{2,64}", candidate_id):
             raise ValueError("Invalid catalog candidate")
         with self.lock:
-            if self.busy:
-                raise RuntimeError("A model download is already running")
             installed = self.installed()
             if any(item["candidate_id"] == candidate_id for item in installed):
                 raise ValueError("Model already installed")
+            with self.connect() as db:
+                if db.execute("SELECT 1 FROM model_jobs WHERE candidate_id=? AND status IN ('queued','running')",
+                              (candidate_id,)).fetchone():
+                    raise ValueError("This model is already queued or downloading")
             metadata = self._metadata(candidate)
             if (candidate.get("revision") and candidate["revision"] != metadata["revision"] or
                     candidate.get("sha256") and candidate["sha256"] != metadata["sha256"]):
@@ -509,7 +600,7 @@ class ModelManager:
                 raise ValueError("No compatible GPU is available for this model")
             if not allow_unfit and not plan["fits"]:
                 raise ValueError("Estimated model memory exceeds the available GPU/RAM budget; select Try anyway to override")
-            if metadata["size"] * 1.2 > hardware["disk_free_gib"] * 2**30:
+            if metadata["size"] * 1.2 + self.reserved_bytes > hardware["disk_free_gib"] * 2**30:
                 raise ValueError("Insufficient model storage")
             context_tokens = (context_for_hardware(candidate, metadata["size"], hardware.get("vram_mib"))
                               if runtime == "gpu" and hardware.get("vram_mib") else
@@ -521,9 +612,14 @@ class ModelManager:
             job_id = str(uuid.uuid4())
             with self.connect() as db:
                 db.execute("INSERT INTO model_jobs(id,candidate_id,started_at,status,stage) VALUES(?,?,?,?,?)",
-                           (job_id, candidate_id, now(), "queued", "queued"))
-            self.busy = True
-            threading.Thread(target=self._install, args=(job_id, candidate, metadata, context_tokens, runtime, hardware, plan), daemon=True).start()
+                           (job_id, candidate_id, now(), "queued", "queued behind current operation" if self.busy else "queued"))
+            args = (job_id, candidate, metadata, context_tokens, runtime, hardware, plan)
+            self.reserved_bytes += int(metadata["size"] * 1.2)
+            if self.busy:
+                self.pending_installs.append(args)
+            else:
+                self.busy = True
+                threading.Thread(target=self._install, args=args, daemon=True).start()
             return job_id
 
     def start_reconfigure_hybrid(self, candidate_id, allow_unfit=False):
@@ -623,8 +719,7 @@ class ModelManager:
                 self._job(job_id, status="failed", ended_at=now(), stage="previous setting restored",
                           error=f"{type(exc).__name__}: {str(exc)[:250]}")
         finally:
-            with self.lock:
-                self.busy = False
+            self._finish_operation()
 
     def _install(self, job_id, candidate, metadata, context_tokens, runtime="gpu", hardware=None, plan=None):
         downloader = None
@@ -690,7 +785,7 @@ class ModelManager:
                 filename = folder if model_format == "safetensors" else folder + "/" + candidate["file"]
             self._job(job_id, stage="creating serving container")
             container = "local-ai-hf-" + candidate["id"]
-            alias = "local-hf-" + candidate["id"]
+            alias = preferred_alias(candidate, {item["alias"] for item in self.installed()})
             image = self.runtime_image(model_format, runtime)
             self._ensure_image(image)
             serving_config = self.serving_config(filename, alias, context_tokens, runtime=runtime,
@@ -713,8 +808,7 @@ class ModelManager:
                         docker_api("DELETE", f"/containers/{container_id}?force=1")
                     except RuntimeError:
                         pass
-            with self.lock:
-                self.busy = False
+            self._finish_operation(int(metadata["size"] * 1.2))
 
     def _ensure_image(self, image):
         try:

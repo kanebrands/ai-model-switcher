@@ -106,6 +106,8 @@ class MediaManager:
         self.host_path = os.environ["MEDIA_HOST_DIR"]
         self.lock = threading.Lock()
         self.busy = False
+        self.pending_installs = []
+        self.reserved_bytes = 0
         self.cache = {}
         with self.connect() as db:
             db.execute("""CREATE TABLE IF NOT EXISTS media_jobs (
@@ -120,7 +122,7 @@ class MediaManager:
 
     def jobs(self):
         with self.connect() as db:
-            return [dict(row) for row in db.execute("SELECT * FROM media_jobs ORDER BY started_at DESC LIMIT 10")]
+            return [dict(row) for row in db.execute("SELECT * FROM media_jobs ORDER BY started_at DESC, rowid DESC LIMIT 10")]
 
     def _job(self, job_id, **values):
         with self.connect() as db:
@@ -201,8 +203,10 @@ class MediaManager:
         if not candidate:
             raise ValueError("Unknown media model")
         with self.lock:
-            if self.busy:
-                raise RuntimeError("A media model download is already running")
+            with self.connect() as db:
+                if db.execute("SELECT 1 FROM media_jobs WHERE candidate_id=? AND status IN ('queued','running')",
+                              (candidate_id,)).fetchone():
+                    raise ValueError("This media model is already queued or downloading")
             if not hardware["vram_mib"] or hardware["vram_mib"] < candidate["vram"] * 1024 or hardware["ram_gib"] < candidate["ram"]:
                 raise ValueError("This model is not recommended for the detected hardware")
             files = self.metadata(candidate)
@@ -213,14 +217,19 @@ class MediaManager:
             missing = [item for item in files if not os.path.isfile(self._destination(item)) or os.path.getsize(self._destination(item)) != item["size"]]
             if not missing:
                 raise ValueError("All files are already installed")
-            if sum(item["size"] for item in missing) * 1.15 > shutil.disk_usage(self.path).free:
+            reserve = int(sum(item["size"] for item in missing) * 1.15)
+            if reserve + self.reserved_bytes > shutil.disk_usage(self.path).free:
                 raise ValueError("Insufficient media model storage")
             job_id = str(uuid.uuid4())
             with self.connect() as db:
                 db.execute("INSERT INTO media_jobs(id,candidate_id,started_at,status,stage) VALUES(?,?,?,?,?)",
-                           (job_id, candidate_id, utc_now(), "queued", "queued"))
-            self.busy = True
-            threading.Thread(target=self._install, args=(job_id, missing), daemon=True).start()
+                           (job_id, candidate_id, utc_now(), "queued", "queued behind current download" if self.busy else "queued"))
+            self.reserved_bytes += reserve
+            if self.busy:
+                self.pending_installs.append((job_id, missing, reserve))
+            else:
+                self.busy = True
+                threading.Thread(target=self._install, args=(job_id, missing, reserve), daemon=True).start()
             return job_id
 
     def _verify(self, path, item):
@@ -233,7 +242,7 @@ class MediaManager:
         if digest.hexdigest() != item["sha256"]:
             raise ValueError("SHA256 does not match Hugging Face: " + item["destination"])
 
-    def _install(self, job_id, files):
+    def _install(self, job_id, files, reserve=0):
         try:
             self._job(job_id, status="running", stage="checking existing files")
             for number, item in enumerate(files, 1):
@@ -281,4 +290,9 @@ class MediaManager:
             self._job(job_id, status="failed", stage="failed", ended_at=utc_now(), error=f"{type(exc).__name__}: {str(exc)[:300]}")
         finally:
             with self.lock:
-                self.busy = False
+                self.reserved_bytes = max(0, self.reserved_bytes - reserve)
+                if self.pending_installs:
+                    args = self.pending_installs.pop(0)
+                    threading.Thread(target=self._install, args=args, daemon=True).start()
+                else:
+                    self.busy = False
