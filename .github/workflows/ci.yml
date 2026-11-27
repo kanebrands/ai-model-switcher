@@ -13,7 +13,7 @@ jobs:
         with:
           python-version: '3.12'
       - name: Unit and integration tests
-        run: python3 -m unittest discover -s . -p 'test_*.py' -q
+        run: python3 -m unittest discover -s tests -p 'test_*.py' -q
       - name: Regenerate standalone installer
         run: |
           python3 build_installer.py
