@@ -51,6 +51,7 @@ def shell(title, body, refresh=False, wide=False, monitor_url=None):
     body_class = ' class="wide"' if wide else ""
     description = ("Compare saved speed and quality results for this machine." if title == "Model benchmarks" else
                    "Find models sized for the hardware in this system." if title == "Hugging Face model recommendations" else
+                   "The switcher could not complete this request." if title == "Request failed" else
                    "Compare coding agents and connect them to your local API." if title == "Coding harnesses" else
                    "Inspect this model's recorded runs and system details.")
     display_title = "Find models" if title == "Hugging Face model recommendations" else title

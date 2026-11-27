@@ -34,6 +34,8 @@ The same page can uninstall switcher-managed Hugging Face text models after you 
 
 New Hugging Face installations use readable API IDs derived from their model names. Existing IDs remain stable unless you explicitly change one on an inactive model. Text and ComfyUI downloads queue when another download of the same type is running. Progress updates in place without full-page reloads. The **Client sharing** page can show per-key input/output token totals and effective output tokens/s graphs for a selected key and time window; missing engine usage is labeled unmeasured.
 
+The home page shows **Loading model** until the active model responds through the API, then **Ready to use**. It displays a copyable API base URL and stable model ID `local-llm-api` for harnesses and other clients; the gateway maps that ID to whichever language model is active. The switcher and proxy show themed error pages if a request fails.
+
 ## What is in this repository
 
 - `ai-setup.sh` is the generated, standalone installer. It embeds the Compose file, controller, gateway, assets, and helper scripts.

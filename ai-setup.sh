@@ -604,6 +604,7 @@ services:
     restart: unless-stopped
     environment:
       CONTROL_ORIGIN: http://${AI_BIND_IP:?set AI_BIND_IP in .env}:${AI_CONTROL_PORT:-3001}
+      PUBLIC_API_URL: http://${AI_BIND_IP:?set AI_BIND_IP in .env}:${AI_PORT:-8080}/v1
       WEB_URL: http://${AI_BIND_IP:?set AI_BIND_IP in .env}:${AI_WEB_PORT:-3000}
       COMFY_URL: http://${AI_BIND_IP:?set AI_BIND_IP in .env}:${AI_COMFY_PORT:-8188}
       CONTROL_CSRF_TOKEN: ${AI_CONTROL_CSRF_TOKEN:?set AI_CONTROL_CSRF_TOKEN in .env}
@@ -748,6 +749,12 @@ http {
         server_name _;
             auth_basic "AI Model Switcher";
         auth_basic_user_file /etc/nginx/.htpasswd;
+        error_page 502 503 504 = @switcher_unavailable;
+        location @switcher_unavailable {
+            default_type text/html;
+            add_header Cache-Control no-store always;
+            return 503 '<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>AI Model Switcher unavailable</title><style>body{margin:0;padding:2rem;background:#0c1418;color:#edf2ef;font:16px/1.55 system-ui,sans-serif}main{max-width:48rem;margin:4rem auto}a{color:#f1bf81}.card{background:#17262a;border:1px solid #344b50;border-radius:.9rem;padding:2rem;box-shadow:0 10px 40px #0002}.eyebrow{color:#e8ba78;font-size:.75rem;letter-spacing:.16em;text-transform:uppercase;font-weight:800}h1{font-size:clamp(2rem,4vw,3rem);line-height:1.1;margin:.6rem 0}p{color:#cbd9d5}</style><main><div class="card"><div class="eyebrow">AI Model Switcher</div><h1>Temporarily unavailable</h1><p>The switcher service did not respond. Wait a moment, then retry. If it continues, check the gpu-control container.</p><a href="/">Retry AI Model Switcher</a></div></main></html>';
+        }
         location / {
             proxy_pass http://gpu-control:8001;
             proxy_http_version 1.1;
@@ -894,9 +901,11 @@ ASSET_PATH = "/app/assets/gpu-workstation.webp"
 ORIGIN = os.environ["CONTROL_ORIGIN"]
 WEB_URL = os.environ["WEB_URL"]
 COMFY_URL = os.environ["COMFY_URL"]
+PUBLIC_API_URL = os.environ.get("PUBLIC_API_URL", ORIGIN.rsplit(":", 1)[0] + ":8080/v1")
 CSRF = os.environ["CONTROL_CSRF_TOKEN"]
 SELECTED_MODES = {value for value in os.environ.get("AI_SELECTED_MODELS", "").split(",") if value}
 LOCK = threading.Lock()
+LAST_SWITCH_MODE = None
 BUILTIN_LABELS = {
     "cpu-tiny": "Qwen3 0.6B Q8 CPU (local-cpu-tiny)",
     "cpu-4b": "Qwen3 4B Q4 CPU (local-cpu-4b)",
@@ -960,6 +969,7 @@ def workload_state(name):
 
 
 def switch(target):
+    global LAST_SWITCH_MODE
     workloads = {mode: container for mode, (_, container) in MODELS.items()}
     if target not in workloads:
         raise ValueError("Unknown mode")
@@ -970,6 +980,7 @@ def switch(target):
     if ENGINE_UPDATES.busy or CONTEXT_TUNER.busy or PARALLEL_TUNER.busy or MODEL_MANAGER.busy:
         raise RuntimeError("Wait for the model operation or context change to finish before switching models")
     with LOCK:
+        LAST_SWITCH_MODE = target
         start_name = workloads[target]
         backup = MODEL_MANAGER.ensure_current_engine(target)
         previous = []
@@ -1011,6 +1022,35 @@ def active_mode():
     return active[0] if len(active) == 1 else None
 
 
+def workload_snapshot():
+    """Report readiness from the public model API, not just Docker's running flag."""
+    mode = active_mode() or LAST_SWITCH_MODE
+    if not mode or mode not in MODELS:
+        return {"mode": None, "state": "idle", "detail": "No model is running", "api_id": None}
+    api_id, container = MODELS[mode]
+    state = workload_state(container)
+    if state.startswith(("exited", "dead")) or state in ("not created", "created", "unhealthy"):
+        return {"mode": mode, "state": "failed", "detail": "Container " + state, "api_id": api_id}
+    if state not in ("running", "healthy"):
+        return {"mode": mode, "state": "loading", "detail": "Container " + state, "api_id": api_id}
+    if mode == "media":
+        ready = state == "healthy"
+    else:
+        ready = False
+        try:
+            request = urllib.request.Request("http://nginx:8080/v1/models",
+                                             headers={"Authorization": "Bearer " + os.environ["BENCHMARK_API_KEY"]})
+            with urllib.request.urlopen(request, timeout=3) as response:
+                ready = api_id in {item.get("id") for item in json.load(response).get("data", [])}
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+    return {"mode": mode, "state": "ready" if ready else "loading",
+            "detail": ("ComfyUI is ready; the language model API is unavailable until you select a language model"
+                       if mode == "media" and ready else "Ready for requests" if ready else
+                       "Model is loading; API requests may fail until ready"),
+            "api_id": api_id}
+
+
 def active_server_slots():
     mode = active_mode()
     if not mode or mode == "media":
@@ -1044,7 +1084,17 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Security-Policy", "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; script-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'self'" if embeddable else "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; script-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
-        self.wfile.write(data)
+        if self.command != "HEAD":
+            self.wfile.write(data)
+
+    def send_error(self, code, message=None, explain=None):
+        """Keep controller errors in the same visual system as the switcher."""
+        reason = self.responses.get(code, ("Request failed", ""))[0]
+        detail = message or reason
+        body = (f'<section class="card"><div class="eyebrow">HTTP {code}</div>'
+                f'<h2>{html.escape(reason)}</h2><p>{html.escape(str(detail))}</p>'
+                '<p><a href="/">Return to AI Model Switcher</a></p></section>')
+        self._send_html(benchmark_views.shell("Request failed", body), code)
 
     def _page(self, message="", status=200):
         try:
@@ -1080,8 +1130,14 @@ class Handler(BaseHTTPRequestHandler):
                   ("Gemma 4 26B-A4B abliterated", gemma4_on),
                   ("ComfyUI", media_on)) if on]
         active.extend(model_display_name(item) for item in managed if running(item["container"]))
-        mode = active[0] if len(active) == 1 else "Neither" if not active else "Conflict: " + ", ".join(active)
+        mode = active[0] if len(active) == 1 else "No model running" if not active else "Conflict: " + ", ".join(active)
         h = lambda s: html.escape(s, quote=True)
+        try:
+            snapshot = workload_snapshot()
+        except (OSError, RuntimeError, ValueError, KeyError):
+            snapshot = {"state": "unavailable", "detail": "Could not check model status"}
+        badge_label = {"ready": "Ready to use", "loading": "Loading model", "failed": "Model failed",
+                       "idle": "No active workload", "unavailable": "Status unavailable"}.get(snapshot["state"], "Status unavailable")
         try:
             fingerprint = MODEL_MANAGER.hardware().get("fingerprint")
             contexts = CONTEXT_TUNER.contexts(fingerprint)
@@ -1173,11 +1229,13 @@ class Handler(BaseHTTPRequestHandler):
         home_style += ".update-card{display:grid;grid-template-columns:1fr auto;gap:1rem;align-items:center;border-color:#8a6843;background:linear-gradient(110deg,#27332d,#1a292c)}.update-card h2{margin:.35rem 0}.update-card p{max-width:65rem}.update-card form{margin:0}@media(max-width:740px){.update-card{grid-template-columns:1fr}}"
         home_style += ".message-banner{display:flex;align-items:center;justify-content:space-between;gap:1rem}.message-banner p,.message-banner form{margin:0}.message-banner button{min-height:2.2rem;padding:.3rem .7rem;background:transparent;border-color:#c5a976;color:#f8d9a5;white-space:nowrap}.message-banner button:hover{background:#3a4437}@media(max-width:740px){.message-banner{align-items:flex-start;flex-direction:column}}"
         home_style += ".gpu-frame{width:100%;height:345px;border:0;background:#17262a}.gpu-note{font-size:.9rem;color:#b6c6c4}@media(max-width:740px){.gpu-frame{height:440px}}"
+        home_style += ".active-caption{font-size:.83rem;font-weight:750;color:#d4e3db}.active-badge:not(.is-ready){background:#443926;border-color:#987445;color:#ffe1ad}.active-badge:not(.is-ready):before{background:#f0b967;box-shadow:0 0 0 3px #f0b96726}.active-badge.is-failed{background:#492a2a;border-color:#a85b55;color:#ffcbc5}.active-badge.is-failed:before{background:#f28b83}.active-detail{margin:.45rem 0;color:#d5e0db}.api-connection{display:flex;gap:.75rem 1.2rem;flex-wrap:wrap;align-items:end;margin-top:.7rem}.api-connection label{display:grid;gap:.2rem;color:#cad9d5;font-size:.82rem}.api-connection input{width:min(100%,22rem);font-family:ui-monospace,SFMono-Regular,monospace;font-size:.88rem}.api-connection .api-base{width:min(100%,28rem)}.api-note{font-size:.84rem;color:#c4d5d0;margin:.45rem 0 0}"
         page = f"""<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>AI Model Switcher</title><style>{benchmark_views.STYLE}{home_style}</style>
 <main><nav aria-label="Main navigation"><a href="/">AI Model Switcher</a><a href="/models">Find models</a><a href="/benchmarks">Benchmarks</a><a href="/sharing">Client sharing</a><a href="/harnesses">Coding harnesses</a></nav>
-<header class="hero"><div class="hero-copy"><div class="eyebrow">Local AI / Control desk</div><h1>AI Model Switcher</h1><p>Manage local workloads and model context from one place.</p><div class="active-line"><span class="active-badge">Active workload</span><strong>{h(mode)}</strong></div></div></header>
-{'<p class="message" role="status" data-operation-monitor="/operations/status?scope=home">Checking operation status…</p><script src="/assets/operation_poll.js" defer></script>' if context_status['busy'] or webui_status['checking'] or webui_status['busy'] else ''}
+<header class="hero"><div class="hero-copy"><div class="eyebrow">Local AI / Control desk</div><h1>AI Model Switcher</h1><p>Manage local workloads and model context from one place.</p><div class="active-line"><span class="active-caption">Active workload</span><span class="active-badge {'is-ready' if snapshot['state'] == 'ready' else 'is-failed' if snapshot['state'] == 'failed' else ''}" data-workload-badge>{h(badge_label)}</span><strong data-workload-label>{h(mode)}</strong></div><p class="active-detail" role="status" data-workload-detail>{h(snapshot['detail'])}</p><div class="api-connection"><label>Stable API model ID<input readonly value="local-llm-api" data-copy-field aria-label="Copyable stable API model ID"></label><label>OpenAI API base URL<input class="api-base" readonly value="{h(PUBLIC_API_URL)}" data-copy-field aria-label="Copyable OpenAI API base URL"></label></div><p class="api-note">Use <code>local-llm-api</code> as the model in your harness to reach the currently loaded language model. Wait for “Ready to use” before sending requests.</p></div></header>
+<script src="/assets/operation_poll.js?v=workload-status-1" defer></script>
+{'<p class="message" role="status" data-operation-monitor="/operations/status?scope=home">Checking operation status…</p>' if context_status['busy'] or webui_status['checking'] or webui_status['busy'] else ''}
 {webui_card}
 {webui_result}
 {f'<p class="message" role="status">{h(message)}</p>' if message else ''}
@@ -1216,6 +1274,22 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(data)))
             self.send_header("Cache-Control", "public, max-age=3600")
             self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(data)
+            return
+        if path.path == "/workload/status":
+            try:
+                snapshot = workload_snapshot()
+            except (OSError, RuntimeError, ValueError, KeyError):
+                snapshot = {"mode": None, "state": "unavailable", "detail": "Could not check model status", "api_id": None}
+            snapshot["label"] = (BUILTIN_LABELS.get(snapshot["mode"]) or
+                                 next((model_display_name(item) for item in MODEL_MANAGER.installed()
+                                       if "hf-" + item["candidate_id"] == snapshot["mode"]), "No model running"))
+            data = json.dumps(snapshot).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(data)
             return
@@ -1448,34 +1522,27 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path == "/route":
             try:
-                if running(QWEN4B):
-                    backend = "qwen4b:8000"
-                elif running(FLINT_IQ4):
-                    backend = "flint-iq4:8080"
-                elif running(FLINT_Q3):
-                    backend = "flint-q3:8080"
-                elif running(DEEPSEEK):
-                    backend = "deepseek-v4-distill:8080"
-                elif running(QWEN38):
-                    backend = "qwen38-ablit:8080"
-                elif running(GEMMA4):
-                    backend = "gemma4-ablit:8080"
-                elif running(HUIHUI):
-                    backend = "huihui:8080"
-                elif running(CPU_4B):
-                    backend = "cpu-4b:8080"
-                elif running(CPU_TINY):
-                    backend = "cpu-tiny:8080"
-                elif running(VISION):
-                    backend = "vision:8000"
+                mode = active_mode()
+                if not mode or mode == "media":
+                    self.send_error(503, "No active language model")
+                    return
+                backends = {"qwen4b": "qwen4b:8000", "flint-iq4": "flint-iq4:8080",
+                            "flint-q3": "flint-q3:8080", "deepseek": "deepseek-v4-distill:8080",
+                            "qwen38": "qwen38-ablit:8080", "gemma4": "gemma4-ablit:8080",
+                            "huihui": "huihui:8080", "cpu-4b": "cpu-4b:8080",
+                            "cpu-tiny": "cpu-tiny:8080", "vision": "vision:8000", "llm": "llm:8000"}
+                if mode.startswith("hf-"):
+                    item = next(item for item in MODEL_MANAGER.installed() if item["candidate_id"] == mode[3:])
+                    backend = item["container"] + (":8000" if item.get("format") == "safetensors" else ":8080")
                 else:
-                    backend = next((item["container"] + (":8000" if item.get("format") == "safetensors" else ":8080") for item in MODEL_MANAGER.installed()
-                                    if running(item["container"])), "llm:8000")
+                    backend = backends[mode]
+                model_id = MODELS[mode][0]
             except Exception:
                 self.send_error(503, "Docker status unavailable")
                 return
             self.send_response(200)
             self.send_header("X-LLM-Backend", backend)
+            self.send_header("X-LLM-Model", model_id)
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
@@ -2385,6 +2452,7 @@ def shell(title, body, refresh=False, wide=False, monitor_url=None):
     body_class = ' class="wide"' if wide else ""
     description = ("Compare saved speed and quality results for this machine." if title == "Model benchmarks" else
                    "Find models sized for the hardware in this system." if title == "Hugging Face model recommendations" else
+                   "The switcher could not complete this request." if title == "Request failed" else
                    "Compare coding agents and connect them to your local API." if title == "Coding harnesses" else
                    "Inspect this model's recorded runs and system details.")
     display_title = "Find models" if title == "Hugging Face model recommendations" else title
@@ -2690,6 +2758,45 @@ cat > "$INSTALL_DIR/gpu_control/operation_poll.js" <<'OPERATION_POLL'
     }
   });
   poll();
+})();
+
+/* Keep the hero honest while a selected model loads, exits, or becomes ready. */
+(() => {
+  const badge = document.querySelector('[data-workload-badge]');
+  if (!badge) return;
+  const label = document.querySelector('[data-workload-label]');
+  const detail = document.querySelector('[data-workload-detail]');
+  const labels = {ready: 'Ready to use', loading: 'Loading model', failed: 'Model failed',
+                  idle: 'No active workload', unavailable: 'Status unavailable'};
+  document.querySelectorAll('[data-copy-field]').forEach(field => {
+    field.addEventListener('focus', () => field.select());
+    field.addEventListener('click', () => field.select());
+  });
+  async function pollWorkload() {
+    if (document.hidden) {
+      setTimeout(pollWorkload, 5000);
+      return;
+    }
+    let state = 'unavailable';
+    let next = 10000;
+    try {
+      const response = await fetch('/workload/status', {cache: 'no-store', credentials: 'same-origin'});
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const result = await response.json();
+      state = result.state in labels ? result.state : 'unavailable';
+      badge.textContent = labels[state];
+      label.textContent = result.label || 'No model running';
+      detail.textContent = result.detail || '';
+      if (state === 'loading') next = 3000;
+    } catch (error) {
+      badge.textContent = labels.unavailable;
+      detail.textContent = 'Could not check model readiness; retrying…';
+    }
+    badge.classList.toggle('is-ready', state === 'ready');
+    badge.classList.toggle('is-failed', state === 'failed');
+    setTimeout(pollWorkload, next);
+  }
+  pollWorkload();
 })();
 OPERATION_POLL
 
@@ -5334,6 +5441,46 @@ USAGE = None  # Initialized only in the server process, after the database mount
 HOP_HEADERS = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
                "te", "trailer", "transfer-encoding", "upgrade"}
 BACKEND = re.compile(r"[a-z0-9-]+:(?:8000|8080)\Z")
+STABLE_MODEL_ID = "local-llm-api"
+
+
+def resolve_model_alias(raw, content_type, model_id):
+    """Replace the stable client-facing ID only when a JSON request uses it."""
+    if not raw or "application/json" not in content_type.lower():
+        return raw
+    try:
+        payload = json.loads(raw)
+    except (ValueError, UnicodeDecodeError):
+        return raw
+    if not isinstance(payload, dict) or payload.get("model") != STABLE_MODEL_ID:
+        return raw
+    if not model_id:
+        raise RuntimeError("No active model ID")
+    payload["model"] = model_id
+    return json.dumps(payload, separators=(",", ":")).encode()
+
+
+def list_model_alias(raw, model_id):
+    """Advertise the stable ID beside the actual ID when that model is loaded."""
+    try:
+        payload = json.loads(raw)
+    except (ValueError, UnicodeDecodeError):
+        return raw
+    if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+        return raw
+    actual = next((item for item in payload["data"] if isinstance(item, dict) and item.get("id") == model_id), None)
+    if not actual or any(isinstance(item, dict) and item.get("id") == STABLE_MODEL_ID for item in payload["data"]):
+        return raw
+    alias = {**actual, "id": STABLE_MODEL_ID}
+    if isinstance(alias.get("aliases"), list):
+        alias["aliases"] = [STABLE_MODEL_ID]
+    payload["data"].append(alias)
+    if isinstance(payload.get("models"), list):
+        source = next((item for item in payload["models"] if isinstance(item, dict) and
+                       (item.get("name") == model_id or item.get("model") == model_id)), None)
+        if source:
+            payload["models"].append({**source, "name": STABLE_MODEL_ID, "model": STABLE_MODEL_ID})
+    return json.dumps(payload, separators=(",", ":")).encode()
 
 
 def cap_output(path, raw, content_type, maximum):
@@ -5554,37 +5701,50 @@ class GatewayHandler(BaseHTTPRequestHandler):
             path = self.path
             if path.startswith("/vision/v1/"):
                 target = "vision:8000"
+                model_id = "local-vision"
                 path = path[len("/vision"):]
             else:
                 request = urllib.request.Request("http://gpu-control:8001/route")
                 with urllib.request.urlopen(request, timeout=10) as routing:
                     target = routing.headers.get("X-LLM-Backend", "")
+                    model_id = routing.headers.get("X-LLM-Model", "")
             if not BACKEND.fullmatch(target):
                 raise RuntimeError("No active model backend")
+            if self.command == "POST":
+                raw = resolve_model_alias(raw, self.headers.get("Content-Type", ""), model_id)
             host, port = target.rsplit(":", 1)
             upstream = http.client.HTTPConnection(host, int(port), timeout=600)
             headers = {key: value for key, value in self.headers.items()
                        if key.lower() not in HOP_HEADERS | {"authorization", "host", "content-length"}}
             headers["Authorization"] = "Bearer " + LEGACY_KEY
             headers["Host"] = target
+            headers["Accept-Encoding"] = "identity"
             headers["Content-Length"] = str(len(raw))
             headers["Connection"] = "close"
             upstream.request(self.command, path, body=raw if self.command == "POST" else None, headers=headers)
             response = upstream.getresponse()
             response_status = response.status
             collector = UsageCollector(response.getheader("Content-Type")) if admitted else None
+            model_list = (self.command == "GET" and path.split("?", 1)[0] == "/v1/models" and
+                          response.status == 200 and response.getheader("Content-Encoding", "identity") == "identity")
+            response_body = list_model_alias(response.read(), model_id) if model_list else None
             self.send_response(response.status)
             for key, value in response.getheaders():
-                if key.lower() not in HOP_HEADERS:
+                if key.lower() not in HOP_HEADERS and (response_body is None or key.lower() != "content-length"):
                     self.send_header(key, value)
+            if response_body is not None:
+                self.send_header("Content-Length", str(len(response_body)))
             self.send_header("X-AI-Client", "shared" if client_id == "legacy" else "dedicated" if client_id != "health" else "health")
             self.end_headers()
             if self.command != "HEAD":
-                while chunk := response.read1(65536):
-                    if collector:
-                        collector.feed(chunk)
-                    self.wfile.write(chunk)
-                    self.wfile.flush()
+                if response_body is not None:
+                    self.wfile.write(response_body)
+                else:
+                    while chunk := response.read1(65536):
+                        if collector:
+                            collector.feed(chunk)
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
         except (OSError, RuntimeError, ValueError) as exc:
             try:
                 if not self.wfile.closed and not getattr(self, "_response_started", False):

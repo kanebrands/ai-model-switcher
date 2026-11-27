@@ -137,6 +137,13 @@ class GatewayIntegrationTests(unittest.TestCase):
     def test_dedicated_key_streams_and_rewrites_backend_auth(self):
         seen = {}
         class Backend(BaseHTTPRequestHandler):
+            def do_GET(self):
+                data = json.dumps({"object": "list", "data": [{"id": "backend-model", "object": "model"}]}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
             def do_POST(self):
                 length = int(self.headers["Content-Length"])
                 seen["auth"] = self.headers["Authorization"]
@@ -152,7 +159,7 @@ class GatewayIntegrationTests(unittest.TestCase):
                 pass
         class Route:
             def __init__(self, target):
-                self.headers = {"X-LLM-Backend": target}
+                self.headers = {"X-LLM-Backend": target, "X-LLM-Model": "backend-model"}
             def __enter__(self):
                 return self
             def __exit__(self, *_):
@@ -182,15 +189,23 @@ class GatewayIntegrationTests(unittest.TestCase):
                      patch.object(gateway, "BACKEND", re.compile(r"127\.0\.0\.1:\d+\Z")), \
                      patch.object(gateway.urllib.request, "urlopen", return_value=Route(f"127.0.0.1:{backend.server_port}")):
                     conn = http.client.HTTPConnection("127.0.0.1", gateway_server.server_port, timeout=5)
-                    body = json.dumps({"model": "test", "messages": [], "stream": True, "max_tokens": 90000})
+                    body = json.dumps({"model": "local-llm-api", "messages": [], "stream": True, "max_tokens": 90000})
                     conn.request("POST", "/v1/chat/completions", body=body,
                                  headers={"Authorization": "Bearer " + client["token"], "Content-Type": "application/json"})
                     response = conn.getresponse()
                     self.assertEqual(response.status, 200)
                     self.assertIn(b"[DONE]", response.read())
                     conn.close()
+                    conn = http.client.HTTPConnection("127.0.0.1", gateway_server.server_port, timeout=5)
+                    conn.request("GET", "/v1/models", headers={"Authorization": "Bearer " + client["token"]})
+                    response = conn.getresponse()
+                    self.assertEqual(response.status, 200)
+                    self.assertEqual({item["id"] for item in json.loads(response.read())["data"]},
+                                     {"backend-model", "local-llm-api"})
+                    conn.close()
                     self.assertTrue(usage_recorded.wait(5), "Gateway did not finish recording usage")
                 self.assertEqual(seen["auth"], "Bearer legacy-test-key")
+                self.assertEqual(seen["body"]["model"], "backend-model")
                 self.assertEqual(seen["body"]["max_tokens"], 8192)
                 self.assertTrue(seen["body"]["stream_options"]["include_usage"])
                 totals = manager.usage_summary(client["id"], 1, "hours")["totals"]

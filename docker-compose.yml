@@ -451,6 +451,7 @@ services:
     restart: unless-stopped
     environment:
       CONTROL_ORIGIN: http://${AI_BIND_IP:?set AI_BIND_IP in .env}:${AI_CONTROL_PORT:-3001}
+      PUBLIC_API_URL: http://${AI_BIND_IP:?set AI_BIND_IP in .env}:${AI_PORT:-8080}/v1
       WEB_URL: http://${AI_BIND_IP:?set AI_BIND_IP in .env}:${AI_WEB_PORT:-3000}
       COMFY_URL: http://${AI_BIND_IP:?set AI_BIND_IP in .env}:${AI_COMFY_PORT:-8188}
       CONTROL_CSRF_TOKEN: ${AI_CONTROL_CSRF_TOKEN:?set AI_CONTROL_CSRF_TOKEN in .env}

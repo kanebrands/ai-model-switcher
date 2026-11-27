@@ -21,6 +21,46 @@ USAGE = None  # Initialized only in the server process, after the database mount
 HOP_HEADERS = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
                "te", "trailer", "transfer-encoding", "upgrade"}
 BACKEND = re.compile(r"[a-z0-9-]+:(?:8000|8080)\Z")
+STABLE_MODEL_ID = "local-llm-api"
+
+
+def resolve_model_alias(raw, content_type, model_id):
+    """Replace the stable client-facing ID only when a JSON request uses it."""
+    if not raw or "application/json" not in content_type.lower():
+        return raw
+    try:
+        payload = json.loads(raw)
+    except (ValueError, UnicodeDecodeError):
+        return raw
+    if not isinstance(payload, dict) or payload.get("model") != STABLE_MODEL_ID:
+        return raw
+    if not model_id:
+        raise RuntimeError("No active model ID")
+    payload["model"] = model_id
+    return json.dumps(payload, separators=(",", ":")).encode()
+
+
+def list_model_alias(raw, model_id):
+    """Advertise the stable ID beside the actual ID when that model is loaded."""
+    try:
+        payload = json.loads(raw)
+    except (ValueError, UnicodeDecodeError):
+        return raw
+    if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+        return raw
+    actual = next((item for item in payload["data"] if isinstance(item, dict) and item.get("id") == model_id), None)
+    if not actual or any(isinstance(item, dict) and item.get("id") == STABLE_MODEL_ID for item in payload["data"]):
+        return raw
+    alias = {**actual, "id": STABLE_MODEL_ID}
+    if isinstance(alias.get("aliases"), list):
+        alias["aliases"] = [STABLE_MODEL_ID]
+    payload["data"].append(alias)
+    if isinstance(payload.get("models"), list):
+        source = next((item for item in payload["models"] if isinstance(item, dict) and
+                       (item.get("name") == model_id or item.get("model") == model_id)), None)
+        if source:
+            payload["models"].append({**source, "name": STABLE_MODEL_ID, "model": STABLE_MODEL_ID})
+    return json.dumps(payload, separators=(",", ":")).encode()
 
 
 def cap_output(path, raw, content_type, maximum):
@@ -241,37 +281,50 @@ class GatewayHandler(BaseHTTPRequestHandler):
             path = self.path
             if path.startswith("/vision/v1/"):
                 target = "vision:8000"
+                model_id = "local-vision"
                 path = path[len("/vision"):]
             else:
                 request = urllib.request.Request("http://gpu-control:8001/route")
                 with urllib.request.urlopen(request, timeout=10) as routing:
                     target = routing.headers.get("X-LLM-Backend", "")
+                    model_id = routing.headers.get("X-LLM-Model", "")
             if not BACKEND.fullmatch(target):
                 raise RuntimeError("No active model backend")
+            if self.command == "POST":
+                raw = resolve_model_alias(raw, self.headers.get("Content-Type", ""), model_id)
             host, port = target.rsplit(":", 1)
             upstream = http.client.HTTPConnection(host, int(port), timeout=600)
             headers = {key: value for key, value in self.headers.items()
                        if key.lower() not in HOP_HEADERS | {"authorization", "host", "content-length"}}
             headers["Authorization"] = "Bearer " + LEGACY_KEY
             headers["Host"] = target
+            headers["Accept-Encoding"] = "identity"
             headers["Content-Length"] = str(len(raw))
             headers["Connection"] = "close"
             upstream.request(self.command, path, body=raw if self.command == "POST" else None, headers=headers)
             response = upstream.getresponse()
             response_status = response.status
             collector = UsageCollector(response.getheader("Content-Type")) if admitted else None
+            model_list = (self.command == "GET" and path.split("?", 1)[0] == "/v1/models" and
+                          response.status == 200 and response.getheader("Content-Encoding", "identity") == "identity")
+            response_body = list_model_alias(response.read(), model_id) if model_list else None
             self.send_response(response.status)
             for key, value in response.getheaders():
-                if key.lower() not in HOP_HEADERS:
+                if key.lower() not in HOP_HEADERS and (response_body is None or key.lower() != "content-length"):
                     self.send_header(key, value)
+            if response_body is not None:
+                self.send_header("Content-Length", str(len(response_body)))
             self.send_header("X-AI-Client", "shared" if client_id == "legacy" else "dedicated" if client_id != "health" else "health")
             self.end_headers()
             if self.command != "HEAD":
-                while chunk := response.read1(65536):
-                    if collector:
-                        collector.feed(chunk)
-                    self.wfile.write(chunk)
-                    self.wfile.flush()
+                if response_body is not None:
+                    self.wfile.write(response_body)
+                else:
+                    while chunk := response.read1(65536):
+                        if collector:
+                            collector.feed(chunk)
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
         except (OSError, RuntimeError, ValueError) as exc:
             try:
                 if not self.wfile.closed and not getattr(self, "_response_started", False):
