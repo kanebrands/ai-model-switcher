@@ -470,6 +470,7 @@ services:
       - ./gpu_control/benchmarks.py:/app/benchmarks.py:ro
       - ./gpu_control/benchmark_views.py:/app/benchmark_views.py:ro
       - ./gpu_control/model_catalog.py:/app/model_catalog.py:ro
+      - ./gpu_control/hybrid_memory.py:/app/hybrid_memory.py:ro
       - ./gpu_control/model_artifacts.py:/app/model_artifacts.py:ro
       - ./gpu_control/model_views.py:/app/model_views.py:ro
       - ./gpu_control/catalog_discovery.py:/app/catalog_discovery.py:ro

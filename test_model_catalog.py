@@ -36,7 +36,7 @@ class CatalogTests(unittest.TestCase):
         self.assertNotEqual(preferred[1]["id"], neutral[1]["id"])
         self.assertIn("–", preferred[0]["estimated_tps"])
 
-    def test_gpu_fit_excludes_large_weights(self):
+    def test_gpu_fit_uses_ram_when_enabled_and_excludes_when_disabled(self):
         hardware = {"gpu": "NVIDIA GeForce RTX 3090", "vram_mib": 24576,
                     "ram_gib": 62.7, "disk_free_gib": 100}
         metadata = {"revision": "a" * 40, "size": 23_000_000_000, "sha256": "b" * 64}
@@ -44,7 +44,11 @@ class CatalogTests(unittest.TestCase):
              patch.object(self.manager, "_metadata", return_value=metadata), \
              patch.object(self.manager, "_baseline_rates", return_value=[]):
             _, suggestions = self.manager.recommendations()
-        self.assertEqual(suggestions, [])
+            self.assertTrue(suggestions)
+            self.assertTrue(all(item["hybrid_used"] for item in suggestions))
+            self.manager.set_hybrid_enabled(False)
+            _, no_hybrid = self.manager.recommendations()
+        self.assertEqual(no_hybrid, [])
 
     def test_cpu_search_requires_explicit_memory_override(self):
         candidate = {"id": "discovered-" + "a" * 16, "repo": "other/large-GGUF",

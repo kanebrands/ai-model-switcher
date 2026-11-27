@@ -115,8 +115,12 @@ class CatalogRefreshTests(unittest.TestCase):
     def test_discovered_install_requires_engine_and_ui_disables_button(self):
         candidate = {"id": "discovered-" + "a" * 16, "repo": "bartowski/Inkling-2-Mini-GGUF",
                      "file": "Inkling-Q4_K_M.gguf", "min_engine_build": 12600}
-        with self.assertRaisesRegex(ValueError, "requires llama.cpp build"):
-            self.manager.start_install(candidate["id"], candidate, 12033)
+        with patch.object(self.manager, "hardware", return_value={"gpu": "3090", "vram_mib": 24576,
+                                                                "ram_gib": 125, "disk_free_gib": 100}), \
+             patch.object(self.manager, "_metadata", return_value={"revision": "a" * 40,
+                                                                   "size": 18_660_000_000, "sha256": "b" * 64}):
+            with self.assertRaisesRegex(ValueError, "requires llama.cpp build"):
+                self.manager.start_install(candidate["id"], candidate, 12033)
         hardware = {"gpu": "3090", "vram_mib": 24576, "ram_gib": 125, "disk_free_gib": 100}
         page = index(hardware, [], [], [], "test", discovery={"status": "completed", "query": "Inkling",
                      "items": [{**candidate, "name": "Inkling", "created_at": "2026-11-20",

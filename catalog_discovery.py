@@ -10,6 +10,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from model_artifacts import artifact_sets, SAFE_PATH
+from hybrid_memory import memory_plan
 
 
 AUTHORS = ("bartowski", "unsloth", "mradermacher")
@@ -101,7 +102,7 @@ class CatalogDiscovery:
         db.row_factory = sqlite3.Row
         return db
 
-    def latest(self):
+    def latest(self, hardware=None):
         with self.connect() as db:
             row = db.execute("SELECT * FROM catalog_refreshes ORDER BY started_at DESC LIMIT 1").fetchone()
         if not row:
@@ -114,9 +115,12 @@ class CatalogDiscovery:
         for item in result["items"]:
             item["installed"] = (item["id"] in installed_ids
                                  or (item["repo"], item["sha256"]) in installed_files)
+            if hardware is not None:
+                item.update(memory_plan(hardware, item["size"], "gguf",
+                                        self.model_manager.hybrid_enabled()))
         return result
 
-    def latest_search(self):
+    def latest_search(self, hardware=None):
         with self.connect() as db:
             row = db.execute("SELECT * FROM model_searches ORDER BY started_at DESC, rowid DESC LIMIT 1").fetchone()
         if not row:
@@ -126,6 +130,9 @@ class CatalogDiscovery:
         installed = {(item["repo"], item["sha256"]) for item in self.model_manager.installed()}
         for item in result["items"]:
             item["installed"] = (item["repo"], item["sha256"]) in installed
+            if hardware is not None:
+                item.update(memory_plan(hardware, item["size"], item.get("format", "gguf"),
+                                        self.model_manager.hybrid_enabled()))
         return result
 
     def start_search(self, query):
@@ -144,6 +151,7 @@ class CatalogDiscovery:
     def _search(self, run_id, query):
         try:
             hardware = self.model_manager.hardware()
+            hybrid_enabled = self.model_manager.hybrid_enabled()
             if re.fullmatch(REPO_PATTERN, query):
                 repos = [{"id": query}]
             else:
@@ -176,11 +184,9 @@ class CatalogDiscovery:
                          "size": entry["size"], "size_gb": round(entry["size"] / 1e9, 1), "pipeline": pipeline,
                          "ablit": any(word in lower for word in ("abliterat", "uncensor", "unbound")),
                          "min_engine_build": minimum,
-                         "runtime": ("gpu" if hardware.get("gpu_provider") in (None, "nvidia") and hardware.get("vram_mib") and entry["size"] + 4 * 2**30 <= hardware["vram_mib"] * 2**20 else
-                                     "vulkan" if entry["format"].startswith("gguf") and hardware.get("gpu_provider") in ("amd", "intel") and hardware.get("render_devices") else "cpu"),
+                         **memory_plan(hardware, entry["size"], entry["format"], hybrid_enabled),
                          "disk_fits": entry["size"] * 1.2 <= hardware.get("disk_free_gib", 0) * 2**30,
-                         "fits": (entry["size"] + 4 * 2**30 <= (hardware.get("vram_mib") or 0) * 2**20 or
-                                  entry["size"] + 4 * 2**30 <= hardware.get("ram_gib", 0) * 2**30)}
+                         }
                         for entry in artifacts]
             with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
                 batches = list(pool.map(inspect, repos[:20]))
@@ -242,8 +248,8 @@ class CatalogDiscovery:
     def _refresh(self, run_id, query, hardware=None):
         try:
             hardware = hardware or self.model_manager.hardware()
-            vram_bytes = (hardware.get("vram_mib") or 0) * 2**20
             disk_bytes = hardware.get("disk_free_gib", 0) * 2**30
+            hybrid_enabled = self.model_manager.hybrid_enabled()
             summaries = []
             for author in AUTHORS:
                 params = {"author": author, "search": query or "GGUF",
@@ -274,7 +280,8 @@ class CatalogDiscovery:
                 if not selected:
                     return None
                 _, size, filename, digest = selected
-                if size + 4 * 2**30 > vram_bytes or size * 1.2 > disk_bytes:
+                plan = memory_plan(hardware, size, "gguf", hybrid_enabled)
+                if not plan["fits"] or plan["runtime"] == "cpu" or size * 1.2 > disk_bytes:
                     return None
                 lower = repo.lower()
                 minimum = max((build for family, build in MIN_ENGINE_BUILD.items() if family in lower), default=0)
@@ -283,7 +290,7 @@ class CatalogDiscovery:
                         "size": size, "size_gb": round(size / 1e9, 1),
                         "created_at": summary.get("createdAt"), "pipeline": summary.get("pipeline_tag") or "Unknown",
                         "ablit": any(word in lower for word in ("abliterat", "uncensor", "unbound")),
-                        "min_engine_build": minimum}
+                        "min_engine_build": minimum, **plan}
 
             # Inspect newest repos first. A search such as "Inkling" narrows this set.
             with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:

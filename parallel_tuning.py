@@ -150,7 +150,9 @@ class ParallelTuner:
                 docker_api("POST", "/containers/create?name=" + current["container"],
                            self.model_manager.serving_config(row["filename"], row["alias"],
                                                              row["context_tokens"], old["Image"], slots,
-                                                             row.get("runtime", "gpu"), row.get("format", "gguf")))
+                                                             row.get("runtime", "gpu"), row.get("format", "gguf"),
+                                                             cpu_offload_gb=row.get("cpu_offload_gb", 0),
+                                                             hybrid_enabled=bool(row.get("hybrid_enabled", 1))))
                 docker_api("POST", "/containers/" + current["container"] + "/start")
             self._job(job_id, stage="waiting for model readiness")
             if not self._wait_ready(current, slots, old_id):

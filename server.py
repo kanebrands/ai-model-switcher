@@ -7,6 +7,7 @@ import json
 import os
 import re
 import socket
+import sqlite3
 import threading
 import urllib.parse
 import urllib.request
@@ -116,8 +117,8 @@ def switch(target):
         raise ValueError("This workload was not selected at installation")
     if not SELECTED_MODES and workload_state(workloads[target]) == "not created":
         raise ValueError("This workload is not installed")
-    if ENGINE_UPDATES.busy or CONTEXT_TUNER.busy or PARALLEL_TUNER.busy:
-        raise RuntimeError("Wait for the engine or context change to finish before switching models")
+    if ENGINE_UPDATES.busy or CONTEXT_TUNER.busy or PARALLEL_TUNER.busy or MODEL_MANAGER.busy:
+        raise RuntimeError("Wait for the model operation or context change to finish before switching models")
     with LOCK:
         start_name = workloads[target]
         backup = MODEL_MANAGER.ensure_current_engine(target)
@@ -397,7 +398,8 @@ class Handler(BaseHTTPRequestHandler):
                 media_suggestions = MEDIA_MANAGER.recommendations(hardware, prefer_ablit)
                 self._send_html(model_views.index(hardware, suggestions, MODEL_MANAGER.installed(), MODEL_MANAGER.jobs(), CSRF,
                                                   prefer_ablit, media_suggestions, MEDIA_MANAGER.jobs(), COMFY_URL,
-                                                  DISCOVERY.latest(), ENGINE_UPDATES.status(), DISCOVERY.latest_search()))
+                                                  DISCOVERY.latest(hardware), ENGINE_UPDATES.status(), DISCOVERY.latest_search(hardware),
+                                                  MODEL_MANAGER.hybrid_enabled()))
             except Exception as exc:
                 self.send_error(503, f"Recommendations unavailable: {type(exc).__name__}")
             return
@@ -525,7 +527,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         if self.path not in ("/switch", "/benchmark", "/context/tune", "/benchmarks/delete", "/models/install",
-                             "/models/media/install", "/models/refresh", "/models/search", "/models/hardware/rescan", "/models/discovered/install",
+                             "/models/media/install", "/models/refresh", "/models/search", "/models/hardware/rescan", "/models/discovered/install", "/models/hybrid", "/models/hybrid/apply",
                              "/models/engine/check", "/models/engine/update", "/webui/update", "/webui/update/dismiss",
                              "/sharing/save", "/sharing/reset", "/sharing/client", "/sharing/revoke",
                              "/sharing/parallel"):
@@ -654,6 +656,47 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(303)
             self.send_header("Location", "/")
             self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if self.path == "/models/hybrid":
+            values = fields.get("enabled", [])
+            if values not in ([], ["1"]):
+                self.send_error(400, "Invalid GPU + RAM preference")
+                return
+            if MODEL_MANAGER.busy:
+                self.send_error(409, "Finish the current model operation first")
+                return
+            try:
+                MODEL_MANAGER.set_hybrid_enabled(values == ["1"])
+            except sqlite3.Error:
+                self.send_error(503, "Memory preference was not saved")
+                return
+            self.send_response(303)
+            self.send_header("Location", "/models#hybrid-memory")
+            self.send_header("Content-Length", "0")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            return
+        if self.path == "/models/hybrid/apply":
+            candidates = fields.get("candidate", [])
+            override = fields.get("override_fit", [])
+            if len(candidates) != 1 or override not in ([], ["1"]):
+                self.send_error(400, "Select one installed model and a valid memory override")
+                return
+            try:
+                if BENCHMARKS.busy or CONTEXT_TUNER.busy or PARALLEL_TUNER.busy or ENGINE_UPDATES.busy:
+                    raise RuntimeError("Finish the current benchmark or engine change first")
+                MODEL_MANAGER.start_reconfigure_hybrid(candidates[0], allow_unfit=override == ["1"])
+            except ValueError as exc:
+                self.send_error(400, str(exc))
+                return
+            except RuntimeError as exc:
+                self.send_error(409, str(exc))
+                return
+            self.send_response(303)
+            self.send_header("Location", "/models#hybrid-memory")
+            self.send_header("Content-Length", "0")
+            self.send_header("Cache-Control", "no-store")
             self.end_headers()
             return
         if self.path in ("/models/refresh", "/models/search", "/models/hardware/rescan", "/models/engine/check", "/models/engine/update", "/models/discovered/install"):

@@ -63,7 +63,7 @@ fi
 if [[ -d "$INSTALL_DIR/gpu_control/assets" && ! -w "$INSTALL_DIR/gpu_control/assets" ]]; then
   sudo chown "$(id -u):$(id -g)" "$INSTALL_DIR/gpu_control/assets"
 fi
-for generated in docker-compose.yml gpu_control/server.py gpu_control/benchmarks.py gpu_control/benchmark_views.py gpu_control/model_catalog.py gpu_control/model_artifacts.py gpu_control/model_views.py gpu_control/catalog_discovery.py gpu_control/engine_updates.py gpu_control/webui_updates.py gpu_control/sharing.py gpu_control/sharing_views.py gpu_control/fairness_gateway.py gpu_control/gpu_metrics.py gpu_control/parallel_tuning.py gpu_control/install_profile.py gpu_control/install_models.sh gpu_control/context_tuning.py gpu_control/update-engine.sh gpu_control/update-webui.sh gpu_control/tune-parallel.sh gpu_control/tune-context.sh gpu_control/media_catalog.py gpu_control/assets/gpu-workstation.webp ai-control.sh start-selected.sh; do
+for generated in docker-compose.yml gpu_control/server.py gpu_control/benchmarks.py gpu_control/benchmark_views.py gpu_control/model_catalog.py gpu_control/model_artifacts.py gpu_control/hybrid_memory.py gpu_control/model_views.py gpu_control/catalog_discovery.py gpu_control/engine_updates.py gpu_control/webui_updates.py gpu_control/sharing.py gpu_control/sharing_views.py gpu_control/fairness_gateway.py gpu_control/gpu_metrics.py gpu_control/parallel_tuning.py gpu_control/install_profile.py gpu_control/install_models.sh gpu_control/context_tuning.py gpu_control/update-engine.sh gpu_control/update-webui.sh gpu_control/tune-parallel.sh gpu_control/tune-context.sh gpu_control/media_catalog.py gpu_control/assets/gpu-workstation.webp ai-control.sh start-selected.sh; do
   if [[ -e "$INSTALL_DIR/$generated" && ! -w "$INSTALL_DIR/$generated" ]]; then
     sudo chown "$(id -u):$(id -g)" "$INSTALL_DIR/$generated"
   fi
@@ -623,6 +623,7 @@ services:
       - ./gpu_control/benchmarks.py:/app/benchmarks.py:ro
       - ./gpu_control/benchmark_views.py:/app/benchmark_views.py:ro
       - ./gpu_control/model_catalog.py:/app/model_catalog.py:ro
+      - ./gpu_control/hybrid_memory.py:/app/hybrid_memory.py:ro
       - ./gpu_control/model_artifacts.py:/app/model_artifacts.py:ro
       - ./gpu_control/model_views.py:/app/model_views.py:ro
       - ./gpu_control/catalog_discovery.py:/app/catalog_discovery.py:ro
@@ -853,6 +854,7 @@ import json
 import os
 import re
 import socket
+import sqlite3
 import threading
 import urllib.parse
 import urllib.request
@@ -962,8 +964,8 @@ def switch(target):
         raise ValueError("This workload was not selected at installation")
     if not SELECTED_MODES and workload_state(workloads[target]) == "not created":
         raise ValueError("This workload is not installed")
-    if ENGINE_UPDATES.busy or CONTEXT_TUNER.busy or PARALLEL_TUNER.busy:
-        raise RuntimeError("Wait for the engine or context change to finish before switching models")
+    if ENGINE_UPDATES.busy or CONTEXT_TUNER.busy or PARALLEL_TUNER.busy or MODEL_MANAGER.busy:
+        raise RuntimeError("Wait for the model operation or context change to finish before switching models")
     with LOCK:
         start_name = workloads[target]
         backup = MODEL_MANAGER.ensure_current_engine(target)
@@ -1243,7 +1245,8 @@ class Handler(BaseHTTPRequestHandler):
                 media_suggestions = MEDIA_MANAGER.recommendations(hardware, prefer_ablit)
                 self._send_html(model_views.index(hardware, suggestions, MODEL_MANAGER.installed(), MODEL_MANAGER.jobs(), CSRF,
                                                   prefer_ablit, media_suggestions, MEDIA_MANAGER.jobs(), COMFY_URL,
-                                                  DISCOVERY.latest(), ENGINE_UPDATES.status(), DISCOVERY.latest_search()))
+                                                  DISCOVERY.latest(hardware), ENGINE_UPDATES.status(), DISCOVERY.latest_search(hardware),
+                                                  MODEL_MANAGER.hybrid_enabled()))
             except Exception as exc:
                 self.send_error(503, f"Recommendations unavailable: {type(exc).__name__}")
             return
@@ -1371,7 +1374,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         if self.path not in ("/switch", "/benchmark", "/context/tune", "/benchmarks/delete", "/models/install",
-                             "/models/media/install", "/models/refresh", "/models/search", "/models/hardware/rescan", "/models/discovered/install",
+                             "/models/media/install", "/models/refresh", "/models/search", "/models/hardware/rescan", "/models/discovered/install", "/models/hybrid", "/models/hybrid/apply",
                              "/models/engine/check", "/models/engine/update", "/webui/update", "/webui/update/dismiss",
                              "/sharing/save", "/sharing/reset", "/sharing/client", "/sharing/revoke",
                              "/sharing/parallel"):
@@ -1500,6 +1503,47 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(303)
             self.send_header("Location", "/")
             self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if self.path == "/models/hybrid":
+            values = fields.get("enabled", [])
+            if values not in ([], ["1"]):
+                self.send_error(400, "Invalid GPU + RAM preference")
+                return
+            if MODEL_MANAGER.busy:
+                self.send_error(409, "Finish the current model operation first")
+                return
+            try:
+                MODEL_MANAGER.set_hybrid_enabled(values == ["1"])
+            except sqlite3.Error:
+                self.send_error(503, "Memory preference was not saved")
+                return
+            self.send_response(303)
+            self.send_header("Location", "/models#hybrid-memory")
+            self.send_header("Content-Length", "0")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            return
+        if self.path == "/models/hybrid/apply":
+            candidates = fields.get("candidate", [])
+            override = fields.get("override_fit", [])
+            if len(candidates) != 1 or override not in ([], ["1"]):
+                self.send_error(400, "Select one installed model and a valid memory override")
+                return
+            try:
+                if BENCHMARKS.busy or CONTEXT_TUNER.busy or PARALLEL_TUNER.busy or ENGINE_UPDATES.busy:
+                    raise RuntimeError("Finish the current benchmark or engine change first")
+                MODEL_MANAGER.start_reconfigure_hybrid(candidates[0], allow_unfit=override == ["1"])
+            except ValueError as exc:
+                self.send_error(400, str(exc))
+                return
+            except RuntimeError as exc:
+                self.send_error(409, str(exc))
+                return
+            self.send_response(303)
+            self.send_header("Location", "/models#hybrid-memory")
+            self.send_header("Content-Length", "0")
+            self.send_header("Cache-Control", "no-store")
             self.end_headers()
             return
         if self.path in ("/models/refresh", "/models/search", "/models/hardware/rescan", "/models/engine/check", "/models/engine/update", "/models/discovered/install"):
@@ -2436,6 +2480,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from model_artifacts import artifact_sets, SAFE_PATH
+from hybrid_memory import memory_plan
 
 from benchmarks import MODELS, docker_api, docker_exec, docker_stream_text
 
@@ -2554,6 +2599,14 @@ class ModelManager:
                 db.execute("ALTER TABLE installed_models ADD COLUMN format TEXT NOT NULL DEFAULT 'gguf'")
             if "files_json" not in columns:
                 db.execute("ALTER TABLE installed_models ADD COLUMN files_json TEXT")
+            if "hybrid_enabled" not in columns:
+                db.execute("ALTER TABLE installed_models ADD COLUMN hybrid_enabled INTEGER NOT NULL DEFAULT 1")
+                db.execute("UPDATE installed_models SET hybrid_enabled=0 WHERE format='safetensors'")
+            if "cpu_offload_gb" not in columns:
+                db.execute("ALTER TABLE installed_models ADD COLUMN cpu_offload_gb INTEGER NOT NULL DEFAULT 0")
+            db.execute("""CREATE TABLE IF NOT EXISTS model_preferences (
+                id INTEGER PRIMARY KEY CHECK(id=1), hybrid_enabled INTEGER NOT NULL CHECK(hybrid_enabled IN (0,1)))""")
+            db.execute("INSERT OR IGNORE INTO model_preferences(id,hybrid_enabled) VALUES(1,1)")
             db.execute("""CREATE TABLE IF NOT EXISTS model_jobs (
                 id TEXT PRIMARY KEY, candidate_id TEXT NOT NULL, started_at TEXT NOT NULL,
                 ended_at TEXT, status TEXT NOT NULL, stage TEXT NOT NULL, error TEXT)""")
@@ -2572,6 +2625,22 @@ class ModelManager:
     def installed(self):
         with self.connect() as db:
             return [dict(row) for row in db.execute("SELECT * FROM installed_models ORDER BY installed_at DESC")]
+
+    def hybrid_enabled(self):
+        with self.connect() as db:
+            return bool(db.execute("SELECT hybrid_enabled FROM model_preferences WHERE id=1").fetchone()[0])
+
+    def set_hybrid_enabled(self, enabled):
+        if not isinstance(enabled, bool):
+            raise ValueError("Choose enabled or disabled")
+        with self.connect() as db:
+            db.execute("UPDATE model_preferences SET hybrid_enabled=? WHERE id=1", (int(enabled),))
+            # Refresh the recent-release shortlist under the new fit policy.
+            if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='catalog_refreshes'").fetchone():
+                db.execute("UPDATE catalog_refreshes SET hardware_fingerprint='' WHERE id=(SELECT id FROM catalog_refreshes ORDER BY started_at DESC LIMIT 1)")
+
+    def plan(self, hardware, size, model_format="gguf"):
+        return memory_plan(hardware, size, model_format, self.hybrid_enabled())
 
     def jobs(self):
         with self.connect() as db:
@@ -2734,12 +2803,13 @@ class ModelManager:
                 continue
             size = metadata["size"]
             vram = hardware["vram_mib"]
-            fits = bool(vram and size + 4 * 2**30 <= vram * 2**20)
+            plan = self.plan(hardware, size)
+            fits = plan["fits"] and plan["runtime"] == "gpu"
             if candidate["id"] not in installed and (not fits or size * 1.2 > hardware["disk_free_gib"] * 2**30):
                 continue
             comparable = [rate * (active / candidate["active_b"]) ** .35 for active, moe, rate in rates if moe == candidate["moe"]]
             estimate = None
-            if comparable:
+            if comparable and not plan["hybrid_used"]:
                 middle = statistics.median(comparable)
                 estimate = f"{max(1, round(middle * .55))}–{round(middle * 1.45)}"
             score = candidate["priority"] + (18 if prefer_ablit and candidate["ablit"] else 0)
@@ -2747,6 +2817,7 @@ class ModelManager:
             suggestions.append({**candidate, **metadata, "size_gb": round(size / 1e9, 1),
                                 "estimated_tps": estimate, "score": score,
                                 "installed": candidate["id"] in installed, "fits": fits,
+                                "hybrid_used": plan["hybrid_used"], "ram_needed_gib": plan["ram_needed_gib"],
                                 "context_tokens": (installed[candidate["id"]].get("context_tokens") or 32768)
                                     if candidate["id"] in installed else context_for_hardware(candidate, size, vram)})
         # Keep room for models the user can actually install. Installed models
@@ -2765,8 +2836,6 @@ class ModelManager:
             raise ValueError("Unknown catalog model")
         if candidate["id"] != candidate_id or not re.fullmatch(r"[a-z0-9-]{2,64}", candidate_id):
             raise ValueError("Invalid catalog candidate")
-        if candidate.get("runtime", "gpu") == "gpu" and candidate.get("min_engine_build", 0) and (engine_build or 0) < candidate["min_engine_build"]:
-            raise ValueError(f"This model requires llama.cpp build {candidate['min_engine_build']} or newer; update the engine first")
         with self.lock:
             if self.busy:
                 raise RuntimeError("A model download is already running")
@@ -2780,9 +2849,11 @@ class ModelManager:
             if any(item["repo"] == candidate["repo"] and item["sha256"] == metadata["sha256"] for item in installed):
                 raise ValueError("This model revision is already installed")
             hardware = self.hardware()
-            runtime = candidate.get("runtime", "gpu")
-            if runtime not in ("cpu", "gpu", "vulkan"):
-                raise ValueError("Unsupported runtime")
+            model_format = metadata.get("format", "gguf")
+            plan = self.plan(hardware, metadata["size"], model_format)
+            runtime = plan["runtime"]
+            if runtime == "gpu" and model_format.startswith("gguf") and candidate.get("min_engine_build", 0) and (engine_build or 0) < candidate["min_engine_build"]:
+                raise ValueError(f"This model requires llama.cpp build {candidate['min_engine_build']} or newer; update the engine first")
             if runtime == "gpu" and hardware.get("gpu_provider", "nvidia") != "nvidia":
                 raise ValueError("CUDA runtime requires an NVIDIA GPU")
             if runtime == "vulkan" and (metadata.get("format") == "safetensors" or
@@ -2795,8 +2866,8 @@ class ModelManager:
                                else hardware.get("ram_gib", 0) * 2**30)
             if runtime == "gpu" and not hardware.get("vram_mib"):
                 raise ValueError("No compatible GPU is available for this model")
-            if not allow_unfit and metadata["size"] + 4 * 2**30 > available_bytes:
-                raise ValueError("Estimated model memory exceeds available " + ("GPU memory" if runtime == "gpu" else "RAM") + "; select Try anyway to override")
+            if not allow_unfit and not plan["fits"]:
+                raise ValueError("Estimated model memory exceeds the available GPU/RAM budget; select Try anyway to override")
             if metadata["size"] * 1.2 > hardware["disk_free_gib"] * 2**30:
                 raise ValueError("Insufficient model storage")
             context_tokens = (context_for_hardware(candidate, metadata["size"], hardware.get("vram_mib"))
@@ -2811,10 +2882,110 @@ class ModelManager:
                 db.execute("INSERT INTO model_jobs(id,candidate_id,started_at,status,stage) VALUES(?,?,?,?,?)",
                            (job_id, candidate_id, now(), "queued", "queued"))
             self.busy = True
-            threading.Thread(target=self._install, args=(job_id, candidate, metadata, context_tokens, runtime, hardware), daemon=True).start()
+            threading.Thread(target=self._install, args=(job_id, candidate, metadata, context_tokens, runtime, hardware, plan), daemon=True).start()
             return job_id
 
-    def _install(self, job_id, candidate, metadata, context_tokens, runtime="gpu", hardware=None):
+    def start_reconfigure_hybrid(self, candidate_id, allow_unfit=False):
+        if not re.fullmatch(r"[a-z0-9-]{2,64}", candidate_id or ""):
+            raise ValueError("Invalid installed model")
+        with self.lock:
+            if self.busy:
+                raise RuntimeError("A model operation is already running")
+            row = next((item for item in self.installed() if item["candidate_id"] == candidate_id), None)
+            if not row:
+                raise ValueError("Model is not installed")
+            hardware = self.hardware()
+            plan = self.plan(hardware, row["size"], row.get("format", "gguf"))
+            if not plan["fits"] and not allow_unfit:
+                raise ValueError("Estimated model memory exceeds the available GPU/RAM budget; select Try anyway to override")
+            if (row.get("runtime") == plan["runtime"] and
+                    bool(row.get("hybrid_enabled", 1)) == plan["hybrid_enabled"] and
+                    row.get("cpu_offload_gb", 0) == plan["offload_gb"]):
+                raise ValueError("This model already uses the saved memory preference")
+            job_id = str(uuid.uuid4())
+            with self.connect() as db:
+                db.execute("INSERT INTO model_jobs(id,candidate_id,started_at,status,stage) VALUES(?,?,?,?,?)",
+                           (job_id, candidate_id, now(), "queued", "queued"))
+            self.busy = True
+            threading.Thread(target=self._reconfigure_hybrid,
+                             args=(job_id, row, plan, hardware), daemon=True).start()
+            return job_id
+
+    def _reconfigure_hybrid(self, job_id, row, plan, hardware):
+        name = row["container"]
+        backup = None
+        was_running = False
+        try:
+            self._job(job_id, status="running", stage="preparing engine")
+            image = self.runtime_image(row.get("format", "gguf"), plan["runtime"])
+            self._ensure_image(image)
+            old = docker_api("GET", "/containers/" + name + "/json")
+            was_running = bool(old["State"].get("Running"))
+            if was_running:
+                self._job(job_id, stage="stopping current model")
+                docker_api("POST", "/containers/" + name + "/stop?t=30")
+            backup_name = name + "-hybrid-rollback-" + job_id[:8]
+            docker_api("POST", "/containers/" + name + "/rename?name=" + backup_name)
+            backup = backup_name
+            config = self.serving_config(row["filename"], row["alias"], row["context_tokens"],
+                                         image=image, parallel_slots=row["parallel_slots"],
+                                         runtime=plan["runtime"], model_format=row.get("format", "gguf"),
+                                         hardware=hardware, cpu_offload_gb=plan["offload_gb"],
+                                         hybrid_enabled=plan["hybrid_enabled"])
+            docker_api("POST", "/containers/create?name=" + name, config)
+            if was_running:
+                self._job(job_id, stage="testing model readiness")
+                docker_api("POST", "/containers/" + name + "/start")
+                for _ in range(120):
+                    state = docker_api("GET", "/containers/" + name + "/json")["State"]
+                    if not state.get("Running"):
+                        raise RuntimeError("Model exited during memory change")
+                    try:
+                        request = urllib.request.Request("http://nginx:8080/v1/models",
+                                                         headers={"Authorization": "Bearer " + self.api_key})
+                        with urllib.request.urlopen(request, timeout=5) as response:
+                            models = json.load(response)
+                        if any(item.get("id") == row["alias"] for item in models.get("data", [])):
+                            break
+                    except (OSError, ValueError, KeyError):
+                        pass
+                    time.sleep(3)
+                else:
+                    raise RuntimeError("Model did not become ready with the new memory setting")
+            with self.connect() as db:
+                db.execute("UPDATE installed_models SET runtime=?,hybrid_enabled=?,cpu_offload_gb=? WHERE candidate_id=?",
+                           (plan["runtime"], int(plan["hybrid_enabled"]), plan["offload_gb"], row["candidate_id"]))
+            try:
+                docker_api("DELETE", "/containers/" + backup + "?force=1")
+            except RuntimeError:
+                pass
+            backup = None
+            self._job(job_id, status="completed", ended_at=now(),
+                      stage="memory setting tested and saved" if was_running else "memory setting saved; activate to test")
+        except Exception as exc:
+            self._job(job_id, stage="restoring previous memory setting")
+            try:
+                if backup:
+                    try:
+                        docker_api("DELETE", "/containers/" + name + "?force=1")
+                    except RuntimeError:
+                        pass
+                    docker_api("POST", "/containers/" + backup + "/rename?name=" + name)
+                    if was_running:
+                        docker_api("POST", "/containers/" + name + "/start")
+                elif was_running:
+                    docker_api("POST", "/containers/" + name + "/start")
+            except Exception as rollback_exc:
+                self._job(job_id, status="failed", ended_at=now(), stage="rollback failed",
+                          error=f"{type(exc).__name__}: {str(exc)[:120]}; rollback: {str(rollback_exc)[:120]}")
+            else:
+                self._job(job_id, status="failed", ended_at=now(), stage="previous setting restored",
+                          error=f"{type(exc).__name__}: {str(exc)[:250]}")
+        finally:
+            with self.lock:
+                self.busy = False
+
+    def _install(self, job_id, candidate, metadata, context_tokens, runtime="gpu", hardware=None, plan=None):
         downloader = None
         serving = None
         try:
@@ -2882,11 +3053,13 @@ class ModelManager:
             image = self.runtime_image(model_format, runtime)
             self._ensure_image(image)
             serving_config = self.serving_config(filename, alias, context_tokens, runtime=runtime,
-                                                 model_format=model_format, hardware=hardware)
+                                                 model_format=model_format, hardware=hardware,
+                                                 cpu_offload_gb=(plan or {}).get("offload_gb", 0),
+                                                 hybrid_enabled=(plan or {}).get("hybrid_enabled", True))
             serving = docker_api("POST", "/containers/create?name=" + container, serving_config)["Id"]
             with self.connect() as db:
-                db.execute("INSERT INTO installed_models(candidate_id,repo,filename,revision,sha256,size,installed_at,alias,container,context_tokens,runtime,format,files_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                           (candidate["id"], candidate["repo"], filename, metadata["revision"], metadata["sha256"], metadata["size"], now(), alias, container, context_tokens, runtime, model_format, json.dumps(files)))
+                db.execute("INSERT INTO installed_models(candidate_id,repo,filename,revision,sha256,size,installed_at,alias,container,context_tokens,runtime,format,files_json,hybrid_enabled,cpu_offload_gb) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                           (candidate["id"], candidate["repo"], filename, metadata["revision"], metadata["sha256"], metadata["size"], now(), alias, container, context_tokens, runtime, model_format, json.dumps(files), int((plan or {}).get("hybrid_enabled", True)), (plan or {}).get("offload_gb", 0)))
             MODELS["hf-" + candidate["id"]] = (alias, container)
             serving = None
             self._job(job_id, status="completed", stage="installed; ready to select", ended_at=now())
@@ -2935,12 +3108,15 @@ class ModelManager:
         return GGUF_IMAGE if runtime == "gpu" else VULKAN_GGUF_IMAGE if runtime == "vulkan" else CPU_GGUF_IMAGE
 
     def serving_config(self, filename, alias, context_tokens, image=None, parallel_slots=1,
-                       runtime="gpu", model_format="gguf", hardware=None):
+                       runtime="gpu", model_format="gguf", hardware=None, cpu_offload_gb=0,
+                       hybrid_enabled=True):
         image = image or self.runtime_image(model_format, runtime)
         if model_format == "safetensors":
             command = ["--model", "/models/" + filename, "--served-model-name", alias,
                        "--host", "0.0.0.0", "--port", "8000", "--max-model-len", str(context_tokens or 4096),
                        "--max-num-seqs", str(parallel_slots), "--load-format", "safetensors", "--api-key", self.api_key]
+            if runtime == "gpu" and hybrid_enabled and cpu_offload_gb:
+                command += ["--cpu-offload-gb", str(cpu_offload_gb)]
         else:
             command = ["--model", "/models/" + filename, "--alias", alias, "--host", "0.0.0.0", "--port", "8080",
                        "--ctx-size", str(context_tokens or 4096), "--parallel", str(parallel_slots)]
@@ -2948,10 +3124,13 @@ class ModelManager:
                 "RestartPolicy": {"Name": "unless-stopped"}}
         if runtime == "gpu":
             if model_format != "safetensors":
-                command += ["--n-gpu-layers", "auto", "--fit-target", "2048", "--flash-attn", "on"]
+                command += (["--n-gpu-layers", "auto", "--fit-target", "2048"] if hybrid_enabled else
+                            ["--n-gpu-layers", "all", "--fit", "off"])
+                command += ["--flash-attn", "on"]
             host["DeviceRequests"] = [{"Driver": "nvidia", "Count": 1, "Capabilities": [["gpu"]]}]
         elif runtime == "vulkan":
-            command += ["--n-gpu-layers", "auto", "--fit-target", "2048"]
+            command += (["--n-gpu-layers", "auto", "--fit-target", "2048"] if hybrid_enabled else
+                        ["--n-gpu-layers", "all", "--fit", "off"])
             devices = (hardware or self.hardware()).get("render_devices") or []
             host["Devices"] = [{"PathOnHost": device, "PathInContainer": device,
                                 "CgroupPermissions": "rwm"} for device in devices]
@@ -2986,7 +3165,9 @@ class ModelManager:
             docker_api("POST", "/containers/create?name=" + name,
                        self.serving_config(row["filename"], row["alias"], row["context_tokens"],
                                            parallel_slots=row["parallel_slots"], runtime=row.get("runtime", "gpu"),
-                                           model_format=row.get("format", "gguf")))
+                                           model_format=row.get("format", "gguf"),
+                                           cpu_offload_gb=row.get("cpu_offload_gb", 0),
+                                           hybrid_enabled=bool(row.get("hybrid_enabled", 1))))
         except Exception:
             docker_api("POST", "/containers/" + backup + "/rename?name=" + name)
             raise
@@ -3002,6 +3183,44 @@ class ModelManager:
             docker_api("DELETE", "/containers/" + name + "?force=1")
             docker_api("POST", "/containers/" + backup + "/rename?name=" + name)
 MODEL_CATALOG
+
+cat > "$INSTALL_DIR/gpu_control/hybrid_memory.py" <<'HYBRID_MEMORY'
+"""Conservative RAM/VRAM planning for optional mixed-memory inference."""
+import math
+
+
+GIB = 2**30
+WORKING_BYTES = 4 * GIB
+
+
+def memory_plan(hardware, weight_bytes, model_format="gguf", enabled=True):
+    """Estimate placement; loading and throughput must still be tested on the host."""
+    if not isinstance(weight_bytes, int) or weight_bytes <= 0:
+        raise ValueError("Unknown model weight size")
+    ram = max(0, float(hardware.get("ram_gib") or 0)) * GIB
+    vram = max(0, int(hardware.get("vram_mib") or 0)) * 2**20
+    ram_budget = max(0, ram - max(2 * GIB, ram * .1))
+    gpu_budget = max(0, vram - max(2 * GIB, vram * .1))
+    demand = weight_bytes + WORKING_BYTES
+    provider = hardware.get("gpu_provider") or ("nvidia" if vram else None)
+    gguf = model_format.startswith("gguf")
+    gpu_runtime = ("gpu" if provider == "nvidia" and vram else
+                   "vulkan" if gguf and provider in ("amd", "intel") and hardware.get("render_devices") else None)
+    if not gpu_runtime:
+        return {"runtime": "cpu", "fits": demand <= ram_budget, "ram_needed_gib": math.ceil(demand / GIB),
+                "offload_gb": 0, "hybrid_used": False, "hybrid_enabled": bool(enabled)}
+    # A Vulkan render device can exist without a reliable VRAM-size report.
+    # In that case, use the RAM budget alone for a conservative fit label.
+    needs_ram = max(0, demand - gpu_budget)
+    if needs_ram and not enabled:
+        return {"runtime": "cpu", "fits": demand <= ram_budget, "ram_needed_gib": math.ceil(demand / GIB),
+                "offload_gb": 0, "hybrid_used": False, "hybrid_enabled": False}
+    offload = min(math.ceil(needs_ram / GIB), math.floor(ram_budget / GIB)) if enabled else 0
+    return {"runtime": gpu_runtime, "fits": demand <= gpu_budget + ram_budget if enabled else demand <= gpu_budget,
+            "ram_needed_gib": math.ceil(needs_ram / GIB),
+            "offload_gb": offload if model_format == "safetensors" else 0,
+            "hybrid_used": bool(needs_ram and enabled), "hybrid_enabled": bool(enabled)}
+HYBRID_MEMORY
 
 cat > "$INSTALL_DIR/gpu_control/model_artifacts.py" <<'MODEL_ARTIFACTS'
 """Validate installable, commit-pinned Hugging Face model file sets."""
@@ -3075,13 +3294,14 @@ cat > "$INSTALL_DIR/gpu_control/model_views.py" <<'MODEL_VIEWS'
 import html
 
 from benchmark_views import shell
+from hybrid_memory import memory_plan
 
 
 def esc(value):
     return html.escape(str(value if value is not None else "—"), quote=True)
 
 
-def specific_search_section(search, installed, jobs, csrf, engine=None):
+def specific_search_section(search, installed, jobs, csrf, engine=None, hardware=None, hybrid_enabled=True):
     search = search or {"status": "not searched", "items": [], "query": "", "error": None}
     installing = {job["candidate_id"] for job in jobs if job["status"] in ("queued", "running")}
     installed_files = {(item["repo"], item["sha256"]) for item in installed}
@@ -3096,6 +3316,7 @@ def specific_search_section(search, installed, jobs, csrf, engine=None):
         disk_fits = item.get("disk_fits", True)
         state = ("Installed" if installed_here else "Installing" if busy else
                  "Insufficient disk" if not disk_fits else "Engine update needed" if needs_engine else
+                 "Likely fits with RAM assistance" if fit and item.get("hybrid_used") else
                  "Likely fits" if fit else "Memory estimate exceeded")
         disabled = " disabled" if installed_here or busy or needs_engine or not disk_fits else ""
         override = ('' if fit else
@@ -3109,22 +3330,44 @@ def specific_search_section(search, installed, jobs, csrf, engine=None):
         if item.get("quantization"):
             variant += " / " + item["quantization"].upper()
         file_label = item["file"] + (f' ({len(item["files"])} files)' if len(item.get("files", [])) > 1 else "")
+        runtime_label = item.get("runtime", "gpu").upper()
+        if item.get("hybrid_used"):
+            runtime_label += f' + RAM (est. {item.get("ram_needed_gib", "?")} GiB)'
         rows.append(f'<tr><td><a href="https://huggingface.co/{esc(item["repo"])}" target="_blank" rel="noopener noreferrer">'
                     f'{esc(item["repo"])}</a></td><td>{esc(variant)}<br>{esc(file_label)}</td><td>{esc(item["size_gb"])} GB</td>'
-                    f'<td>{esc(item.get("runtime", "gpu").upper())}</td><td>{esc(state)}</td><td>{action}</td></tr>')
+                    f'<td>{esc(runtime_label)}</td><td>{esc(state)}</td><td>{action}</td></tr>')
     status = esc(search["status"])
     if search.get("error"):
         status += ': ' + esc(search["error"])
     if search["status"] == "completed" and not rows:
         status += ' — no complete GGUF or supported Safetensors file sets found. Gated repositories are not supported.'
-    installed_rows = ''.join(f'<tr><td>{esc(item["alias"])}</td><td>{esc(item["repo"])}</td>'
-                             f'<td>{esc(item.get("format", "gguf").upper())} / {esc(item.get("runtime", "gpu").upper())}</td>'
-                             f'<td><form method="post" action="/switch"><input type="hidden" name="token" value="{esc(csrf)}">'
-                             f'<button name="mode" value="hf-{esc(item["candidate_id"])}">Activate</button></form></td></tr>' for item in installed)
+    installed_rows = []
+    for item in installed:
+        assistance = "Enabled" if item.get("hybrid_enabled", 1) else "Disabled"
+        if item.get("cpu_offload_gb"):
+            assistance += f' · {item["cpu_offload_gb"]} GiB vLLM offload'
+        plan = memory_plan(hardware or {}, item["size"], item.get("format", "gguf"), hybrid_enabled)
+        differs = (plan["runtime"] != item.get("runtime", "gpu") or
+                   plan["hybrid_enabled"] != bool(item.get("hybrid_enabled", 1)) or
+                   plan["offload_gb"] != item.get("cpu_offload_gb", 0))
+        apply_form = ""
+        if differs:
+            override = ('' if plan["fits"] else
+                        '<label class="note"><input type="checkbox" name="override_fit" value="1" required> Try anyway</label> ')
+            apply_form = (f'<form method="post" action="/models/hybrid/apply">'
+                          f'<input type="hidden" name="token" value="{esc(csrf)}">'
+                          f'<input type="hidden" name="candidate" value="{esc(item["candidate_id"])}">'
+                          f'{override}<button type="submit">Apply saved preference</button></form>')
+        installed_rows.append(f'<tr><td>{esc(item["alias"])}</td><td>{esc(item["repo"])}</td>'
+                              f'<td>{esc(item.get("format", "gguf").upper())} / {esc(item.get("runtime", "gpu").upper())}</td>'
+                              f'<td>{esc(assistance)}</td>'
+                              f'<td><form method="post" action="/switch"><input type="hidden" name="token" value="{esc(csrf)}">'
+                              f'<button name="mode" value="hf-{esc(item["candidate_id"])}">Activate</button></form>'
+                              f'{apply_form}</td></tr>')
     return (f'<section class="card" id="specific-search"><h2>Search a specific Hugging Face model</h2>'
             '<p>Search by model name, exact owner/repository ID, or a Hugging Face repository URL. '
             'Searches any publisher and lists complete GGUF shard sets, single-file GGUF, and Safetensors repositories with standard tokenizer and configuration files. '
-            'A model is downloaded only after you choose Install. The initial memory check reserves 4 GiB for serving; '
+            'A model is downloaded only after you choose Install. The memory estimate reserves space for serving and the host; '
             'you can explicitly try a model that exceeds this estimate. Disk capacity and SHA256 verification still apply. '
             'NVIDIA uses CUDA, AMD and Intel use Vulkan for GGUF where render devices are available, and CPU inference remains available. '
             'Safetensors uses vLLM on NVIDIA or CPU; AWQ and GPTQ support depends on the engine and model architecture. '
@@ -3138,12 +3381,16 @@ def specific_search_section(search, installed, jobs, csrf, engine=None):
             f'<p role="status">Search: {status}</p>'
             '<div class="scroll"><table><thead><tr><th>Repository</th><th>Variant</th><th>Size</th><th>Runtime</th><th>Fit/status</th><th>Action</th></tr></thead>'
             f'<tbody>{"".join(rows) if rows else "<tr><td colspan=6>No search results yet.</td></tr>"}</tbody></table></div>'
-            '<h3>Installed Hugging Face models</h3><div class="scroll"><table><tr><th>API name</th><th>Repository</th><th>Engine</th><th>Action</th></tr>'
-            f'{installed_rows if installed_rows else "<tr><td colspan=4>None yet.</td></tr>"}</table></div></section>')
+            '<h3>Installed Hugging Face models</h3><p class="note">Use Apply saved preference to update an installed model. '
+            'A running model is restarted and checked; failure restores its previous container. '
+            'A stopped model is staged with the new setting and checked when activated.</p>'
+            '<div class="scroll"><table><tr><th>API name</th><th>Repository</th><th>Engine</th><th>Memory setting</th><th>Action</th></tr>'
+            f'{"".join(installed_rows) if installed_rows else "<tr><td colspan=5>None yet.</td></tr>"}</table></div></section>')
 
 
 def index(hardware, suggestions, installed, jobs, csrf, prefer_ablit=True,
-          media_suggestions=(), media_jobs=(), comfy_url="", discovery=None, engine=None, search=None):
+          media_suggestions=(), media_jobs=(), comfy_url="", discovery=None, engine=None, search=None,
+          hybrid_enabled=True):
     selected_on = " selected" if prefer_ablit else ""
     selected_off = "" if prefer_ablit else " selected"
     hardware_line = (f'<h2>Detected hardware</h2><p>GPU: <strong>{esc(hardware["gpu"] or "unavailable")}</strong> · '
@@ -3154,12 +3401,25 @@ def index(hardware, suggestions, installed, jobs, csrf, prefer_ablit=True,
                      f'Last hardware change UTC: {esc(hardware.get("changed_at"))}. '
                      'The switcher scans about once a minute while this page is used. '
                      'A GPU or memory change refreshes the Hugging Face discoveries and recalculates suitability. '
-                     'CPU details are shown, but CPU upgrades do not increase the GPU memory available to models.</p>'
+                     'RAM can hold model weights that do not fit in VRAM, but this does not increase physical VRAM or guarantee speed.</p>'
                      f'<form method="post" action="/models/hardware/rescan"><input type="hidden" name="token" value="{esc(csrf)}">'
                      '<button type="submit">Rescan hardware and suggestions</button></form>')
-    search_section = specific_search_section(search, installed, jobs, csrf, engine)
+    search_section = specific_search_section(search, installed, jobs, csrf, engine, hardware, hybrid_enabled)
+    hybrid_box = (f'<section class="card" id="hybrid-memory"><h2>GPU + system RAM</h2>'
+                  f'<p>New model installs: <strong>{"Enabled" if hybrid_enabled else "Disabled"}</strong> (default: enabled).</p>'
+                  '<p>When a model exceeds GPU memory, llama.cpp can keep some GGUF layers in system RAM. '
+                  'For NVIDIA Safetensors, vLLM receives an estimated CPU weight offload budget. '
+                  'This can make larger models load, but each request may move weights across the GPU connection and run much slower. '
+                  'The switcher reserves RAM for Ubuntu and GPU memory for serving; actual fit and speed are verified only when you activate and test a model. '
+                  'Disabling this preference selects CPU inference for models estimated too large for GPU memory. '
+                  'This preference affects new installs. Apply it to an installed model using the control in that model’s row below.</p>'
+                  f'<form method="post" action="/models/hybrid"><input type="hidden" name="token" value="{esc(csrf)}">'
+                  f'<label><input type="checkbox" name="enabled" value="1"{" checked" if hybrid_enabled else ""}> '
+                  'Allow GPU + system RAM for models</label> <button type="submit">Save memory preference</button></form>'
+                  + (f'<p role="status">Latest model operation: {esc(jobs[0]["status"])} · {esc(jobs[0]["stage"])}'
+                     f' · {esc(jobs[0].get("error"))}</p>' if jobs else '') + '</section>')
     if not hardware.get("vram_mib"):
-        body = ('<section class="card">' + hardware_line + '</section>'
+        body = ('<section class="card">' + hardware_line + '</section>' + hybrid_box +
                 '<section class="card"><h2>CPU model choices</h2>'
                 '<p>No NVIDIA CUDA device was detected. GGUF can use an AMD or Intel Vulkan render device when available; '
                 'Safetensors uses the CPU runtime on this host. The installer offers CPU models according to detected RAM. '
@@ -3201,12 +3461,15 @@ def index(hardware, suggestions, installed, jobs, csrf, prefer_ablit=True,
         state = "Installed" if item["installed"] else "Installing" if item["id"] in installing else "Available"
         context = f'{item["context_tokens"]:,} tokens' if item.get("context_tokens") else "Unknown"
         context += " (configured)" if item["installed"] else " (target)"
+        download = f'{item["size_gb"]} GB'
+        if item.get("hybrid_used"):
+            download += f'<br>GPU + RAM; about {esc(item.get("ram_needed_gib"))} GiB RAM'
         disabled = " disabled" if state != "Available" else ""
         button_text = state if disabled else "Download and install"
         form = (f'<form method="post" action="/models/install"><input type="hidden" name="token" value="{esc(csrf)}">'
                 f'<input type="hidden" name="candidate" value="{esc(item["id"])}"><button type="submit"{disabled}>{esc(button_text)}</button></form>')
         rows.append(f'<tr><td>{number}</td><td><strong>{esc(item["name"])}</strong><br><a href="{esc(source)}" target="_blank" rel="noopener noreferrer">Hugging Face source</a></td>'
-                    f'<td>{esc(item["features"])}</td><td>{"Yes" if item["ablit"] else "No"}</td><td>{esc(item["size_gb"])} GB</td>'
+                    f'<td>{esc(item["features"])}</td><td>{"Yes" if item["ablit"] else "No"}</td><td>{download}</td>'
                     f'<td>{esc(estimate)}</td><td>{esc(context)}</td><td><strong>{esc(state)}</strong></td><td>{form}</td></tr>')
     installed_rows = []
     for item in installed:
@@ -3225,9 +3488,11 @@ def index(hardware, suggestions, installed, jobs, csrf, prefer_ablit=True,
     installing = installing | {job["candidate_id"] for job in jobs if job["status"] in ("queued", "running")}
     for number, item in enumerate(discovery.get("items", []), 1):
         required = item.get("min_engine_build") or 0
-        blocked = required and (engine.get("local_build") or 0) < required
+        blocked = (required and item.get("runtime", "gpu") == "gpu" and
+                   (engine.get("local_build") or 0) < required)
         state = ("Installed" if item.get("installed") else "Installing" if item["id"] in installing
-                 else f"Needs llama.cpp build {required}+" if blocked else "Untested engine compatibility")
+                 else f"Needs llama.cpp build {required}+" if blocked else
+                 "GPU + RAM estimate" if item.get("hybrid_used") else "Untested engine compatibility")
         disabled = " disabled" if item.get("installed") or item["id"] in installing or blocked else ""
         label = "Download and stage" if not disabled else state
         form = (f'<form method="post" action="/models/discovered/install"><input type="hidden" name="token" value="{esc(csrf)}">'
@@ -3266,11 +3531,11 @@ def index(hardware, suggestions, installed, jobs, csrf, prefer_ablit=True,
     refreshing = (refreshing or bool(media_installing) or discovery["status"] == "running"
                   or bool(engine.get("checking")) or bool(engine.get("busy")))
     comfy_link = f'<a href="{esc(comfy_url)}">Open ComfyUI</a>' if comfy_url else "Open ComfyUI from the switcher"
-    body = ('<div class="section-links" aria-label="Page sections"><a href="#specific-search">Search Hugging Face</a><a href="#text-models">Text and code</a><a href="#media-models">Image and video</a><a href="#discovered-models">Recent discoveries</a><a href="#installed-models">Installed</a></div>'
-            + search_section
+    body = ('<div class="section-links" aria-label="Page sections"><a href="#hybrid-memory">GPU + RAM</a><a href="#specific-search">Search Hugging Face</a><a href="#text-models">Text and code</a><a href="#media-models">Image and video</a><a href="#discovered-models">Recent discoveries</a><a href="#installed-models">Installed</a></div>'
+            + hybrid_box + search_section
             + '<div class="overview-grid"><section class="card" id="hardware">' + hardware_line + '</section><section class="card" id="engine">' + engine_box + '</section></div>'
-            + '<h2 id="text-models">Text and code models</h2><p class="note">Top 10 reviewed Hugging Face GGUF candidates, including already installed models. New downloads fit current GPU memory with a 4 GiB serving reserve and available disk. '
-              'Features describe intended use, not measured quality. Tokens/s is a broad estimate calibrated from completed short-prompt runs on this GPU; run a benchmark after installation. '
+            + '<h2 id="text-models">Text and code models</h2><p class="note">Top 10 reviewed Hugging Face GGUF candidates, including already installed models. New downloads use the selected GPU/RAM preference and available disk. '
+              'Features describe intended use, not measured quality. Tokens/s is a broad estimate calibrated from completed short-prompt runs on this GPU; RAM-assisted speeds have no comparable estimate. Run a benchmark after installation. '
               'Context is a conservative serving target chosen from GGUF weight size and detected VRAM, capped by the model family native limit; it is configured on installation and has not been load-tested at full length. '
               'Downloads verify the exact Hugging Face file size and SHA256. Installation does not activate the model. Text serving only; image input needs a separate projector.</p>'
             + f'<form method="get" action="/models"><label for="ablit">Abliterated model preference</label> '
@@ -3325,6 +3590,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from model_artifacts import artifact_sets, SAFE_PATH
+from hybrid_memory import memory_plan
 
 
 AUTHORS = ("bartowski", "unsloth", "mradermacher")
@@ -3416,7 +3682,7 @@ class CatalogDiscovery:
         db.row_factory = sqlite3.Row
         return db
 
-    def latest(self):
+    def latest(self, hardware=None):
         with self.connect() as db:
             row = db.execute("SELECT * FROM catalog_refreshes ORDER BY started_at DESC LIMIT 1").fetchone()
         if not row:
@@ -3429,9 +3695,12 @@ class CatalogDiscovery:
         for item in result["items"]:
             item["installed"] = (item["id"] in installed_ids
                                  or (item["repo"], item["sha256"]) in installed_files)
+            if hardware is not None:
+                item.update(memory_plan(hardware, item["size"], "gguf",
+                                        self.model_manager.hybrid_enabled()))
         return result
 
-    def latest_search(self):
+    def latest_search(self, hardware=None):
         with self.connect() as db:
             row = db.execute("SELECT * FROM model_searches ORDER BY started_at DESC, rowid DESC LIMIT 1").fetchone()
         if not row:
@@ -3441,6 +3710,9 @@ class CatalogDiscovery:
         installed = {(item["repo"], item["sha256"]) for item in self.model_manager.installed()}
         for item in result["items"]:
             item["installed"] = (item["repo"], item["sha256"]) in installed
+            if hardware is not None:
+                item.update(memory_plan(hardware, item["size"], item.get("format", "gguf"),
+                                        self.model_manager.hybrid_enabled()))
         return result
 
     def start_search(self, query):
@@ -3459,6 +3731,7 @@ class CatalogDiscovery:
     def _search(self, run_id, query):
         try:
             hardware = self.model_manager.hardware()
+            hybrid_enabled = self.model_manager.hybrid_enabled()
             if re.fullmatch(REPO_PATTERN, query):
                 repos = [{"id": query}]
             else:
@@ -3491,11 +3764,9 @@ class CatalogDiscovery:
                          "size": entry["size"], "size_gb": round(entry["size"] / 1e9, 1), "pipeline": pipeline,
                          "ablit": any(word in lower for word in ("abliterat", "uncensor", "unbound")),
                          "min_engine_build": minimum,
-                         "runtime": ("gpu" if hardware.get("gpu_provider") in (None, "nvidia") and hardware.get("vram_mib") and entry["size"] + 4 * 2**30 <= hardware["vram_mib"] * 2**20 else
-                                     "vulkan" if entry["format"].startswith("gguf") and hardware.get("gpu_provider") in ("amd", "intel") and hardware.get("render_devices") else "cpu"),
+                         **memory_plan(hardware, entry["size"], entry["format"], hybrid_enabled),
                          "disk_fits": entry["size"] * 1.2 <= hardware.get("disk_free_gib", 0) * 2**30,
-                         "fits": (entry["size"] + 4 * 2**30 <= (hardware.get("vram_mib") or 0) * 2**20 or
-                                  entry["size"] + 4 * 2**30 <= hardware.get("ram_gib", 0) * 2**30)}
+                         }
                         for entry in artifacts]
             with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
                 batches = list(pool.map(inspect, repos[:20]))
@@ -3557,8 +3828,8 @@ class CatalogDiscovery:
     def _refresh(self, run_id, query, hardware=None):
         try:
             hardware = hardware or self.model_manager.hardware()
-            vram_bytes = (hardware.get("vram_mib") or 0) * 2**20
             disk_bytes = hardware.get("disk_free_gib", 0) * 2**30
+            hybrid_enabled = self.model_manager.hybrid_enabled()
             summaries = []
             for author in AUTHORS:
                 params = {"author": author, "search": query or "GGUF",
@@ -3589,7 +3860,8 @@ class CatalogDiscovery:
                 if not selected:
                     return None
                 _, size, filename, digest = selected
-                if size + 4 * 2**30 > vram_bytes or size * 1.2 > disk_bytes:
+                plan = memory_plan(hardware, size, "gguf", hybrid_enabled)
+                if not plan["fits"] or plan["runtime"] == "cpu" or size * 1.2 > disk_bytes:
                     return None
                 lower = repo.lower()
                 minimum = max((build for family, build in MIN_ENGINE_BUILD.items() if family in lower), default=0)
@@ -3598,7 +3870,7 @@ class CatalogDiscovery:
                         "size": size, "size_gb": round(size / 1e9, 1),
                         "created_at": summary.get("createdAt"), "pipeline": summary.get("pipeline_tag") or "Unknown",
                         "ablit": any(word in lower for word in ("abliterat", "uncensor", "unbound")),
-                        "min_engine_build": minimum}
+                        "min_engine_build": minimum, **plan}
 
             # Inspect newest repos first. A search such as "Inkling" narrows this set.
             with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
@@ -4881,7 +5153,9 @@ class ParallelTuner:
                 docker_api("POST", "/containers/create?name=" + current["container"],
                            self.model_manager.serving_config(row["filename"], row["alias"],
                                                              row["context_tokens"], old["Image"], slots,
-                                                             row.get("runtime", "gpu"), row.get("format", "gguf")))
+                                                             row.get("runtime", "gpu"), row.get("format", "gguf"),
+                                                             cpu_offload_gb=row.get("cpu_offload_gb", 0),
+                                                             hybrid_enabled=bool(row.get("hybrid_enabled", 1))))
                 docker_api("POST", "/containers/" + current["container"] + "/start")
             self._job(job_id, stage="waiting for model readiness")
             if not self._wait_ready(current, slots, old_id):
@@ -5242,7 +5516,9 @@ class ContextTuner:
                 docker_api("POST", "/containers/create?name=" + current["container"],
                            self.model_manager.serving_config(row["filename"], row["alias"], tokens, old["Image"],
                                                              row["parallel_slots"], row.get("runtime", "gpu"),
-                                                             row.get("format", "gguf")))
+                                                             row.get("format", "gguf"),
+                                                             cpu_offload_gb=row.get("cpu_offload_gb", 0),
+                                                             hybrid_enabled=bool(row.get("hybrid_enabled", 1))))
                 docker_api("POST", "/containers/" + current["container"] + "/start")
             self._job(job_id, stage="waiting for model readiness")
             if not self._wait_ready(current, tokens, old_id):

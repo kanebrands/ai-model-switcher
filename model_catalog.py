@@ -16,6 +16,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from model_artifacts import artifact_sets, SAFE_PATH
+from hybrid_memory import memory_plan
 
 from benchmarks import MODELS, docker_api, docker_exec, docker_stream_text
 
@@ -134,6 +135,14 @@ class ModelManager:
                 db.execute("ALTER TABLE installed_models ADD COLUMN format TEXT NOT NULL DEFAULT 'gguf'")
             if "files_json" not in columns:
                 db.execute("ALTER TABLE installed_models ADD COLUMN files_json TEXT")
+            if "hybrid_enabled" not in columns:
+                db.execute("ALTER TABLE installed_models ADD COLUMN hybrid_enabled INTEGER NOT NULL DEFAULT 1")
+                db.execute("UPDATE installed_models SET hybrid_enabled=0 WHERE format='safetensors'")
+            if "cpu_offload_gb" not in columns:
+                db.execute("ALTER TABLE installed_models ADD COLUMN cpu_offload_gb INTEGER NOT NULL DEFAULT 0")
+            db.execute("""CREATE TABLE IF NOT EXISTS model_preferences (
+                id INTEGER PRIMARY KEY CHECK(id=1), hybrid_enabled INTEGER NOT NULL CHECK(hybrid_enabled IN (0,1)))""")
+            db.execute("INSERT OR IGNORE INTO model_preferences(id,hybrid_enabled) VALUES(1,1)")
             db.execute("""CREATE TABLE IF NOT EXISTS model_jobs (
                 id TEXT PRIMARY KEY, candidate_id TEXT NOT NULL, started_at TEXT NOT NULL,
                 ended_at TEXT, status TEXT NOT NULL, stage TEXT NOT NULL, error TEXT)""")
@@ -152,6 +161,22 @@ class ModelManager:
     def installed(self):
         with self.connect() as db:
             return [dict(row) for row in db.execute("SELECT * FROM installed_models ORDER BY installed_at DESC")]
+
+    def hybrid_enabled(self):
+        with self.connect() as db:
+            return bool(db.execute("SELECT hybrid_enabled FROM model_preferences WHERE id=1").fetchone()[0])
+
+    def set_hybrid_enabled(self, enabled):
+        if not isinstance(enabled, bool):
+            raise ValueError("Choose enabled or disabled")
+        with self.connect() as db:
+            db.execute("UPDATE model_preferences SET hybrid_enabled=? WHERE id=1", (int(enabled),))
+            # Refresh the recent-release shortlist under the new fit policy.
+            if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='catalog_refreshes'").fetchone():
+                db.execute("UPDATE catalog_refreshes SET hardware_fingerprint='' WHERE id=(SELECT id FROM catalog_refreshes ORDER BY started_at DESC LIMIT 1)")
+
+    def plan(self, hardware, size, model_format="gguf"):
+        return memory_plan(hardware, size, model_format, self.hybrid_enabled())
 
     def jobs(self):
         with self.connect() as db:
@@ -314,12 +339,13 @@ class ModelManager:
                 continue
             size = metadata["size"]
             vram = hardware["vram_mib"]
-            fits = bool(vram and size + 4 * 2**30 <= vram * 2**20)
+            plan = self.plan(hardware, size)
+            fits = plan["fits"] and plan["runtime"] == "gpu"
             if candidate["id"] not in installed and (not fits or size * 1.2 > hardware["disk_free_gib"] * 2**30):
                 continue
             comparable = [rate * (active / candidate["active_b"]) ** .35 for active, moe, rate in rates if moe == candidate["moe"]]
             estimate = None
-            if comparable:
+            if comparable and not plan["hybrid_used"]:
                 middle = statistics.median(comparable)
                 estimate = f"{max(1, round(middle * .55))}–{round(middle * 1.45)}"
             score = candidate["priority"] + (18 if prefer_ablit and candidate["ablit"] else 0)
@@ -327,6 +353,7 @@ class ModelManager:
             suggestions.append({**candidate, **metadata, "size_gb": round(size / 1e9, 1),
                                 "estimated_tps": estimate, "score": score,
                                 "installed": candidate["id"] in installed, "fits": fits,
+                                "hybrid_used": plan["hybrid_used"], "ram_needed_gib": plan["ram_needed_gib"],
                                 "context_tokens": (installed[candidate["id"]].get("context_tokens") or 32768)
                                     if candidate["id"] in installed else context_for_hardware(candidate, size, vram)})
         # Keep room for models the user can actually install. Installed models
@@ -345,8 +372,6 @@ class ModelManager:
             raise ValueError("Unknown catalog model")
         if candidate["id"] != candidate_id or not re.fullmatch(r"[a-z0-9-]{2,64}", candidate_id):
             raise ValueError("Invalid catalog candidate")
-        if candidate.get("runtime", "gpu") == "gpu" and candidate.get("min_engine_build", 0) and (engine_build or 0) < candidate["min_engine_build"]:
-            raise ValueError(f"This model requires llama.cpp build {candidate['min_engine_build']} or newer; update the engine first")
         with self.lock:
             if self.busy:
                 raise RuntimeError("A model download is already running")
@@ -360,9 +385,11 @@ class ModelManager:
             if any(item["repo"] == candidate["repo"] and item["sha256"] == metadata["sha256"] for item in installed):
                 raise ValueError("This model revision is already installed")
             hardware = self.hardware()
-            runtime = candidate.get("runtime", "gpu")
-            if runtime not in ("cpu", "gpu", "vulkan"):
-                raise ValueError("Unsupported runtime")
+            model_format = metadata.get("format", "gguf")
+            plan = self.plan(hardware, metadata["size"], model_format)
+            runtime = plan["runtime"]
+            if runtime == "gpu" and model_format.startswith("gguf") and candidate.get("min_engine_build", 0) and (engine_build or 0) < candidate["min_engine_build"]:
+                raise ValueError(f"This model requires llama.cpp build {candidate['min_engine_build']} or newer; update the engine first")
             if runtime == "gpu" and hardware.get("gpu_provider", "nvidia") != "nvidia":
                 raise ValueError("CUDA runtime requires an NVIDIA GPU")
             if runtime == "vulkan" and (metadata.get("format") == "safetensors" or
@@ -375,8 +402,8 @@ class ModelManager:
                                else hardware.get("ram_gib", 0) * 2**30)
             if runtime == "gpu" and not hardware.get("vram_mib"):
                 raise ValueError("No compatible GPU is available for this model")
-            if not allow_unfit and metadata["size"] + 4 * 2**30 > available_bytes:
-                raise ValueError("Estimated model memory exceeds available " + ("GPU memory" if runtime == "gpu" else "RAM") + "; select Try anyway to override")
+            if not allow_unfit and not plan["fits"]:
+                raise ValueError("Estimated model memory exceeds the available GPU/RAM budget; select Try anyway to override")
             if metadata["size"] * 1.2 > hardware["disk_free_gib"] * 2**30:
                 raise ValueError("Insufficient model storage")
             context_tokens = (context_for_hardware(candidate, metadata["size"], hardware.get("vram_mib"))
@@ -391,10 +418,110 @@ class ModelManager:
                 db.execute("INSERT INTO model_jobs(id,candidate_id,started_at,status,stage) VALUES(?,?,?,?,?)",
                            (job_id, candidate_id, now(), "queued", "queued"))
             self.busy = True
-            threading.Thread(target=self._install, args=(job_id, candidate, metadata, context_tokens, runtime, hardware), daemon=True).start()
+            threading.Thread(target=self._install, args=(job_id, candidate, metadata, context_tokens, runtime, hardware, plan), daemon=True).start()
             return job_id
 
-    def _install(self, job_id, candidate, metadata, context_tokens, runtime="gpu", hardware=None):
+    def start_reconfigure_hybrid(self, candidate_id, allow_unfit=False):
+        if not re.fullmatch(r"[a-z0-9-]{2,64}", candidate_id or ""):
+            raise ValueError("Invalid installed model")
+        with self.lock:
+            if self.busy:
+                raise RuntimeError("A model operation is already running")
+            row = next((item for item in self.installed() if item["candidate_id"] == candidate_id), None)
+            if not row:
+                raise ValueError("Model is not installed")
+            hardware = self.hardware()
+            plan = self.plan(hardware, row["size"], row.get("format", "gguf"))
+            if not plan["fits"] and not allow_unfit:
+                raise ValueError("Estimated model memory exceeds the available GPU/RAM budget; select Try anyway to override")
+            if (row.get("runtime") == plan["runtime"] and
+                    bool(row.get("hybrid_enabled", 1)) == plan["hybrid_enabled"] and
+                    row.get("cpu_offload_gb", 0) == plan["offload_gb"]):
+                raise ValueError("This model already uses the saved memory preference")
+            job_id = str(uuid.uuid4())
+            with self.connect() as db:
+                db.execute("INSERT INTO model_jobs(id,candidate_id,started_at,status,stage) VALUES(?,?,?,?,?)",
+                           (job_id, candidate_id, now(), "queued", "queued"))
+            self.busy = True
+            threading.Thread(target=self._reconfigure_hybrid,
+                             args=(job_id, row, plan, hardware), daemon=True).start()
+            return job_id
+
+    def _reconfigure_hybrid(self, job_id, row, plan, hardware):
+        name = row["container"]
+        backup = None
+        was_running = False
+        try:
+            self._job(job_id, status="running", stage="preparing engine")
+            image = self.runtime_image(row.get("format", "gguf"), plan["runtime"])
+            self._ensure_image(image)
+            old = docker_api("GET", "/containers/" + name + "/json")
+            was_running = bool(old["State"].get("Running"))
+            if was_running:
+                self._job(job_id, stage="stopping current model")
+                docker_api("POST", "/containers/" + name + "/stop?t=30")
+            backup_name = name + "-hybrid-rollback-" + job_id[:8]
+            docker_api("POST", "/containers/" + name + "/rename?name=" + backup_name)
+            backup = backup_name
+            config = self.serving_config(row["filename"], row["alias"], row["context_tokens"],
+                                         image=image, parallel_slots=row["parallel_slots"],
+                                         runtime=plan["runtime"], model_format=row.get("format", "gguf"),
+                                         hardware=hardware, cpu_offload_gb=plan["offload_gb"],
+                                         hybrid_enabled=plan["hybrid_enabled"])
+            docker_api("POST", "/containers/create?name=" + name, config)
+            if was_running:
+                self._job(job_id, stage="testing model readiness")
+                docker_api("POST", "/containers/" + name + "/start")
+                for _ in range(120):
+                    state = docker_api("GET", "/containers/" + name + "/json")["State"]
+                    if not state.get("Running"):
+                        raise RuntimeError("Model exited during memory change")
+                    try:
+                        request = urllib.request.Request("http://nginx:8080/v1/models",
+                                                         headers={"Authorization": "Bearer " + self.api_key})
+                        with urllib.request.urlopen(request, timeout=5) as response:
+                            models = json.load(response)
+                        if any(item.get("id") == row["alias"] for item in models.get("data", [])):
+                            break
+                    except (OSError, ValueError, KeyError):
+                        pass
+                    time.sleep(3)
+                else:
+                    raise RuntimeError("Model did not become ready with the new memory setting")
+            with self.connect() as db:
+                db.execute("UPDATE installed_models SET runtime=?,hybrid_enabled=?,cpu_offload_gb=? WHERE candidate_id=?",
+                           (plan["runtime"], int(plan["hybrid_enabled"]), plan["offload_gb"], row["candidate_id"]))
+            try:
+                docker_api("DELETE", "/containers/" + backup + "?force=1")
+            except RuntimeError:
+                pass
+            backup = None
+            self._job(job_id, status="completed", ended_at=now(),
+                      stage="memory setting tested and saved" if was_running else "memory setting saved; activate to test")
+        except Exception as exc:
+            self._job(job_id, stage="restoring previous memory setting")
+            try:
+                if backup:
+                    try:
+                        docker_api("DELETE", "/containers/" + name + "?force=1")
+                    except RuntimeError:
+                        pass
+                    docker_api("POST", "/containers/" + backup + "/rename?name=" + name)
+                    if was_running:
+                        docker_api("POST", "/containers/" + name + "/start")
+                elif was_running:
+                    docker_api("POST", "/containers/" + name + "/start")
+            except Exception as rollback_exc:
+                self._job(job_id, status="failed", ended_at=now(), stage="rollback failed",
+                          error=f"{type(exc).__name__}: {str(exc)[:120]}; rollback: {str(rollback_exc)[:120]}")
+            else:
+                self._job(job_id, status="failed", ended_at=now(), stage="previous setting restored",
+                          error=f"{type(exc).__name__}: {str(exc)[:250]}")
+        finally:
+            with self.lock:
+                self.busy = False
+
+    def _install(self, job_id, candidate, metadata, context_tokens, runtime="gpu", hardware=None, plan=None):
         downloader = None
         serving = None
         try:
@@ -462,11 +589,13 @@ class ModelManager:
             image = self.runtime_image(model_format, runtime)
             self._ensure_image(image)
             serving_config = self.serving_config(filename, alias, context_tokens, runtime=runtime,
-                                                 model_format=model_format, hardware=hardware)
+                                                 model_format=model_format, hardware=hardware,
+                                                 cpu_offload_gb=(plan or {}).get("offload_gb", 0),
+                                                 hybrid_enabled=(plan or {}).get("hybrid_enabled", True))
             serving = docker_api("POST", "/containers/create?name=" + container, serving_config)["Id"]
             with self.connect() as db:
-                db.execute("INSERT INTO installed_models(candidate_id,repo,filename,revision,sha256,size,installed_at,alias,container,context_tokens,runtime,format,files_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                           (candidate["id"], candidate["repo"], filename, metadata["revision"], metadata["sha256"], metadata["size"], now(), alias, container, context_tokens, runtime, model_format, json.dumps(files)))
+                db.execute("INSERT INTO installed_models(candidate_id,repo,filename,revision,sha256,size,installed_at,alias,container,context_tokens,runtime,format,files_json,hybrid_enabled,cpu_offload_gb) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                           (candidate["id"], candidate["repo"], filename, metadata["revision"], metadata["sha256"], metadata["size"], now(), alias, container, context_tokens, runtime, model_format, json.dumps(files), int((plan or {}).get("hybrid_enabled", True)), (plan or {}).get("offload_gb", 0)))
             MODELS["hf-" + candidate["id"]] = (alias, container)
             serving = None
             self._job(job_id, status="completed", stage="installed; ready to select", ended_at=now())
@@ -515,12 +644,15 @@ class ModelManager:
         return GGUF_IMAGE if runtime == "gpu" else VULKAN_GGUF_IMAGE if runtime == "vulkan" else CPU_GGUF_IMAGE
 
     def serving_config(self, filename, alias, context_tokens, image=None, parallel_slots=1,
-                       runtime="gpu", model_format="gguf", hardware=None):
+                       runtime="gpu", model_format="gguf", hardware=None, cpu_offload_gb=0,
+                       hybrid_enabled=True):
         image = image or self.runtime_image(model_format, runtime)
         if model_format == "safetensors":
             command = ["--model", "/models/" + filename, "--served-model-name", alias,
                        "--host", "0.0.0.0", "--port", "8000", "--max-model-len", str(context_tokens or 4096),
                        "--max-num-seqs", str(parallel_slots), "--load-format", "safetensors", "--api-key", self.api_key]
+            if runtime == "gpu" and hybrid_enabled and cpu_offload_gb:
+                command += ["--cpu-offload-gb", str(cpu_offload_gb)]
         else:
             command = ["--model", "/models/" + filename, "--alias", alias, "--host", "0.0.0.0", "--port", "8080",
                        "--ctx-size", str(context_tokens or 4096), "--parallel", str(parallel_slots)]
@@ -528,10 +660,13 @@ class ModelManager:
                 "RestartPolicy": {"Name": "unless-stopped"}}
         if runtime == "gpu":
             if model_format != "safetensors":
-                command += ["--n-gpu-layers", "auto", "--fit-target", "2048", "--flash-attn", "on"]
+                command += (["--n-gpu-layers", "auto", "--fit-target", "2048"] if hybrid_enabled else
+                            ["--n-gpu-layers", "all", "--fit", "off"])
+                command += ["--flash-attn", "on"]
             host["DeviceRequests"] = [{"Driver": "nvidia", "Count": 1, "Capabilities": [["gpu"]]}]
         elif runtime == "vulkan":
-            command += ["--n-gpu-layers", "auto", "--fit-target", "2048"]
+            command += (["--n-gpu-layers", "auto", "--fit-target", "2048"] if hybrid_enabled else
+                        ["--n-gpu-layers", "all", "--fit", "off"])
             devices = (hardware or self.hardware()).get("render_devices") or []
             host["Devices"] = [{"PathOnHost": device, "PathInContainer": device,
                                 "CgroupPermissions": "rwm"} for device in devices]
@@ -566,7 +701,9 @@ class ModelManager:
             docker_api("POST", "/containers/create?name=" + name,
                        self.serving_config(row["filename"], row["alias"], row["context_tokens"],
                                            parallel_slots=row["parallel_slots"], runtime=row.get("runtime", "gpu"),
-                                           model_format=row.get("format", "gguf")))
+                                           model_format=row.get("format", "gguf"),
+                                           cpu_offload_gb=row.get("cpu_offload_gb", 0),
+                                           hybrid_enabled=bool(row.get("hybrid_enabled", 1))))
         except Exception:
             docker_api("POST", "/containers/" + backup + "/rename?name=" + name)
             raise
