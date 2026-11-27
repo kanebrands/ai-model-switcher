@@ -507,7 +507,7 @@ class Handler(BaseHTTPRequestHandler):
                 elif running(VISION):
                     backend = "vision:8000"
                 else:
-                    backend = next((item["container"] + ":8080" for item in MODEL_MANAGER.installed()
+                    backend = next((item["container"] + (":8000" if item.get("format") == "safetensors" else ":8080") for item in MODEL_MANAGER.installed()
                                     if running(item["container"])), "llm:8000")
             except Exception:
                 self.send_error(503, "Docker status unavailable")

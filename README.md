@@ -2,7 +2,7 @@
 
 An all-in-one Ubuntu 24.04 installation for local AI. It runs an OpenAI-compatible LLM API, Open WebUI, and a browser-based model switcher behind Nginx. On compatible NVIDIA hardware, selected GPU models and ComfyUI are available too. The switcher manages model selection, hardware-aware recommendations, benchmark history, context and generation-slot tuning, client limits, and live GPU metrics when a GPU is available.
 
-No GPU is required. The installer measures host RAM and, when present, NVIDIA VRAM and CUDA compatibility. It offers only matching CPU and GPU workload choices. It downloads no model until you select one or more at the installation prompt; at least one text or vision model is required. ComfyUI is optional and its image/video model files are chosen separately later.
+No GPU is required. The installer measures host RAM and, when present, NVIDIA VRAM and CUDA compatibility. It offers CPU and compatible NVIDIA workload choices; AMD and Intel owners can add GGUF models through the switcher's Vulkan path after installation. It downloads no model until you select one or more at the installation prompt; at least one text or vision model is required. ComfyUI is optional and its image/video model files are chosen separately later.
 
 ## Quick start
 
@@ -26,7 +26,7 @@ The script prints the URLs when ready. With the default ports, substitute your U
 
 The switcher and ComfyUI use HTTP Basic authentication. The username is `operator`; get the generated password from the installed controller with `~/ai_setup/ai-control.sh switch-password`. Get the existing API key with `~/ai_setup/ai-control.sh key`. The switcher can create separate, revocable keys for individual agents under **Client sharing**.
 
-The switcher's **Find models** page can search Hugging Face by model name, repository ID, or repository URL across publishers. It shows verified standalone GGUF quantizations and installs the selected file into a stopped llama.cpp container. It chooses the GPU runtime when the weights fit VRAM and otherwise offers CPU inference. A model that exceeds the memory estimate requires an explicit **Try anyway** choice; insufficient disk space remains a hard stop. This search does not install sharded GGUF, projector files, gated repositories, or non-GGUF formats.
+The switcher's **Find models** page searches public Hugging Face repositories across publishers. It offers single GGUF files, complete GGUF shard sets, and Safetensors repositories with standard configuration and tokenizer files. GGUF runs through llama.cpp on NVIDIA CUDA, AMD/Intel Vulkan when a render device is available, or CPU. Safetensors runs through vLLM on NVIDIA CUDA or CPU. The selected model is staged and checksum-verified before a stopped serving container is created. **Try anyway** overrides the memory estimate only; disk capacity, file integrity, and engine compatibility remain required. Gated repositories and separate vision projector files are excluded. Model-specific custom Python code is not enabled.
 
 ## What is in this repository
 
@@ -41,4 +41,4 @@ For installation details, storage locations, and upgrades, see [Installation](do
 
 ## Project state
 
-The earlier GPU stack was verified on one Ubuntu 24.04 host with a single RTX 3090. The new CPU-only and multi-selection paths have automated tests but have not yet been run end to end on a separate Ubuntu host. CI checks syntax, installer generation, and unit/integration tests without a GPU. Model download, driver installation, and real workload changes still need host-level verification.
+The earlier GPU stack was verified on one Ubuntu 24.04 host with a single RTX 3090. CPU, AMD Vulkan, Intel Vulkan, and vLLM Safetensors paths have automated tests but still need end-to-end tests on representative hardware. Model architecture compatibility is checked when the serving engine loads; a complete repository does not guarantee that vLLM supports its architecture. CI checks syntax, installer generation, and unit/integration tests without a GPU.

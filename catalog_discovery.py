@@ -9,6 +9,7 @@ import threading
 import urllib.parse
 import urllib.request
 import uuid
+from model_artifacts import artifact_sets, SAFE_PATH
 
 
 AUTHORS = ("bartowski", "unsloth", "mradermacher")
@@ -167,16 +168,20 @@ class CatalogDiscovery:
                     return []
                 lower = repo.lower()
                 minimum = max((build for family, build in MIN_ENGINE_BUILD.items() if family in lower), default=0)
-                return [{"id": candidate_id(repo, filename), "name": repo.split("/", 1)[1],
-                         "repo": repo, "file": filename, "revision": info["sha"], "sha256": digest,
-                         "size": size, "size_gb": round(size / 1e9, 1), "pipeline": pipeline,
+                artifacts = artifact_sets(info.get("siblings", []), info.get("config"))
+                return [{"id": candidate_id(repo, entry["file"]), "name": repo.split("/", 1)[1],
+                         "repo": repo, "file": entry["file"], "files": entry["files"],
+                         "format": entry["format"], "quantization": entry.get("quantization", ""),
+                         "revision": info["sha"], "sha256": entry["sha256"],
+                         "size": entry["size"], "size_gb": round(entry["size"] / 1e9, 1), "pipeline": pipeline,
                          "ablit": any(word in lower for word in ("abliterat", "uncensor", "unbound")),
                          "min_engine_build": minimum,
-                         "runtime": "gpu" if hardware.get("vram_mib") and size + 4 * 2**30 <= hardware["vram_mib"] * 2**20 else "cpu",
-                         "disk_fits": size * 1.2 <= hardware.get("disk_free_gib", 0) * 2**30,
-                         "fits": (size + 4 * 2**30 <= (hardware.get("vram_mib") or 0) * 2**20 or
-                                  size + 4 * 2**30 <= hardware.get("ram_gib", 0) * 2**30)}
-                        for filename, size, digest in verified_ggufs(info.get("siblings", []))]
+                         "runtime": ("gpu" if hardware.get("gpu_provider") in (None, "nvidia") and hardware.get("vram_mib") and entry["size"] + 4 * 2**30 <= hardware["vram_mib"] * 2**20 else
+                                     "vulkan" if entry["format"].startswith("gguf") and hardware.get("gpu_provider") in ("amd", "intel") and hardware.get("render_devices") else "cpu"),
+                         "disk_fits": entry["size"] * 1.2 <= hardware.get("disk_free_gib", 0) * 2**30,
+                         "fits": (entry["size"] + 4 * 2**30 <= (hardware.get("vram_mib") or 0) * 2**20 or
+                                  entry["size"] + 4 * 2**30 <= hardware.get("ram_gib", 0) * 2**30)}
+                        for entry in artifacts]
             with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
                 batches = list(pool.map(inspect, repos[:20]))
             items = [item for batch in batches for item in batch]
@@ -306,7 +311,8 @@ class CatalogDiscovery:
         if not item or item["installed"]:
             return None
         if (not re.fullmatch(REPO_PATTERN, item["repo"]) or
-                not re.fullmatch(r"[A-Za-z0-9_.-]+\.gguf", item["file"], re.I) or
+                not (SAFE_PATH.fullmatch(item["file"]) and item["file"].lower().endswith(".gguf") or
+                     item.get("format") == "safetensors" and item["file"] == "config.json") or
                 candidate_id(item["repo"], item["file"]) != item["id"]):
             return None
-        return {**item, "active_b": 0, "moe": False, "features": "New GGUF; capabilities unverified", "priority": 0}
+        return {**item, "active_b": 0, "moe": False, "features": "Model capabilities unverified", "priority": 0}

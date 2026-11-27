@@ -211,7 +211,8 @@ class ContextTuner:
                 backup = backup_name
                 docker_api("POST", "/containers/create?name=" + current["container"],
                            self.model_manager.serving_config(row["filename"], row["alias"], tokens, old["Image"],
-                                                             row["parallel_slots"], row.get("runtime", "gpu")))
+                                                             row["parallel_slots"], row.get("runtime", "gpu"),
+                                                             row.get("format", "gguf")))
                 docker_api("POST", "/containers/" + current["container"] + "/start")
             self._job(job_id, stage="waiting for model readiness")
             if not self._wait_ready(current, tokens, old_id):

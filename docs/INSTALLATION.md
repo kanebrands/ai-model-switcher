@@ -39,7 +39,7 @@ The installer creates `.env` in the installation root and generates credentials.
 | Data | Default host path |
 | --- | --- |
 | Compose stack and controller | `~/ai_setup` |
-| Hugging Face cache and GGUF files | `~/ai_models/huggingface` and `~/ai_models/huggingface/gguf` |
+| Hugging Face cache and switcher-installed model files | `~/ai_models/huggingface` and `~/ai_models/huggingface/gguf` (including GGUF shard folders and Safetensors snapshots) |
 | ComfyUI models, inputs, outputs, user data | `~/ai_media` |
 | Benchmark and switcher database | `~/ai_setup/gpu_control/results/benchmarks.sqlite3` |
 | Open WebUI data | Docker volume `local-ai_webui_data` |

@@ -470,8 +470,10 @@ services:
       - ./gpu_control/benchmarks.py:/app/benchmarks.py:ro
       - ./gpu_control/benchmark_views.py:/app/benchmark_views.py:ro
       - ./gpu_control/model_catalog.py:/app/model_catalog.py:ro
+      - ./gpu_control/model_artifacts.py:/app/model_artifacts.py:ro
       - ./gpu_control/model_views.py:/app/model_views.py:ro
       - ./gpu_control/catalog_discovery.py:/app/catalog_discovery.py:ro
+      - /sys:/host_sys:ro
       - ./gpu_control/engine_updates.py:/app/engine_updates.py:ro
       - ./gpu_control/webui_updates.py:/app/webui_updates.py:ro
       - ./gpu_control/context_tuning.py:/app/context_tuning.py:ro

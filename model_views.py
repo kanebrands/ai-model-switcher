@@ -16,7 +16,8 @@ def specific_search_section(search, installed, jobs, csrf, engine=None):
     rows = []
     for item in search["items"]:
         installed_here = item.get("installed") or (item["repo"], item["sha256"]) in installed_files
-        needs_engine = (item.get("runtime") == "gpu" and item.get("min_engine_build", 0) > engine_build)
+        needs_engine = (item.get("runtime") == "gpu" and item.get("format", "gguf").startswith("gguf") and
+                        item.get("min_engine_build", 0) > engine_build)
         busy = item["id"] in installing
         fit = bool(item.get("fits"))
         disk_fits = item.get("disk_fits", True)
@@ -31,32 +32,41 @@ def specific_search_section(search, installed, jobs, csrf, engine=None):
                   f'<input type="hidden" name="token" value="{esc(csrf)}">'
                   f'<input type="hidden" name="candidate" value="{esc(item["id"])}">'
                   f'{override}<button type="submit"{disabled}>{"Install" if not installed_here else "Installed"}</button></form>')
+        variant = (item.get("format") or "gguf").upper()
+        if item.get("quantization"):
+            variant += " / " + item["quantization"].upper()
+        file_label = item["file"] + (f' ({len(item["files"])} files)' if len(item.get("files", [])) > 1 else "")
         rows.append(f'<tr><td><a href="https://huggingface.co/{esc(item["repo"])}" target="_blank" rel="noopener noreferrer">'
-                    f'{esc(item["repo"])}</a></td><td>{esc(item["file"])}</td><td>{esc(item["size_gb"])} GB</td>'
+                    f'{esc(item["repo"])}</a></td><td>{esc(variant)}<br>{esc(file_label)}</td><td>{esc(item["size_gb"])} GB</td>'
                     f'<td>{esc(item.get("runtime", "gpu").upper())}</td><td>{esc(state)}</td><td>{action}</td></tr>')
     status = esc(search["status"])
     if search.get("error"):
         status += ': ' + esc(search["error"])
     if search["status"] == "completed" and not rows:
-        status += ' — no verified standalone GGUF files found. Gated repositories and sharded files are not supported by this installer.'
+        status += ' — no complete GGUF or supported Safetensors file sets found. Gated repositories are not supported.'
     installed_rows = ''.join(f'<tr><td>{esc(item["alias"])}</td><td>{esc(item["repo"])}</td>'
-                             f'<td>{esc(item.get("runtime", "gpu").upper())}</td></tr>' for item in installed)
+                             f'<td>{esc(item.get("format", "gguf").upper())} / {esc(item.get("runtime", "gpu").upper())}</td>'
+                             f'<td><form method="post" action="/switch"><input type="hidden" name="token" value="{esc(csrf)}">'
+                             f'<button name="mode" value="hf-{esc(item["candidate_id"])}">Activate</button></form></td></tr>' for item in installed)
     return (f'<section class="card" id="specific-search"><h2>Search a specific Hugging Face model</h2>'
             '<p>Search by model name, exact owner/repository ID, or a Hugging Face repository URL. '
-            'Searches any publisher and lists verified single-file GGUF variants, including other quantizations. '
+            'Searches any publisher and lists complete GGUF shard sets, single-file GGUF, and Safetensors repositories with standard tokenizer and configuration files. '
             'A model is downloaded only after you choose Install. The initial memory check reserves 4 GiB for serving; '
             'you can explicitly try a model that exceeds this estimate. Disk capacity and SHA256 verification still apply. '
-            'CPU fallback is available when GPU memory is insufficient. Loading, context, and speed are unverified until the model runs. '
-            'Gated models, sharded GGUF files, projector files, and non-GGUF formats are not supported by this search.</p>'
+            'NVIDIA uses CUDA, AMD and Intel use Vulkan for GGUF where render devices are available, and CPU inference remains available. '
+            'Safetensors uses vLLM on NVIDIA or CPU; AWQ and GPTQ support depends on the engine and model architecture. '
+            'Loading, context, and speed are unverified until the model runs. Try anyway overrides the memory estimate only; '
+            'it cannot make an unsupported engine or missing files work. Gated models and projector files are excluded. '
+            'Safetensors model code is not executed with trust_remote_code.</p>'
             f'<form method="post" action="/models/search"><input type="hidden" name="token" value="{esc(csrf)}">'
             f'<label for="specific-model">Model or repository</label> <input id="specific-model" type="text" name="query" '
             f'maxlength="200" required value="{esc(search.get("query") or "")}" placeholder="owner/model-GGUF or model name"> '
             '<button type="submit">Search Hugging Face</button></form>'
             f'<p role="status">Search: {status}</p>'
-            '<div class="scroll"><table><thead><tr><th>Repository</th><th>GGUF variant</th><th>Size</th><th>Runtime</th><th>Fit/status</th><th>Action</th></tr></thead>'
+            '<div class="scroll"><table><thead><tr><th>Repository</th><th>Variant</th><th>Size</th><th>Runtime</th><th>Fit/status</th><th>Action</th></tr></thead>'
             f'<tbody>{"".join(rows) if rows else "<tr><td colspan=6>No search results yet.</td></tr>"}</tbody></table></div>'
-            '<h3>Installed Hugging Face models</h3><div class="scroll"><table><tr><th>API name</th><th>Repository</th><th>Runtime</th></tr>'
-            f'{installed_rows if installed_rows else "<tr><td colspan=3>None yet.</td></tr>"}</table></div></section>')
+            '<h3>Installed Hugging Face models</h3><div class="scroll"><table><tr><th>API name</th><th>Repository</th><th>Engine</th><th>Action</th></tr>'
+            f'{installed_rows if installed_rows else "<tr><td colspan=4>None yet.</td></tr>"}</table></div></section>')
 
 
 def index(hardware, suggestions, installed, jobs, csrf, prefer_ablit=True,
@@ -78,7 +88,8 @@ def index(hardware, suggestions, installed, jobs, csrf, prefer_ablit=True,
     if not hardware.get("vram_mib"):
         body = ('<section class="card">' + hardware_line + '</section>'
                 '<section class="card"><h2>CPU model choices</h2>'
-                '<p>The current installation has no compatible NVIDIA GPU. The installer offers CPU models according to detected RAM. '
+                '<p>No NVIDIA CUDA device was detected. GGUF can use an AMD or Intel Vulkan render device when available; '
+                'Safetensors uses the CPU runtime on this host. The installer offers CPU models according to detected RAM. '
                 'Installed choices are available on the switcher home page. To change the selection, rerun the installer with '
                 '<code>AI_MODEL_SELECTION=cpu-tiny,cpu-4b</code> after checking which choices fit this host. '
                 'The GPU catalog and engine updates appear when a supported GPU is detected and the installer is rerun.</p></section>'

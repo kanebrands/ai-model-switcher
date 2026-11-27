@@ -73,6 +73,7 @@ for target, marker, file in (
     ("gpu_control/benchmarks.py", "BENCHMARK_RUNNER", "benchmarks.py"),
     ("gpu_control/benchmark_views.py", "BENCHMARK_VIEWS", "benchmark_views.py"),
     ("gpu_control/model_catalog.py", "MODEL_CATALOG", "model_catalog.py"),
+    ("gpu_control/model_artifacts.py", "MODEL_ARTIFACTS", "model_artifacts.py"),
     ("gpu_control/model_views.py", "MODEL_VIEWS", "model_views.py"),
     ("gpu_control/catalog_discovery.py", "CATALOG_DISCOVERY", "catalog_discovery.py"),
     ("gpu_control/engine_updates.py", "ENGINE_UPDATES", "engine_updates.py"),
@@ -111,7 +112,7 @@ fi
 if [[ -d "$INSTALL_DIR/gpu_control/assets" && ! -w "$INSTALL_DIR/gpu_control/assets" ]]; then
   sudo chown "$(id -u):$(id -g)" "$INSTALL_DIR/gpu_control/assets"
 fi
-for generated in docker-compose.yml gpu_control/server.py gpu_control/benchmarks.py gpu_control/benchmark_views.py gpu_control/model_catalog.py gpu_control/model_views.py gpu_control/catalog_discovery.py gpu_control/engine_updates.py gpu_control/webui_updates.py gpu_control/sharing.py gpu_control/sharing_views.py gpu_control/fairness_gateway.py gpu_control/gpu_metrics.py gpu_control/parallel_tuning.py gpu_control/install_profile.py gpu_control/install_models.sh gpu_control/context_tuning.py gpu_control/update-engine.sh gpu_control/update-webui.sh gpu_control/tune-parallel.sh gpu_control/tune-context.sh gpu_control/media_catalog.py gpu_control/assets/gpu-workstation.webp ai-control.sh start-selected.sh; do
+for generated in docker-compose.yml gpu_control/server.py gpu_control/benchmarks.py gpu_control/benchmark_views.py gpu_control/model_catalog.py gpu_control/model_artifacts.py gpu_control/model_views.py gpu_control/catalog_discovery.py gpu_control/engine_updates.py gpu_control/webui_updates.py gpu_control/sharing.py gpu_control/sharing_views.py gpu_control/fairness_gateway.py gpu_control/gpu_metrics.py gpu_control/parallel_tuning.py gpu_control/install_profile.py gpu_control/install_models.sh gpu_control/context_tuning.py gpu_control/update-engine.sh gpu_control/update-webui.sh gpu_control/tune-parallel.sh gpu_control/tune-context.sh gpu_control/media_catalog.py gpu_control/assets/gpu-workstation.webp ai-control.sh start-selected.sh; do
   if [[ -e "$INSTALL_DIR/$generated" && ! -w "$INSTALL_DIR/$generated" ]]; then
     sudo chown "$(id -u):$(id -g)" "$INSTALL_DIR/$generated"
   fi

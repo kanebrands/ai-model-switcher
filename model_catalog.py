@@ -4,6 +4,7 @@ import datetime as dt
 import hashlib
 import json
 import os
+import platform
 import re
 import shutil
 import sqlite3
@@ -14,6 +15,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from model_artifacts import artifact_sets, SAFE_PATH
 
 from benchmarks import MODELS, docker_api, docker_exec, docker_stream_text
 
@@ -41,16 +43,21 @@ REFERENCE_ACTIVE_B = {"local-coder": (3, True), "local-qwen4b": (4, False),
                       "local-qwen38-ablit": (3, True), "local-gemma4-ablit": (4, True)}
 GGUF_IMAGE = "ghcr.io/ggml-org/llama.cpp:server-cuda13"
 CPU_GGUF_IMAGE = "ghcr.io/ggml-org/llama.cpp:server"
+VULKAN_GGUF_IMAGE = "ghcr.io/ggml-org/llama.cpp:server-vulkan"
+VLLM_CUDA_IMAGE = "vllm/vllm-openai:latest"
+VLLM_CPU_IMAGE = "vllm/vllm-openai-cpu:latest-x86_64"
 DOWNLOAD_IMAGE = "python:3.12-alpine"
-DOWNLOAD_SCRIPT = """import pathlib, sys, urllib.request
-url, target = sys.argv[1:]
-path = pathlib.Path(target)
-path.parent.mkdir(parents=True, exist_ok=True)
-request = urllib.request.Request(url, headers={"User-Agent": "local-ai-model-switcher/2"})
-with urllib.request.urlopen(request, timeout=60) as response, path.open("wb") as output:
-    while chunk := response.read(4 * 1024 * 1024):
-        output.write(chunk)
-print("Downloaded", path.name, path.stat().st_size, "bytes")
+DOWNLOAD_SCRIPT = """import json, pathlib, sys, urllib.parse, urllib.request
+base, target, manifest = sys.argv[1:]
+for item in json.loads(manifest):
+    path = pathlib.Path(target) / item['path']
+    path.parent.mkdir(parents=True, exist_ok=True)
+    url = base + '/' + urllib.parse.quote(item['path'], safe='/')
+    request = urllib.request.Request(url, headers={'User-Agent': 'local-ai-model-switcher/2'})
+    with urllib.request.urlopen(request, timeout=90) as response, path.open('wb') as output:
+        while chunk := response.read(4 * 1024 * 1024):
+            output.write(chunk)
+    print('Downloaded', item['path'], path.stat().st_size, 'bytes', flush=True)
 """
 NATIVE_CONTEXT = {"gpt-oss-20b": 131072}
 DEFAULT_NATIVE_CONTEXT = 262144  # Qwen3.5 and Gemma 4 catalog families
@@ -78,6 +85,12 @@ def hub_metadata(candidate):
         info = json.load(response)
     if info.get("gated") or not re.fullmatch(r"[0-9a-f]{40}", info.get("sha", "")):
         raise ValueError("Repository is gated or missing a commit hash")
+    if candidate.get("format") in ("gguf", "gguf-sharded", "safetensors"):
+        entry = next((item for item in artifact_sets(info.get("siblings", []), info.get("config"))
+                      if item["format"] == candidate["format"] and item["file"] == candidate["file"]), None)
+        if not entry:
+            raise ValueError("Selected model file set is incomplete or changed on Hugging Face")
+        return {**entry, "revision": info["sha"]}
     blob = next((file for file in info.get("siblings", []) if file.get("rfilename") == candidate["file"]), None)
     if not blob:
         raise ValueError("Selected GGUF is unavailable on Hugging Face")
@@ -85,7 +98,8 @@ def hub_metadata(candidate):
     digest = (blob.get("lfs") or {}).get("sha256")
     if not isinstance(size, int) or not 100_000_000 < size < 100_000_000_000 or not re.fullmatch(r"[0-9a-f]{64}", digest or ""):
         raise ValueError("Hugging Face did not return verified GGUF size and SHA256")
-    return {"revision": info["sha"], "size": size, "sha256": digest}
+    return {"revision": info["sha"], "size": size, "sha256": digest,
+            "format": "gguf", "files": [{"path": candidate["file"], "size": size, "sha256": digest}]}
 
 
 class ModelManager:
@@ -116,6 +130,10 @@ class ModelManager:
                 db.execute("ALTER TABLE installed_models ADD COLUMN parallel_slots INTEGER NOT NULL DEFAULT 1")
             if "runtime" not in columns:
                 db.execute("ALTER TABLE installed_models ADD COLUMN runtime TEXT NOT NULL DEFAULT 'gpu'")
+            if "format" not in columns:
+                db.execute("ALTER TABLE installed_models ADD COLUMN format TEXT NOT NULL DEFAULT 'gguf'")
+            if "files_json" not in columns:
+                db.execute("ALTER TABLE installed_models ADD COLUMN files_json TEXT")
             db.execute("""CREATE TABLE IF NOT EXISTS model_jobs (
                 id TEXT PRIMARY KEY, candidate_id TEXT NOT NULL, started_at TEXT NOT NULL,
                 ended_at TEXT, status TEXT NOT NULL, stage TEXT NOT NULL, error TEXT)""")
@@ -192,13 +210,35 @@ class ModelManager:
                 vram_mib = int(vram)
             except (ValueError, IndexError):
                 gpu_name, vram_mib, gpu_uuid = None, None, None
+        provider = "nvidia" if gpu_name else None
+        render_devices = []
+        drm_root = "/host_sys/class/drm"
+        for entry in sorted(os.listdir(drm_root)) if os.path.isdir(drm_root) else []:
+            if not re.fullmatch(r"renderD\d+", entry):
+                continue
+            try:
+                with open(f"{drm_root}/{entry}/device/vendor", encoding="ascii") as stream:
+                    vendor = stream.read().strip().lower()
+            except OSError:
+                continue
+            if vendor in ("0x1002", "0x8086"):
+                render_devices.append("/dev/dri/" + entry)
+                if not provider:
+                    provider = "amd" if vendor == "0x1002" else "intel"
+                    gpu_name = ("AMD" if provider == "amd" else "Intel") + " GPU (Vulkan)"
+                    try:
+                        with open(f"{drm_root}/{entry}/device/mem_info_vram_total", encoding="ascii") as stream:
+                            vram_mib = int(stream.read().strip()) // 2**20
+                    except (OSError, ValueError):
+                        pass
         cpu_model = None
         try:
             with open("/proc/cpuinfo", encoding="utf-8") as stream:
                 cpu_model = next((line.split(":", 1)[1].strip() for line in stream if line.startswith("model name")), None)
         except OSError:
             pass
-        signature = {"gpu": gpu_name, "gpu_uuid": gpu_uuid, "vram_mib": vram_mib,
+        signature = {"gpu": gpu_name, "gpu_uuid": gpu_uuid, "gpu_provider": provider,
+                     "render_devices": render_devices, "vram_mib": vram_mib,
                      "ram_bytes": ram, "cpu_model": cpu_model, "cpu_threads": info.get("NCPU")}
         fingerprint = hashlib.sha256(json.dumps(signature, sort_keys=True).encode()).hexdigest()[:16]
         with self.connect() as db:
@@ -207,7 +247,8 @@ class ModelManager:
             db.execute("INSERT INTO hardware_state(id,fingerprint,changed_at) VALUES(1,?,?) "
                        "ON CONFLICT(id) DO UPDATE SET fingerprint=excluded.fingerprint,changed_at=excluded.changed_at",
                        (fingerprint, changed_at))
-        return {"gpu": gpu_name, "gpu_uuid": gpu_uuid, "vram_mib": vram_mib,
+        return {"gpu": gpu_name, "gpu_uuid": gpu_uuid, "gpu_provider": provider,
+                "render_devices": render_devices, "vram_mib": vram_mib,
                 "cpu_model": cpu_model, "cpu_threads": info.get("NCPU"),
                 "ram_gib": round(ram / 2**30, 1), "fingerprint": fingerprint,
                 "changed_at": changed_at, "checked_at": now()}
@@ -317,12 +358,20 @@ class ModelManager:
                     candidate.get("sha256") and candidate["sha256"] != metadata["sha256"]):
                 raise ValueError("Model changed since the search; search again before installing")
             if any(item["repo"] == candidate["repo"] and item["sha256"] == metadata["sha256"] for item in installed):
-                raise ValueError("This GGUF file is already installed")
+                raise ValueError("This model revision is already installed")
             hardware = self.hardware()
             runtime = candidate.get("runtime", "gpu")
-            if runtime not in ("cpu", "gpu"):
+            if runtime not in ("cpu", "gpu", "vulkan"):
                 raise ValueError("Unsupported runtime")
-            available_bytes = ((hardware.get("vram_mib") or 0) * 2**20 if runtime == "gpu"
+            if runtime == "gpu" and hardware.get("gpu_provider", "nvidia") != "nvidia":
+                raise ValueError("CUDA runtime requires an NVIDIA GPU")
+            if runtime == "vulkan" and (metadata.get("format") == "safetensors" or
+                                        hardware.get("gpu_provider") not in ("amd", "intel") or
+                                        not hardware.get("render_devices")):
+                raise ValueError("Vulkan GGUF runtime requires an available AMD or Intel render device")
+            if metadata.get("format") == "safetensors" and metadata.get("quantization") in ("awq", "gptq") and runtime == "gpu" and hardware.get("gpu_provider", "nvidia") != "nvidia":
+                raise ValueError("This quantization is not supported on the detected GPU")
+            available_bytes = ((hardware.get("vram_mib") or 0) * 2**20 if runtime == "gpu" and hardware.get("vram_mib")
                                else hardware.get("ram_gib", 0) * 2**30)
             if runtime == "gpu" and not hardware.get("vram_mib"):
                 raise ValueError("No compatible GPU is available for this model")
@@ -330,8 +379,8 @@ class ModelManager:
                 raise ValueError("Estimated model memory exceeds available " + ("GPU memory" if runtime == "gpu" else "RAM") + "; select Try anyway to override")
             if metadata["size"] * 1.2 > hardware["disk_free_gib"] * 2**30:
                 raise ValueError("Insufficient model storage")
-            context_tokens = (context_for_hardware(candidate, metadata["size"], hardware["vram_mib"])
-                              if runtime == "gpu" else
+            context_tokens = (context_for_hardware(candidate, metadata["size"], hardware.get("vram_mib"))
+                              if runtime == "gpu" and hardware.get("vram_mib") else
                               min(16384 if available_bytes - metadata["size"] >= 16 * 2**30 else
                                   8192 if available_bytes - metadata["size"] >= 8 * 2**30 else 4096,
                                   NATIVE_CONTEXT.get(candidate_id, DEFAULT_NATIVE_CONTEXT)))
@@ -342,69 +391,82 @@ class ModelManager:
                 db.execute("INSERT INTO model_jobs(id,candidate_id,started_at,status,stage) VALUES(?,?,?,?,?)",
                            (job_id, candidate_id, now(), "queued", "queued"))
             self.busy = True
-            threading.Thread(target=self._install, args=(job_id, candidate, metadata, context_tokens, runtime), daemon=True).start()
+            threading.Thread(target=self._install, args=(job_id, candidate, metadata, context_tokens, runtime, hardware), daemon=True).start()
             return job_id
 
-    def _install(self, job_id, candidate, metadata, context_tokens, runtime="gpu"):
+    def _install(self, job_id, candidate, metadata, context_tokens, runtime="gpu", hardware=None):
         downloader = None
         serving = None
         try:
             self._job(job_id, status="running", stage="downloading")
             name = "local-ai-hf-download-" + job_id[:12]
             stage_dir = ".catalog_downloads/" + candidate["id"]
+            files = metadata.get("files") or [{"path": candidate["file"], "size": metadata["size"], "sha256": metadata["sha256"]}]
+            if not files or any(not SAFE_PATH.fullmatch(item["path"]) or ".." in item["path"].split("/") for item in files):
+                raise ValueError("Unsafe model file set")
             source_url = ("https://huggingface.co/" + urllib.parse.quote(candidate["repo"], safe="/") +
-                          "/resolve/" + metadata["revision"] + "/" + urllib.parse.quote(candidate["file"], safe=""))
+                          "/resolve/" + metadata["revision"])
             config = {"Image": DOWNLOAD_IMAGE, "Cmd": ["python", "-c", DOWNLOAD_SCRIPT, source_url,
-                      "/models/" + stage_dir + "/" + candidate["file"]],
+                      "/models/" + stage_dir, json.dumps(files)],
                       "HostConfig": {"Binds": [self.host_dir + ":/models"], "NetworkMode": "bridge", "Memory": 512 * 2**20}}
             downloader = docker_api("POST", "/containers/create?name=" + name, config)["Id"]
             docker_api("POST", f"/containers/{downloader}/start")
-            for _ in range(720):
+            for tick in range(4320):
                 state = docker_api("GET", f"/containers/{downloader}/json")["State"]
                 if not state.get("Running"):
                     if state.get("ExitCode") != 0:
                         raise RuntimeError("Hugging Face download failed; inspect the download container logs")
                     break
+                if tick % 6 == 0:
+                    received = 0
+                    for item in files:
+                        try:
+                            received += min(item["size"], os.path.getsize(os.path.join(self.model_dir, stage_dir, item["path"])))
+                        except OSError:
+                            pass
+                    self._job(job_id, stage=f"downloading {received / metadata['size']:.0%} of {len(files)} files")
                 time.sleep(5)
             else:
-                raise TimeoutError("Download exceeded one hour")
-            self._job(job_id, stage="verifying SHA256")
-            filename = candidate["file"]
-            if not re.fullmatch(r"[A-Za-z0-9_.-]+\.gguf", filename):
-                raise ValueError("Unsafe model filename")
-            path = os.path.join(self.model_dir, stage_dir, filename)
-            if os.path.getsize(path) != metadata["size"]:
-                raise ValueError("Downloaded file size does not match Hugging Face")
-            digest = hashlib.sha256()
-            with open(path, "rb") as file:
-                while chunk := file.read(4 * 2**20):
-                    digest.update(chunk)
-            if digest.hexdigest() != metadata["sha256"]:
-                raise ValueError("Downloaded file SHA256 does not match Hugging Face")
-            if candidate["id"].startswith("discovered-"):
-                filename = candidate["id"] + "--" + filename
-            destination = os.path.join(self.model_dir, filename)
-            if os.path.lexists(destination):
-                if os.path.islink(destination) or os.path.getsize(destination) != metadata["size"]:
-                    raise ValueError("A different GGUF already has this destination name")
-                existing = hashlib.sha256()
-                with open(destination, "rb") as stream:
-                    while chunk := stream.read(4 * 2**20):
-                        existing.update(chunk)
-                if existing.hexdigest() != metadata["sha256"]:
-                    raise ValueError("A different GGUF already has this destination name")
+                raise TimeoutError("Download exceeded six hours")
+            self._job(job_id, stage="verifying downloaded files")
+            for item in files:
+                path = os.path.join(self.model_dir, stage_dir, item["path"])
+                if os.path.islink(path) or os.path.getsize(path) != item["size"]:
+                    raise ValueError("Downloaded file size does not match Hugging Face")
+                if item.get("sha256"):
+                    digest = hashlib.sha256()
+                    with open(path, "rb") as stream:
+                        while chunk := stream.read(4 * 2**20):
+                            digest.update(chunk)
+                    if digest.hexdigest() != item["sha256"]:
+                        raise ValueError("Downloaded file SHA256 does not match Hugging Face")
+            model_format = metadata.get("format", "gguf")
+            if model_format == "gguf" and len(files) == 1 and "/" not in candidate["file"]:
+                filename = candidate["file"]
+                if candidate["id"].startswith("discovered-"):
+                    filename = candidate["id"] + "--" + filename
+                destination = os.path.join(self.model_dir, filename)
+                if os.path.lexists(destination):
+                    raise ValueError("Model destination already exists")
+                os.replace(os.path.join(self.model_dir, stage_dir, files[0]["path"]), destination)
             else:
-                os.replace(path, destination)
+                folder = "hf-" + candidate["id"]
+                destination = os.path.join(self.model_dir, folder)
+                if os.path.lexists(destination):
+                    raise ValueError("Model destination already exists")
+                os.replace(os.path.join(self.model_dir, stage_dir), destination)
+                filename = folder if model_format == "safetensors" else folder + "/" + candidate["file"]
             self._job(job_id, stage="creating serving container")
             container = "local-ai-hf-" + candidate["id"]
             alias = "local-hf-" + candidate["id"]
-            image = GGUF_IMAGE if runtime == "gpu" else CPU_GGUF_IMAGE
+            image = self.runtime_image(model_format, runtime)
             self._ensure_image(image)
-            serving_config = self.serving_config(filename, alias, context_tokens, runtime=runtime)
+            serving_config = self.serving_config(filename, alias, context_tokens, runtime=runtime,
+                                                 model_format=model_format, hardware=hardware)
             serving = docker_api("POST", "/containers/create?name=" + container, serving_config)["Id"]
             with self.connect() as db:
-                db.execute("INSERT INTO installed_models(candidate_id,repo,filename,revision,sha256,size,installed_at,alias,container,context_tokens,runtime) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                           (candidate["id"], candidate["repo"], filename, metadata["revision"], metadata["sha256"], metadata["size"], now(), alias, container, context_tokens, runtime))
+                db.execute("INSERT INTO installed_models(candidate_id,repo,filename,revision,sha256,size,installed_at,alias,container,context_tokens,runtime,format,files_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                           (candidate["id"], candidate["repo"], filename, metadata["revision"], metadata["sha256"], metadata["size"], now(), alias, container, context_tokens, runtime, model_format, json.dumps(files)))
             MODELS["hf-" + candidate["id"]] = (alias, container)
             serving = None
             self._job(job_id, status="completed", stage="installed; ready to select", ended_at=now())
@@ -438,22 +500,45 @@ class ModelManager:
                 state = docker_api("GET", "/containers/" + helper + "/json")["State"]
                 if not state.get("Running"):
                     if state.get("ExitCode") != 0:
-                        raise RuntimeError("Could not download the selected llama.cpp engine image")
+                        raise RuntimeError("Could not download the selected model engine image")
                     return
                 time.sleep(2)
             raise TimeoutError("Engine image download exceeded 20 minutes")
         finally:
             docker_api("DELETE", "/containers/" + helper + "?force=1")
 
-    def serving_config(self, filename, alias, context_tokens, image=None, parallel_slots=1, runtime="gpu"):
-        image = image or (GGUF_IMAGE if runtime == "gpu" else CPU_GGUF_IMAGE)
-        command = ["--model", "/models/" + filename, "--alias", alias, "--host", "0.0.0.0", "--port", "8080",
-                   "--ctx-size", str(context_tokens or 4096), "--parallel", str(parallel_slots)]
+    @staticmethod
+    def runtime_image(model_format, runtime):
+        if model_format == "safetensors":
+            return VLLM_CUDA_IMAGE if runtime == "gpu" else (
+                "vllm/vllm-openai-cpu:latest-arm64" if platform.machine() in ("aarch64", "arm64") else VLLM_CPU_IMAGE)
+        return GGUF_IMAGE if runtime == "gpu" else VULKAN_GGUF_IMAGE if runtime == "vulkan" else CPU_GGUF_IMAGE
+
+    def serving_config(self, filename, alias, context_tokens, image=None, parallel_slots=1,
+                       runtime="gpu", model_format="gguf", hardware=None):
+        image = image or self.runtime_image(model_format, runtime)
+        if model_format == "safetensors":
+            command = ["--model", "/models/" + filename, "--served-model-name", alias,
+                       "--host", "0.0.0.0", "--port", "8000", "--max-model-len", str(context_tokens or 4096),
+                       "--max-num-seqs", str(parallel_slots), "--load-format", "safetensors", "--api-key", self.api_key]
+        else:
+            command = ["--model", "/models/" + filename, "--alias", alias, "--host", "0.0.0.0", "--port", "8080",
+                       "--ctx-size", str(context_tokens or 4096), "--parallel", str(parallel_slots)]
         host = {"Binds": [self.host_dir + ":/models:ro"], "NetworkMode": self.network,
                 "RestartPolicy": {"Name": "unless-stopped"}}
         if runtime == "gpu":
-            command += ["--n-gpu-layers", "auto", "--fit-target", "2048", "--flash-attn", "on"]
+            if model_format != "safetensors":
+                command += ["--n-gpu-layers", "auto", "--fit-target", "2048", "--flash-attn", "on"]
             host["DeviceRequests"] = [{"Driver": "nvidia", "Count": 1, "Capabilities": [["gpu"]]}]
+        elif runtime == "vulkan":
+            command += ["--n-gpu-layers", "auto", "--fit-target", "2048"]
+            devices = (hardware or self.hardware()).get("render_devices") or []
+            host["Devices"] = [{"PathOnHost": device, "PathInContainer": device,
+                                "CgroupPermissions": "rwm"} for device in devices]
+            if (hardware or {}).get("gpu_provider") == "amd" and os.path.exists("/dev/kfd"):
+                host["Devices"].append({"PathOnHost": "/dev/kfd", "PathInContainer": "/dev/kfd", "CgroupPermissions": "rwm"})
+        if model_format == "safetensors" and runtime == "cpu":
+            host["ShmSize"] = 4 * 2**30
         return {"Image": image, "Env": ["LLAMA_API_KEY=" + self.api_key], "Cmd": command,
                 "Labels": {"local-ai.model-manager": "1"}, "HostConfig": host}
 
@@ -471,7 +556,7 @@ class ModelManager:
         inspect = docker_api("GET", "/containers/" + name + "/json")
         if inspect["State"].get("Running"):
             return None
-        image_name = CPU_GGUF_IMAGE if row.get("runtime") == "cpu" else GGUF_IMAGE
+        image_name = self.runtime_image(row.get("format", "gguf"), row.get("runtime", "gpu"))
         image = docker_api("GET", "/images/" + urllib.parse.quote(image_name, safe="") + "/json")["Id"]
         if inspect["Image"] == image:
             return None
@@ -480,7 +565,8 @@ class ModelManager:
         try:
             docker_api("POST", "/containers/create?name=" + name,
                        self.serving_config(row["filename"], row["alias"], row["context_tokens"],
-                                           parallel_slots=row["parallel_slots"], runtime=row.get("runtime", "gpu")))
+                                           parallel_slots=row["parallel_slots"], runtime=row.get("runtime", "gpu"),
+                                           model_format=row.get("format", "gguf")))
         except Exception:
             docker_api("POST", "/containers/" + backup + "/rename?name=" + name)
             raise
