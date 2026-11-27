@@ -56,6 +56,7 @@ class SharingManager:
                 status INTEGER NOT NULL, duration_seconds REAL NOT NULL,
                 input_tokens INTEGER, output_tokens INTEGER)""")
             db.execute("CREATE INDEX IF NOT EXISTS api_usage_client_time ON api_usage(client_id,started_at)")
+            db.execute("CREATE INDEX IF NOT EXISTS api_usage_time ON api_usage(started_at)")
 
     def connect(self):
         db = (sqlite3.connect("file:" + self.db_path + "?mode=ro", uri=True, timeout=20)
@@ -169,7 +170,7 @@ class SharingManager:
                        (client_id, started_at, int(status), max(0, float(duration_seconds)), input_tokens, output_tokens))
 
     def usage_summary(self, client_id, amount=24, unit="hours", buckets=30):
-        """Aggregate one key over a chosen UTC window; missing token counts stay unknown."""
+        """Aggregate one key, or all recorded keys, over a chosen UTC window."""
         seconds_per = {"minutes": 60, "hours": 3600, "days": 86400}
         if unit not in seconds_per or not isinstance(amount, int) or not 1 <= amount or amount * seconds_per[unit] > 90 * 86400:
             raise ValueError("Choose a window from one minute through 90 days")
@@ -180,6 +181,9 @@ class SharingManager:
         start_text = start.isoformat(timespec="seconds")
         end_text = end.isoformat(timespec="seconds")
         bucket_seconds = amount * seconds_per[unit] / buckets
+        client_filter = "" if client_id == "all" else "client_id=? AND "
+        parameters = ((start_text, bucket_seconds, start_text, end_text) if client_id == "all" else
+                      (start_text, bucket_seconds, client_id, start_text, end_text))
         with self.connect() as db:
             rows = db.execute("""SELECT CAST((julianday(started_at)-julianday(?))*86400/? AS INTEGER) AS bucket,
                 COUNT(*) AS requests, COUNT(input_tokens) AS input_measured,
@@ -187,8 +191,8 @@ class SharingManager:
                 COALESCE(SUM(input_tokens),0) AS input_tokens,
                 COALESCE(SUM(output_tokens),0) AS output_tokens,
                 COALESCE(SUM(CASE WHEN output_tokens IS NOT NULL THEN duration_seconds ELSE 0 END),0) AS measured_seconds
-                FROM api_usage WHERE client_id=? AND started_at>=? AND started_at<=? GROUP BY bucket""",
-                (start_text, bucket_seconds, client_id, start_text, end_text)).fetchall()
+                FROM api_usage WHERE """ + client_filter + "started_at>=? AND started_at<=? GROUP BY bucket",
+                parameters).fetchall()
         points = [{"requests": 0, "input_measured": 0, "output_measured": 0,
                    "input_tokens": 0, "output_tokens": 0, "measured_seconds": 0.0, "tokens_per_second": None}
                   for _ in range(buckets)]

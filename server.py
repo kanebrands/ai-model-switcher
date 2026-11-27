@@ -28,6 +28,15 @@ import sharing_views
 import model_views
 import harness_views
 
+
+def usage_window(query, prefix=""):
+    """Read a bounded window for the shared and per-key usage views."""
+    amount = query.get(prefix + "amount", ["24"])
+    unit = query.get(prefix + "unit", ["hours"])
+    if len(amount) != 1 or not amount[0].isdecimal() or len(unit) != 1:
+        raise ValueError("Choose a valid usage window")
+    return int(amount[0]), unit[0]
+
 SOCKET = "/var/run/docker.sock"
 LLM = "local-ai-llm"
 CPU_TINY = "local-ai-cpu-tiny"
@@ -393,14 +402,25 @@ class Handler(BaseHTTPRequestHandler):
                           '<h2>Open WebUI</h2><p>A newer container image is available. Updating briefly takes Open WebUI offline. '
                           'The current data volume is backed up first and restored if the new version fails its health check.</p>'
                           '</div><div>' + webui_action + progress + '</div></section>')
+        try:
+            all_usage = SHARING.usage_summary("all", *usage_window(urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query), "all_"))
+        except ValueError as exc:
+            self.send_error(400, str(exc))
+            return
+        except Exception as exc:
+            all_usage_panel = f'<p class="note" role="status">API usage is temporarily unavailable: {h(type(exc).__name__)}</p>'
+        else:
+            all_usage_panel = sharing_views.usage_panel(all_usage, "all API keys", embedded=True, action="/")
+        gpu_card = ('' if not any(available_builtin(item) for item in ('llm','qwen4b','huihui','flint-iq4','flint-q3','deepseek','qwen38','gemma4','vision','media')) else
+                    '<section class="card"><h2>Live GPU status</h2><p class="gpu-note">GPU use and VRAM use over recent samples. Temperature and power are current readings. This panel refreshes every five seconds without reloading the switcher controls.</p><iframe class="gpu-frame" src="/gpu/graph" title="Live GPU utilization and memory graph" loading="lazy"></iframe>' + all_usage_panel + '</section>')
         home_style = """.home-grid{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(19rem,1fr);gap:1rem;align-items:start}.home-grid .card{margin:0}.home-grid select{width:100%;margin:.45rem 0}.home-grid button{margin:.55rem .5rem .2rem 0}.home-actions{display:flex;flex-wrap:wrap;align-items:center;gap:.3rem 1rem}.home-actions form{margin:0}.active-line{display:flex;align-items:center;gap:.8rem;flex-wrap:wrap}.active-badge{display:inline-flex;align-items:center;gap:.5rem;background:#1b3a34;border:1px solid #437864;color:#c8efd9;border-radius:99px;padding:.28rem .75rem;font-size:.82rem;font-weight:800}.active-badge:before{content:"";height:.48rem;width:.48rem;border-radius:50%;background:#82d6a2;box-shadow:0 0 0 3px #82d6a226}.services{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:.6rem}.service{display:flex;flex-direction:column;gap:.3rem;background:#122126;border:1px solid #30464b;border-radius:.55rem;padding:.75rem}.service span{font-size:.8rem;color:#b5c8c7}.service strong{font-size:.82rem;overflow-wrap:anywhere}.service .ready{color:#a8e0bc}.service .idle{color:#ced8d3}details{margin:1rem 0}summary{cursor:pointer;color:#f3bf80;font-weight:700}details table{font-size:.88rem}.home-footer{display:flex;gap:.6rem;flex-wrap:wrap;margin:1.5rem 0}.home-footer a{padding:.65rem .9rem;border:1px solid #49605e;border-radius:.6rem;text-decoration:none;background:#17282b}.home-footer a:hover{background:#24393a}.message{padding:.75rem 1rem;border-left:3px solid #e9b977;background:#24302d;border-radius:.3rem}@media(max-width:900px){.home-grid{grid-template-columns:1fr}.services{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:480px){.services{grid-template-columns:1fr 1fr}.home-actions button{width:100%}}"""
         home_style += ".update-card{display:grid;grid-template-columns:1fr auto;gap:1rem;align-items:center;border-color:#8a6843;background:linear-gradient(110deg,#27332d,#1a292c)}.update-card h2{margin:.35rem 0}.update-card p{max-width:65rem}.update-card form{margin:0}@media(max-width:740px){.update-card{grid-template-columns:1fr}}"
         home_style += ".message-banner{display:flex;align-items:center;justify-content:space-between;gap:1rem}.message-banner p,.message-banner form{margin:0}.message-banner button{min-height:2.2rem;padding:.3rem .7rem;background:transparent;border-color:#c5a976;color:#f8d9a5;white-space:nowrap}.message-banner button:hover{background:#3a4437}@media(max-width:740px){.message-banner{align-items:flex-start;flex-direction:column}}"
-        home_style += ".gpu-frame{width:100%;height:345px;border:0;background:#17262a}.gpu-note{font-size:.9rem;color:#b6c6c4}@media(max-width:740px){.gpu-frame{height:440px}}"
+        home_style += ".gpu-frame{width:100%;height:345px;border:0;background:#17262a}.gpu-note{font-size:.9rem;color:#b6c6c4}.all-key-usage{margin-top:1.5rem;padding-top:1.2rem;border-top:1px solid #365056}@media(max-width:740px){.gpu-frame{height:440px}}"
         home_style += ".active-caption{font-size:.83rem;font-weight:750;color:#d4e3db}.active-badge:not(.is-ready){background:#443926;border-color:#987445;color:#ffe1ad}.active-badge:not(.is-ready):before{background:#f0b967;box-shadow:0 0 0 3px #f0b96726}.active-badge.is-failed{background:#492a2a;border-color:#a85b55;color:#ffcbc5}.active-badge.is-failed:before{background:#f28b83}.active-detail{margin:.45rem 0;color:#d5e0db}.api-connection{display:flex;gap:.75rem 1.2rem;flex-wrap:wrap;align-items:end;margin-top:.7rem}.api-connection label{display:grid;gap:.2rem;color:#cad9d5;font-size:.82rem}.api-connection input{width:min(100%,22rem);font-family:ui-monospace,SFMono-Regular,monospace;font-size:.88rem}.api-connection .api-base{width:min(100%,28rem)}.api-note{font-size:.84rem;color:#c4d5d0;margin:.45rem 0 0}"
         home_style += ".api-connection{display:grid;grid-template-columns:minmax(0,12rem) minmax(0,1fr);gap:1rem;align-items:start}.api-connection label{min-width:0;margin:0}.api-connection input[type=text]{width:100%;max-width:none}.api-port{display:block;color:#e8ba78;font-size:.78rem;font-weight:700}@media(max-width:680px){.api-connection{grid-template-columns:1fr}}"
         page = f"""<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>AI Model Switcher</title><style>{benchmark_views.STYLE}{home_style}</style>
+<title>AI Model Switcher</title><style>{benchmark_views.STYLE}{home_style}{sharing_views.USAGE_STYLE}</style>
 <main><nav aria-label="Main navigation"><a href="/">AI Model Switcher</a><a href="/models">Find models</a><a href="/benchmarks">Benchmarks</a><a href="/sharing">Client sharing</a><a href="/harnesses">Coding harnesses</a></nav>
 <header class="hero"><div class="hero-copy"><div class="eyebrow">Local AI / Control desk</div><h1>AI Model Switcher</h1><p>Manage local workloads and model context from one place.</p><div class="active-line"><span class="active-caption">Active workload</span><span class="active-badge {'is-ready' if snapshot['state'] == 'ready' else 'is-failed' if snapshot['state'] == 'failed' else ''}" data-workload-badge>{h(badge_label)}</span><strong data-workload-label>{h(mode)}</strong></div><p class="active-detail" role="status" data-workload-detail>{h(snapshot['detail'])}</p><div class="api-connection"><label>Stable API model ID<input type="text" readonly value="local-llm-api" data-copy-field aria-label="Copyable stable API model ID"></label><label>OpenAI API base URL<input type="text" class="api-base" readonly value="{h(PUBLIC_API_URL)}" data-copy-field aria-label="Copyable OpenAI API base URL">{api_port_note}</label></div><p class="api-note">Use <code>local-llm-api</code> as the model in your harness to reach the currently loaded language model. Wait for “Ready to use” before sending requests.</p></div></header>
 <script src="/assets/operation_poll.js?v=workload-status-1" defer></script>
@@ -416,7 +436,7 @@ class Handler(BaseHTTPRequestHandler):
 <p class="note">Switching stops the other model workloads and interrupts active requests. In Open WebUI, choose the matching model after it starts.</p></section>
 <section class="card"><h3>Context tuning</h3>{context_form}{context_note}<p class="note">“Tuned” means the value passed a restart and readiness test on this hardware. Testing briefly interrupts requests; a failed test restores the previous setting. Larger context uses more memory and may reduce speed.</p></section></div>
 <h2>Service status</h2><div class="services">{status_cards}</div><p><a href="/">Refresh status</a></p>
-{'' if not any(available_builtin(item) for item in ('llm','qwen4b','huihui','flint-iq4','flint-q3','deepseek','qwen38','gemma4','vision','media')) else '<section class="card"><h2>Live GPU status</h2><p class="gpu-note">GPU use and VRAM use over recent samples. Temperature and power are current readings. This panel refreshes every five seconds without reloading the switcher controls.</p><iframe class="gpu-frame" src="/gpu/graph" title="Live GPU utilization and memory graph" loading="lazy"></iframe></section>'}
+{gpu_card}
 <p class="note">If a service fails, check ai-control.sh huihui-logs or media-logs. If Open WebUI still shows local-coder after switching, set its connection URL to http://nginx:8080/v1 in Admin → Settings → Connections.</p>
 <div class="home-footer"><a href="/models">Find models</a><a href="/benchmarks">Benchmarks and results</a><a href="/sharing">Client sharing and rate limits</a><a href="/harnesses">Coding harnesses</a><a href="{h(WEB_URL)}">Open WebUI</a>{f'<a href="{h(COMFY_URL)}">ComfyUI</a>' if available_builtin('media') else ''}</div></main></html>"""
         data = page.encode()
@@ -531,7 +551,12 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(data)
             return
         if path.path == "/harnesses":
-            self._send_html(harness_views.index())
+            try:
+                current = CONTEXT_TUNER.active(active_mode())
+                context_tokens = current["tokens"] if current else 4096
+            except (RuntimeError, ValueError, KeyError):
+                context_tokens = 4096
+            self._send_html(harness_views.index(PUBLIC_API_URL, context_tokens))
             return
         if path.path == "/gpu/graph":
             self._send_html(GPU_MONITOR.render(), embeddable=True)
@@ -542,17 +567,14 @@ class Handler(BaseHTTPRequestHandler):
                 settings = SHARING.settings(hardware, active_server_slots())
                 clients = SHARING.clients()
                 query = urllib.parse.parse_qs(path.query)
+                all_usage = SHARING.usage_summary("all", *usage_window(query, "all_"))
                 selected = query.get("client", [])
                 usage = None
                 selected_label = ""
                 if selected:
                     if len(selected) != 1 or selected[0] not in {"legacy", *(item["id"] for item in clients)}:
                         raise ValueError("Unknown API key")
-                    amount = query.get("amount", ["24"])
-                    unit = query.get("unit", ["hours"])
-                    if len(amount) != 1 or not amount[0].isdecimal() or len(unit) != 1:
-                        raise ValueError("Choose a valid usage window")
-                    usage = SHARING.usage_summary(selected[0], int(amount[0]), unit[0])
+                    usage = SHARING.usage_summary(selected[0], *usage_window(query))
                     selected_label = ("Shared legacy key" if selected[0] == "legacy" else
                                       next(item["label"] for item in clients if item["id"] == selected[0]))
                 notice = {"limits_saved": "Sharing limits saved and confirmed by the API gateway.",
@@ -562,7 +584,8 @@ class Handler(BaseHTTPRequestHandler):
                               query.get("status", [""])[0], "")
                 self._send_html(sharing_views.index(settings, clients, CSRF, hardware, active_server_slots(),
                                                     active_mode(), PARALLEL_TUNER.status(), message=notice,
-                                                    selected_usage=usage, selected_client_label=selected_label))
+                                                    selected_usage=usage, selected_client_label=selected_label,
+                                                    all_usage=all_usage))
             except ValueError as exc:
                 self.send_error(400, str(exc))
             except Exception as exc:
@@ -715,7 +738,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
-        if self.path != "/":
+        if path.path != "/":
             self.send_error(404)
             return
         WEBUI_UPDATES.check_async()

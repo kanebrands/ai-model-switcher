@@ -28,19 +28,26 @@ def usage_graph(usage, key, title, suffix=""):
             + "".join(columns) + '</div><p class="note">Older → newer; hover bars for each bucket.</p></div>')
 
 
-def usage_panel(usage, label):
+def usage_panel(usage, label, embedded=False, action="/sharing"):
     totals = usage["totals"]
     choices = "".join(f'<option value="{unit}"{" selected" if unit == usage["unit"] else ""}>{unit.title()}</option>'
                       for unit in ("minutes", "hours", "days"))
     rate = f'{totals["tokens_per_second"]:,.2f}' if totals["tokens_per_second"] is not None else "Unmeasured"
-    return (f'<section class="card" id="client-usage"><h2>Usage for {esc(label)}</h2>'
+    panel_id = "all-key-usage" if embedded else "client-usage"
+    amount_name = "all_amount" if embedded else "amount"
+    unit_name = "all_unit" if embedded else "unit"
+    amount_id = "all-usage-amount" if embedded else "usage-amount"
+    container = '<div class="all-key-usage"' if embedded else '<section class="card"'
+    close = '</div>' if embedded else '</section>'
+    return (f'{container} id="{panel_id}"><h2>Usage for {esc(label)}</h2>'
             '<p class="note">Totals use token counts reported by the serving engine. Streaming Chat Completions request usage explicitly. '
             'When a model or API route omits token usage, that request remains in the request count but its tokens are unmeasured. '
             'Tokens/s is reported output tokens divided by measured end-to-end request seconds, weighted across requests; '
             'it is not a GPU kernel speed measurement.</p>'
-            f'<form method="get" action="/sharing"><input type="hidden" name="client" value="{esc(usage["client_id"])}">'
-            f'<label for="usage-amount">Last</label><input id="usage-amount" type="number" min="1" max="129600" '
-            f'name="amount" value="{usage["amount"]}" required> <select name="unit" aria-label="Usage time unit">{choices}</select> '
+            f'<form method="get" action="{esc(action)}">'
+            + ('' if embedded else f'<input type="hidden" name="client" value="{esc(usage["client_id"])}">')
+            + f'<label for="{amount_id}">Last</label><input id="{amount_id}" type="number" min="1" max="129600" '
+            f'name="{amount_name}" value="{usage["amount"]}" required> <select name="{unit_name}" aria-label="Usage time unit">{choices}</select> '
             '<button type="submit">Update usage window</button></form>'
             f'<p class="note">{esc(usage["start"])} to {esc(usage["end"])} UTC</p>'
             '<div class="usage-totals">'
@@ -51,7 +58,10 @@ def usage_panel(usage, label):
             + usage_graph(usage, "input_tokens", "Input tokens")
             + usage_graph(usage, "output_tokens", "Output tokens")
             + usage_graph(usage, "tokens_per_second", "Effective output tokens/s", " tokens/s")
-            + '</div></section>')
+            + '</div>' + close)
+
+
+USAGE_STYLE = """.usage-totals{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:.8rem}.usage-totals>div{display:grid;gap:.2rem;background:#102024;border:1px solid #365056;border-radius:.7rem;padding:1rem}.usage-totals strong{font-size:clamp(1.3rem,3vw,2rem);color:#f1bf81}.usage-totals small{color:#b6c6c4}.usage-charts{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:.8rem;margin-top:1rem}.usage-chart{background:#102024;border:1px solid #365056;border-radius:.7rem;padding:1rem;min-width:0}.usage-chart h3{margin:.1rem 0 .8rem}.usage-chart p{font-size:.78rem}.usage-bars{height:9rem;display:flex;align-items:end;gap:2px;border-bottom:1px solid #8ba9a1}.usage-bar{flex:1;min-width:2px;background:linear-gradient(#f1bf81,#a87645);border-radius:3px 3px 0 0}@media(max-width:900px){.usage-charts{grid-template-columns:1fr}}@media(max-width:760px){.usage-totals{grid-template-columns:1fr}}"""
 
 
 EXPLAIN = (
@@ -77,7 +87,7 @@ EXPLAIN = (
 
 
 def index(settings, clients, csrf, hardware, server_slots, active_mode=None,
-          parallel_status=None, created=None, message="", selected_usage=None, selected_client_label=""):
+          parallel_status=None, created=None, message="", selected_usage=None, selected_client_label="", all_usage=None):
     recommended = defaults(hardware, server_slots)
     parallel_status = parallel_status or {"busy": False, "job": None}
     parallel_job = parallel_status.get("job") or {}
@@ -147,7 +157,8 @@ def index(settings, clients, csrf, hardware, server_slots, active_mode=None,
               '<button type="submit">Create client key</button></form>'
             + '<div class="scroll"><table><tr><th>Client</th><th>Created UTC</th><th>Status</th><th>Action</th></tr>'
             + '<tr><td>Shared legacy key</td><td>Before dedicated keys</td><td>Active</td><td><a href="/sharing?client=legacy#client-usage">View usage</a></td></tr>'
-            + client_rows + '</table></div></div>'
+            + client_rows + '</table></div>'
+            + (usage_panel(all_usage, "all API keys", embedded=True) if all_usage else '') + '</div>'
             + (usage_panel(selected_usage, selected_client_label) if selected_usage else ''))
-    style = """<style>.settings-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1rem}.setting{padding:.8rem;border:1px solid #344b50;border-radius:.6rem;background:#122126}.setting label{display:block;margin-bottom:.3rem}.setting input{width:8rem}.setting p{font-size:.9rem;margin:.5rem 0 0}.secondary{background:#22373a;color:#e6d3b3;border-color:#557070}.secondary:hover{background:#30484b}.new-key{display:block;overflow-wrap:anywhere;padding:1rem;background:#0b181c;border:1px solid #4d696a;border-radius:.5rem}.usage-totals{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:.8rem}.usage-totals>div{display:grid;gap:.2rem;background:#102024;border:1px solid #365056;border-radius:.7rem;padding:1rem}.usage-totals strong{font-size:clamp(1.3rem,3vw,2rem);color:#f1bf81}.usage-totals small{color:#b6c6c4}.usage-charts{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:.8rem;margin-top:1rem}.usage-chart{background:#102024;border:1px solid #365056;border-radius:.7rem;padding:1rem;min-width:0}.usage-chart h3{margin:.1rem 0 .8rem}.usage-chart p{font-size:.78rem}.usage-bars{height:9rem;display:flex;align-items:end;gap:2px;border-bottom:1px solid #8ba9a1}.usage-bar{flex:1;min-width:2px;background:linear-gradient(#f1bf81,#a87645);border-radius:3px 3px 0 0}@media(max-width:900px){.usage-charts{grid-template-columns:1fr}}@media(max-width:760px){.settings-grid,.usage-totals{grid-template-columns:1fr}}</style>"""
+    style = """<style>.settings-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1rem}.setting{padding:.8rem;border:1px solid #344b50;border-radius:.6rem;background:#122126}.setting label{display:block;margin-bottom:.3rem}.setting input{width:8rem}.setting p{font-size:.9rem;margin:.5rem 0 0}.secondary{background:#22373a;color:#e6d3b3;border-color:#557070}.secondary:hover{background:#30484b}.new-key{display:block;overflow-wrap:anywhere;padding:1rem;background:#0b181c;border:1px solid #4d696a;border-radius:.5rem}.all-key-usage{margin-top:1.5rem;padding-top:1.2rem;border-top:1px solid #365056}@media(max-width:760px){.settings-grid{grid-template-columns:1fr}}</style>""" + '<style>' + USAGE_STYLE + '</style>'
     return shell("Client sharing and rate limits", style + body, refresh=parallel_status["busy"], wide=True)

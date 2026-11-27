@@ -1,6 +1,6 @@
 # AI Model Switcher
 
-The switcher's **Coding harnesses** page links to official installation and local API guides for Hermes Agent, OpenCode, Pi, Aider, Cline, and Goose, with strengths and tradeoffs for each.
+The switcher's **Coding harnesses** page links to official installation and local API guides for Hermes Agent, OpenCode, Pi, Aider, Cline, and Goose, with strengths and tradeoffs for each. It also shows an OpenCode 2.x provider configuration for `~/.config/opencode/opencode.json` using this installation's API URL and stable model ID.
 
 An all-in-one Ubuntu 24.04 installation for local AI. It runs an OpenAI-compatible LLM API, Open WebUI, and a browser-based model switcher behind Nginx. On compatible NVIDIA hardware, selected GPU models and ComfyUI are available too. The switcher manages model selection, hardware-aware recommendations, benchmark history, context and generation-slot tuning, client limits, and live GPU metrics when a GPU is available.
 
@@ -32,7 +32,7 @@ The switcher's **Find models** page searches public Hugging Face repositories ac
 
 The same page can uninstall switcher-managed Hugging Face text models after you switch away from them. It removes their files and serving containers while retaining benchmark history. Installer-selected built-in models and shared ComfyUI files need separate manual review.
 
-New Hugging Face installations use readable API IDs derived from their model names. Existing IDs remain stable unless you explicitly change one on an inactive model. Text and ComfyUI downloads queue when another download of the same type is running. Progress updates in place without full-page reloads. The **Client sharing** page can show per-key input/output token totals and effective output tokens/s graphs for a selected key and time window; missing engine usage is labeled unmeasured.
+New Hugging Face installations use readable API IDs derived from their model names. Existing IDs remain stable unless you explicitly change one on an inactive model. Text and ComfyUI downloads queue when another download of the same type is running. Progress updates in place without full-page reloads. The **Client sharing** page shows cumulative input/output token totals and effective output tokens/s graphs across all issued keys, including the shared key, directly on the Client API keys card. The same graphs appear below the live GPU graph on the home page. Select a time window in minutes, hours, or days. Individual key stats remain available from each row; missing engine usage is labeled unmeasured.
 
 The home page shows **Loading model** until the active model responds through the API, then **Ready to use**. It displays a copyable API base URL and stable model ID `local-llm-api` for harnesses and other clients; the gateway maps that ID to whichever language model is active. The switcher and proxy show themed error pages if a request fails.
 

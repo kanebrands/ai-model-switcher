@@ -13,12 +13,21 @@ from gpu_metrics import GPUMonitor, parse_samples
 from parallel_tuning import ParallelTuner
 from sharing import SharingManager, defaults, FIELDS
 from sharing_views import index as sharing_page
+from harness_views import index as harness_page
 
 with patch.dict(os.environ, {"BENCHMARK_API_KEY": "legacy-test-key"}):
     import fairness_gateway as gateway
 
 
 class SharingTests(unittest.TestCase):
+    def test_opencode_config_uses_current_api_base_and_stable_model_id(self):
+        page = harness_page("http://switcher.test:9123/v1", 32768)
+        self.assertIn("~/.config/opencode/opencode.json", page)
+        self.assertIn("http://switcher.test:9123/v1", page)
+        self.assertIn("@opencode/ai/providers/openai-compatible", page)
+        self.assertIn("local-llm-api", page)
+        self.assertNotIn("YOUR_ACTUAL_KEY", page)
+
     def test_hardware_defaults_follow_capacity_and_active_server(self):
         small = {"fingerprint": "small", "vram_mib": 8192, "cpu_threads": 8}
         large = {"fingerprint": "large", "vram_mib": 49152, "cpu_threads": 32}
@@ -96,6 +105,33 @@ class SharingTests(unittest.TestCase):
             self.assertIn('id="client-usage"', visible)
             self.assertIn("25.00", visible)
             self.assertIn("Input tokens", visible)
+
+    def test_all_key_usage_includes_legacy_and_revoked_keys(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = SharingManager(directory + "/sharing.db")
+            first = manager.create_client("Agent one")
+            second = manager.create_client("Agent two")
+            from sharing import now
+            manager.record_usage(first["id"], now(), 200, 2.0, 10, 4)
+            manager.record_usage(second["id"], now(), 200, 1.0, 20, 6)
+            manager.record_usage("legacy", now(), 200, 2.0, 30, 10)
+            manager.record_usage(second["id"], now(), 200, 1.0, None, None)
+            manager.revoke(first["id"])
+            aggregate = manager.usage_summary("all", 1, "hours")
+            self.assertEqual(aggregate["totals"]["requests"], 4)
+            self.assertEqual(aggregate["totals"]["input_tokens"], 60)
+            self.assertEqual(aggregate["totals"]["output_tokens"], 20)
+            self.assertEqual(aggregate["totals"]["tokens_per_second"], 4.0)
+            self.assertEqual(aggregate["totals"]["input_measured"], 3)
+            self.assertEqual(manager.usage_summary(second["id"], 1, "hours")["totals"]["input_tokens"], 20)
+            hardware = {"vram_mib": 0, "ram_gib": 16, "cpu_threads": 8}
+            page = sharing_page(manager.settings(hardware, 1), manager.clients(), "csrf", hardware, 1,
+                                all_usage=aggregate)
+            self.assertIn('id="all-key-usage"', page)
+            self.assertIn('name="all_amount"', page)
+            self.assertIn('name="all_unit"', page)
+            self.assertIn("Usage for all API keys", page)
+            self.assertIn("Effective output tokens/s", page)
 
     def test_gpu_parser_accepts_optional_power_and_multiple_devices(self):
         samples = parse_samples("0, GPU A, 52, 8000, 24000, 61, 210.5\n1, GPU B, 0, 10, 16000, N/A, N/A",

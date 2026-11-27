@@ -884,6 +884,15 @@ import sharing_views
 import model_views
 import harness_views
 
+
+def usage_window(query, prefix=""):
+    """Read a bounded window for the shared and per-key usage views."""
+    amount = query.get(prefix + "amount", ["24"])
+    unit = query.get(prefix + "unit", ["hours"])
+    if len(amount) != 1 or not amount[0].isdecimal() or len(unit) != 1:
+        raise ValueError("Choose a valid usage window")
+    return int(amount[0]), unit[0]
+
 SOCKET = "/var/run/docker.sock"
 LLM = "local-ai-llm"
 CPU_TINY = "local-ai-cpu-tiny"
@@ -1249,14 +1258,25 @@ class Handler(BaseHTTPRequestHandler):
                           '<h2>Open WebUI</h2><p>A newer container image is available. Updating briefly takes Open WebUI offline. '
                           'The current data volume is backed up first and restored if the new version fails its health check.</p>'
                           '</div><div>' + webui_action + progress + '</div></section>')
+        try:
+            all_usage = SHARING.usage_summary("all", *usage_window(urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query), "all_"))
+        except ValueError as exc:
+            self.send_error(400, str(exc))
+            return
+        except Exception as exc:
+            all_usage_panel = f'<p class="note" role="status">API usage is temporarily unavailable: {h(type(exc).__name__)}</p>'
+        else:
+            all_usage_panel = sharing_views.usage_panel(all_usage, "all API keys", embedded=True, action="/")
+        gpu_card = ('' if not any(available_builtin(item) for item in ('llm','qwen4b','huihui','flint-iq4','flint-q3','deepseek','qwen38','gemma4','vision','media')) else
+                    '<section class="card"><h2>Live GPU status</h2><p class="gpu-note">GPU use and VRAM use over recent samples. Temperature and power are current readings. This panel refreshes every five seconds without reloading the switcher controls.</p><iframe class="gpu-frame" src="/gpu/graph" title="Live GPU utilization and memory graph" loading="lazy"></iframe>' + all_usage_panel + '</section>')
         home_style = """.home-grid{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(19rem,1fr);gap:1rem;align-items:start}.home-grid .card{margin:0}.home-grid select{width:100%;margin:.45rem 0}.home-grid button{margin:.55rem .5rem .2rem 0}.home-actions{display:flex;flex-wrap:wrap;align-items:center;gap:.3rem 1rem}.home-actions form{margin:0}.active-line{display:flex;align-items:center;gap:.8rem;flex-wrap:wrap}.active-badge{display:inline-flex;align-items:center;gap:.5rem;background:#1b3a34;border:1px solid #437864;color:#c8efd9;border-radius:99px;padding:.28rem .75rem;font-size:.82rem;font-weight:800}.active-badge:before{content:"";height:.48rem;width:.48rem;border-radius:50%;background:#82d6a2;box-shadow:0 0 0 3px #82d6a226}.services{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:.6rem}.service{display:flex;flex-direction:column;gap:.3rem;background:#122126;border:1px solid #30464b;border-radius:.55rem;padding:.75rem}.service span{font-size:.8rem;color:#b5c8c7}.service strong{font-size:.82rem;overflow-wrap:anywhere}.service .ready{color:#a8e0bc}.service .idle{color:#ced8d3}details{margin:1rem 0}summary{cursor:pointer;color:#f3bf80;font-weight:700}details table{font-size:.88rem}.home-footer{display:flex;gap:.6rem;flex-wrap:wrap;margin:1.5rem 0}.home-footer a{padding:.65rem .9rem;border:1px solid #49605e;border-radius:.6rem;text-decoration:none;background:#17282b}.home-footer a:hover{background:#24393a}.message{padding:.75rem 1rem;border-left:3px solid #e9b977;background:#24302d;border-radius:.3rem}@media(max-width:900px){.home-grid{grid-template-columns:1fr}.services{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:480px){.services{grid-template-columns:1fr 1fr}.home-actions button{width:100%}}"""
         home_style += ".update-card{display:grid;grid-template-columns:1fr auto;gap:1rem;align-items:center;border-color:#8a6843;background:linear-gradient(110deg,#27332d,#1a292c)}.update-card h2{margin:.35rem 0}.update-card p{max-width:65rem}.update-card form{margin:0}@media(max-width:740px){.update-card{grid-template-columns:1fr}}"
         home_style += ".message-banner{display:flex;align-items:center;justify-content:space-between;gap:1rem}.message-banner p,.message-banner form{margin:0}.message-banner button{min-height:2.2rem;padding:.3rem .7rem;background:transparent;border-color:#c5a976;color:#f8d9a5;white-space:nowrap}.message-banner button:hover{background:#3a4437}@media(max-width:740px){.message-banner{align-items:flex-start;flex-direction:column}}"
-        home_style += ".gpu-frame{width:100%;height:345px;border:0;background:#17262a}.gpu-note{font-size:.9rem;color:#b6c6c4}@media(max-width:740px){.gpu-frame{height:440px}}"
+        home_style += ".gpu-frame{width:100%;height:345px;border:0;background:#17262a}.gpu-note{font-size:.9rem;color:#b6c6c4}.all-key-usage{margin-top:1.5rem;padding-top:1.2rem;border-top:1px solid #365056}@media(max-width:740px){.gpu-frame{height:440px}}"
         home_style += ".active-caption{font-size:.83rem;font-weight:750;color:#d4e3db}.active-badge:not(.is-ready){background:#443926;border-color:#987445;color:#ffe1ad}.active-badge:not(.is-ready):before{background:#f0b967;box-shadow:0 0 0 3px #f0b96726}.active-badge.is-failed{background:#492a2a;border-color:#a85b55;color:#ffcbc5}.active-badge.is-failed:before{background:#f28b83}.active-detail{margin:.45rem 0;color:#d5e0db}.api-connection{display:flex;gap:.75rem 1.2rem;flex-wrap:wrap;align-items:end;margin-top:.7rem}.api-connection label{display:grid;gap:.2rem;color:#cad9d5;font-size:.82rem}.api-connection input{width:min(100%,22rem);font-family:ui-monospace,SFMono-Regular,monospace;font-size:.88rem}.api-connection .api-base{width:min(100%,28rem)}.api-note{font-size:.84rem;color:#c4d5d0;margin:.45rem 0 0}"
         home_style += ".api-connection{display:grid;grid-template-columns:minmax(0,12rem) minmax(0,1fr);gap:1rem;align-items:start}.api-connection label{min-width:0;margin:0}.api-connection input[type=text]{width:100%;max-width:none}.api-port{display:block;color:#e8ba78;font-size:.78rem;font-weight:700}@media(max-width:680px){.api-connection{grid-template-columns:1fr}}"
         page = f"""<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>AI Model Switcher</title><style>{benchmark_views.STYLE}{home_style}</style>
+<title>AI Model Switcher</title><style>{benchmark_views.STYLE}{home_style}{sharing_views.USAGE_STYLE}</style>
 <main><nav aria-label="Main navigation"><a href="/">AI Model Switcher</a><a href="/models">Find models</a><a href="/benchmarks">Benchmarks</a><a href="/sharing">Client sharing</a><a href="/harnesses">Coding harnesses</a></nav>
 <header class="hero"><div class="hero-copy"><div class="eyebrow">Local AI / Control desk</div><h1>AI Model Switcher</h1><p>Manage local workloads and model context from one place.</p><div class="active-line"><span class="active-caption">Active workload</span><span class="active-badge {'is-ready' if snapshot['state'] == 'ready' else 'is-failed' if snapshot['state'] == 'failed' else ''}" data-workload-badge>{h(badge_label)}</span><strong data-workload-label>{h(mode)}</strong></div><p class="active-detail" role="status" data-workload-detail>{h(snapshot['detail'])}</p><div class="api-connection"><label>Stable API model ID<input type="text" readonly value="local-llm-api" data-copy-field aria-label="Copyable stable API model ID"></label><label>OpenAI API base URL<input type="text" class="api-base" readonly value="{h(PUBLIC_API_URL)}" data-copy-field aria-label="Copyable OpenAI API base URL">{api_port_note}</label></div><p class="api-note">Use <code>local-llm-api</code> as the model in your harness to reach the currently loaded language model. Wait for “Ready to use” before sending requests.</p></div></header>
 <script src="/assets/operation_poll.js?v=workload-status-1" defer></script>
@@ -1272,7 +1292,7 @@ class Handler(BaseHTTPRequestHandler):
 <p class="note">Switching stops the other model workloads and interrupts active requests. In Open WebUI, choose the matching model after it starts.</p></section>
 <section class="card"><h3>Context tuning</h3>{context_form}{context_note}<p class="note">“Tuned” means the value passed a restart and readiness test on this hardware. Testing briefly interrupts requests; a failed test restores the previous setting. Larger context uses more memory and may reduce speed.</p></section></div>
 <h2>Service status</h2><div class="services">{status_cards}</div><p><a href="/">Refresh status</a></p>
-{'' if not any(available_builtin(item) for item in ('llm','qwen4b','huihui','flint-iq4','flint-q3','deepseek','qwen38','gemma4','vision','media')) else '<section class="card"><h2>Live GPU status</h2><p class="gpu-note">GPU use and VRAM use over recent samples. Temperature and power are current readings. This panel refreshes every five seconds without reloading the switcher controls.</p><iframe class="gpu-frame" src="/gpu/graph" title="Live GPU utilization and memory graph" loading="lazy"></iframe></section>'}
+{gpu_card}
 <p class="note">If a service fails, check ai-control.sh huihui-logs or media-logs. If Open WebUI still shows local-coder after switching, set its connection URL to http://nginx:8080/v1 in Admin → Settings → Connections.</p>
 <div class="home-footer"><a href="/models">Find models</a><a href="/benchmarks">Benchmarks and results</a><a href="/sharing">Client sharing and rate limits</a><a href="/harnesses">Coding harnesses</a><a href="{h(WEB_URL)}">Open WebUI</a>{f'<a href="{h(COMFY_URL)}">ComfyUI</a>' if available_builtin('media') else ''}</div></main></html>"""
         data = page.encode()
@@ -1387,7 +1407,12 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(data)
             return
         if path.path == "/harnesses":
-            self._send_html(harness_views.index())
+            try:
+                current = CONTEXT_TUNER.active(active_mode())
+                context_tokens = current["tokens"] if current else 4096
+            except (RuntimeError, ValueError, KeyError):
+                context_tokens = 4096
+            self._send_html(harness_views.index(PUBLIC_API_URL, context_tokens))
             return
         if path.path == "/gpu/graph":
             self._send_html(GPU_MONITOR.render(), embeddable=True)
@@ -1398,17 +1423,14 @@ class Handler(BaseHTTPRequestHandler):
                 settings = SHARING.settings(hardware, active_server_slots())
                 clients = SHARING.clients()
                 query = urllib.parse.parse_qs(path.query)
+                all_usage = SHARING.usage_summary("all", *usage_window(query, "all_"))
                 selected = query.get("client", [])
                 usage = None
                 selected_label = ""
                 if selected:
                     if len(selected) != 1 or selected[0] not in {"legacy", *(item["id"] for item in clients)}:
                         raise ValueError("Unknown API key")
-                    amount = query.get("amount", ["24"])
-                    unit = query.get("unit", ["hours"])
-                    if len(amount) != 1 or not amount[0].isdecimal() or len(unit) != 1:
-                        raise ValueError("Choose a valid usage window")
-                    usage = SHARING.usage_summary(selected[0], int(amount[0]), unit[0])
+                    usage = SHARING.usage_summary(selected[0], *usage_window(query))
                     selected_label = ("Shared legacy key" if selected[0] == "legacy" else
                                       next(item["label"] for item in clients if item["id"] == selected[0]))
                 notice = {"limits_saved": "Sharing limits saved and confirmed by the API gateway.",
@@ -1418,7 +1440,8 @@ class Handler(BaseHTTPRequestHandler):
                               query.get("status", [""])[0], "")
                 self._send_html(sharing_views.index(settings, clients, CSRF, hardware, active_server_slots(),
                                                     active_mode(), PARALLEL_TUNER.status(), message=notice,
-                                                    selected_usage=usage, selected_client_label=selected_label))
+                                                    selected_usage=usage, selected_client_label=selected_label,
+                                                    all_usage=all_usage))
             except ValueError as exc:
                 self.send_error(400, str(exc))
             except Exception as exc:
@@ -1571,7 +1594,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
-        if self.path != "/":
+        if path.path != "/":
             self.send_error(404)
             return
         WEBUI_UPDATES.check_async()
@@ -2827,6 +2850,8 @@ OPERATION_POLL
 
 cat > "$INSTALL_DIR/gpu_control/harness_views.py" <<'HARNESS_VIEWS'
 """Curated links to coding harnesses that can use a local API."""
+import json
+
 from benchmark_views import esc, shell
 
 
@@ -2867,15 +2892,44 @@ def _link(url, label):
     return f'<a href="{esc(url)}" target="_blank" rel="noopener noreferrer">{esc(label)}</a>'
 
 
-def index():
+def opencode_config(api_base_url, context_tokens=4096):
+    """Provide an instance-specific endpoint without embedding a key or model name."""
+    context = max(4096, min(int(context_tokens or 4096), 262144))
+    return {
+        "$schema": "https://opencode.ai/config.json",
+        "model": "local-llm/local-llm-api",
+        "providers": {
+            "local-llm": {
+                "name": "AI Model Switcher",
+                "package": "@opencode/ai/providers/openai-compatible",
+                "settings": {
+                    "baseURL": api_base_url,
+                    "apiKey": "{file:~/.config/opencode/local-llm-api-key}",
+                },
+                "models": {
+                    "local-llm-api": {
+                        "modelID": "local-llm-api",
+                        "name": "Active local model",
+                        "capabilities": {"tools": True, "input": ["text"], "output": ["text"]},
+                        "limit": {"context": context, "output": min(8192, max(1024, context // 4))},
+                    },
+                },
+            },
+        },
+    }
+
+
+def index(api_base_url="http://YOUR-SWITCHER-HOST:YOUR-API-PORT/v1", context_tokens=4096):
     rows = "".join(
         f'<article class="card harness-card"><div><h2>{esc(name)}</h2><p class="harness-purpose">{esc(purpose)}</p></div>'
         f'<div><h3>Strengths</h3><p>{esc(strength)}</p><h3>Tradeoffs</h3><p>{esc(weakness)}</p></div>'
         f'<div class="harness-links">{_link(install, "Install guide")}{_link(connect, "Local API setup")}</div></article>'
         for name, purpose, strength, weakness, install, connect in HARNESSES
     )
-    body = '''<style>.harness-intro{max-width:75rem}.harness-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1rem}.harness-card{margin:0;display:flex;flex-direction:column;justify-content:space-between}.harness-card h2{margin:.1rem 0 .3rem}.harness-card h3{font-size:.8rem;letter-spacing:.12em;text-transform:uppercase;color:#e9bc82;margin:1rem 0 .2rem}.harness-card p{margin:.2rem 0}.harness-purpose{color:#b8d0ca}.harness-links{display:flex;flex-wrap:wrap;gap:.65rem;margin-top:1.2rem}.harness-links a{padding:.5rem .75rem;border:1px solid #52706c;border-radius:.55rem;text-decoration:none;background:#203438}@media(max-width:800px){.harness-grid{grid-template-columns:1fr}}</style>
-<section class="card harness-intro"><h2>Connect a harness to this server</h2><ol><li>Install the harness on the computer where it should edit files. These links do not install software on the switcher host.</li><li>Use the API base <code>http://&lt;server-LAN-IP&gt;:8080/v1</code> and a dedicated key from <a href="/sharing">Client sharing</a>.</li><li>Read <code>GET /v1/models</code> with that key and enter the returned model ID in the harness. Switching models can change that ID.</li><li>Choose an OpenAI-compatible <strong>Chat Completions</strong> provider where offered. Test a read, a file edit, and a tool call before allowing autonomous work.</li></ol><p class="note">Compatibility and speed depend on the active engine, model, context, and tool-call format. A successful chat response does not prove that agent tools work. On an untrusted network, put the API behind HTTPS before sending keys.</p></section>
+    config = esc(json.dumps(opencode_config(api_base_url, context_tokens), indent=2))
+    body = f'''<style>.harness-intro{{max-width:75rem}}.harness-grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1rem}}.harness-card{{margin:0;display:flex;flex-direction:column;justify-content:space-between}}.harness-card h2{{margin:.1rem 0 .3rem}}.harness-card h3{{font-size:.8rem;letter-spacing:.12em;text-transform:uppercase;color:#e9bc82;margin:1rem 0 .2rem}}.harness-card p{{margin:.2rem 0}}.harness-purpose{{color:#b8d0ca}}.harness-links{{display:flex;flex-wrap:wrap;gap:.65rem;margin-top:1.2rem}}.harness-links a{{padding:.5rem .75rem;border:1px solid #52706c;border-radius:.55rem;text-decoration:none;background:#203438}}.harness-config{{max-width:75rem}}.harness-config pre{{overflow-x:auto;font-size:.84rem}}@media(max-width:800px){{.harness-grid{{grid-template-columns:1fr}}}}</style>
+<section class="card harness-intro"><h2>Connect a harness to this server</h2><ol><li>Install the harness on the computer where it should edit files. These links do not install software on the switcher host.</li><li>Use the API base <code>{esc(api_base_url)}</code> and a dedicated key from <a href="/sharing">Client sharing</a>.</li><li>Use stable model ID <code>local-llm-api</code> so the harness follows the active language model without changing its configuration.</li><li>Choose an OpenAI-compatible <strong>Chat Completions</strong> provider where offered. Test a read, a file edit, and a tool call before allowing autonomous work.</li></ol><p class="note">Compatibility and speed depend on the active engine, model, context, and tool-call format. A successful chat response does not prove that agent tools work. On an untrusted network, put the API behind HTTPS before sending keys.</p></section>
+<section class="card harness-config" id="opencode-config"><h2>Use this API in OpenCode 2.x</h2><p>Save this JSON in <code>~/.config/opencode/opencode.json</code> on the computer running OpenCode, or merge it into that file if you already have a configuration. OpenCode’s <code>--server</code> option expects an OpenCode V2 server with <code>/api/info</code>; the AI Model Switcher provides an OpenAI-compatible <code>/v1</code> model API. Configure it as a model provider instead.</p><pre><code>{config}</code></pre><p>Save a dedicated API key from <a href="/sharing">Client sharing</a> in <code>~/.config/opencode/local-llm-api-key</code> and make that file readable only by your user. The <code>apiKey</code> setting sends the bearer token; a separate Authorization header is unnecessary. The example uses the active model’s current context as a starting value. If OpenCode runs outside this network, change <code>baseURL</code> to the address it can reach. If you switch to a model with a smaller context or different tool support, adjust <code>limit</code> and <code>capabilities</code> accordingly.</p><p class="note">See OpenCode’s {_link("https://opencode.ai/docs/config/", "config locations")} and {_link("https://opencode.ai/docs/models/", "OpenAI-compatible model setup")}.</p></section>
 <h2>Choose a harness</h2><p class="note">The tradeoffs below are practical guidance based on each project's documented features; they are not benchmark results for the currently selected model.</p><div class="harness-grid">''' + rows + '</div>'
     return shell("Coding harnesses", body)
 HARNESS_VIEWS
@@ -5134,6 +5188,7 @@ class SharingManager:
                 status INTEGER NOT NULL, duration_seconds REAL NOT NULL,
                 input_tokens INTEGER, output_tokens INTEGER)""")
             db.execute("CREATE INDEX IF NOT EXISTS api_usage_client_time ON api_usage(client_id,started_at)")
+            db.execute("CREATE INDEX IF NOT EXISTS api_usage_time ON api_usage(started_at)")
 
     def connect(self):
         db = (sqlite3.connect("file:" + self.db_path + "?mode=ro", uri=True, timeout=20)
@@ -5247,7 +5302,7 @@ class SharingManager:
                        (client_id, started_at, int(status), max(0, float(duration_seconds)), input_tokens, output_tokens))
 
     def usage_summary(self, client_id, amount=24, unit="hours", buckets=30):
-        """Aggregate one key over a chosen UTC window; missing token counts stay unknown."""
+        """Aggregate one key, or all recorded keys, over a chosen UTC window."""
         seconds_per = {"minutes": 60, "hours": 3600, "days": 86400}
         if unit not in seconds_per or not isinstance(amount, int) or not 1 <= amount or amount * seconds_per[unit] > 90 * 86400:
             raise ValueError("Choose a window from one minute through 90 days")
@@ -5258,6 +5313,9 @@ class SharingManager:
         start_text = start.isoformat(timespec="seconds")
         end_text = end.isoformat(timespec="seconds")
         bucket_seconds = amount * seconds_per[unit] / buckets
+        client_filter = "" if client_id == "all" else "client_id=? AND "
+        parameters = ((start_text, bucket_seconds, start_text, end_text) if client_id == "all" else
+                      (start_text, bucket_seconds, client_id, start_text, end_text))
         with self.connect() as db:
             rows = db.execute("""SELECT CAST((julianday(started_at)-julianday(?))*86400/? AS INTEGER) AS bucket,
                 COUNT(*) AS requests, COUNT(input_tokens) AS input_measured,
@@ -5265,8 +5323,8 @@ class SharingManager:
                 COALESCE(SUM(input_tokens),0) AS input_tokens,
                 COALESCE(SUM(output_tokens),0) AS output_tokens,
                 COALESCE(SUM(CASE WHEN output_tokens IS NOT NULL THEN duration_seconds ELSE 0 END),0) AS measured_seconds
-                FROM api_usage WHERE client_id=? AND started_at>=? AND started_at<=? GROUP BY bucket""",
-                (start_text, bucket_seconds, client_id, start_text, end_text)).fetchall()
+                FROM api_usage WHERE """ + client_filter + "started_at>=? AND started_at<=? GROUP BY bucket",
+                parameters).fetchall()
         points = [{"requests": 0, "input_measured": 0, "output_measured": 0,
                    "input_tokens": 0, "output_tokens": 0, "measured_seconds": 0.0, "tokens_per_second": None}
                   for _ in range(buckets)]
@@ -5317,19 +5375,26 @@ def usage_graph(usage, key, title, suffix=""):
             + "".join(columns) + '</div><p class="note">Older → newer; hover bars for each bucket.</p></div>')
 
 
-def usage_panel(usage, label):
+def usage_panel(usage, label, embedded=False, action="/sharing"):
     totals = usage["totals"]
     choices = "".join(f'<option value="{unit}"{" selected" if unit == usage["unit"] else ""}>{unit.title()}</option>'
                       for unit in ("minutes", "hours", "days"))
     rate = f'{totals["tokens_per_second"]:,.2f}' if totals["tokens_per_second"] is not None else "Unmeasured"
-    return (f'<section class="card" id="client-usage"><h2>Usage for {esc(label)}</h2>'
+    panel_id = "all-key-usage" if embedded else "client-usage"
+    amount_name = "all_amount" if embedded else "amount"
+    unit_name = "all_unit" if embedded else "unit"
+    amount_id = "all-usage-amount" if embedded else "usage-amount"
+    container = '<div class="all-key-usage"' if embedded else '<section class="card"'
+    close = '</div>' if embedded else '</section>'
+    return (f'{container} id="{panel_id}"><h2>Usage for {esc(label)}</h2>'
             '<p class="note">Totals use token counts reported by the serving engine. Streaming Chat Completions request usage explicitly. '
             'When a model or API route omits token usage, that request remains in the request count but its tokens are unmeasured. '
             'Tokens/s is reported output tokens divided by measured end-to-end request seconds, weighted across requests; '
             'it is not a GPU kernel speed measurement.</p>'
-            f'<form method="get" action="/sharing"><input type="hidden" name="client" value="{esc(usage["client_id"])}">'
-            f'<label for="usage-amount">Last</label><input id="usage-amount" type="number" min="1" max="129600" '
-            f'name="amount" value="{usage["amount"]}" required> <select name="unit" aria-label="Usage time unit">{choices}</select> '
+            f'<form method="get" action="{esc(action)}">'
+            + ('' if embedded else f'<input type="hidden" name="client" value="{esc(usage["client_id"])}">')
+            + f'<label for="{amount_id}">Last</label><input id="{amount_id}" type="number" min="1" max="129600" '
+            f'name="{amount_name}" value="{usage["amount"]}" required> <select name="{unit_name}" aria-label="Usage time unit">{choices}</select> '
             '<button type="submit">Update usage window</button></form>'
             f'<p class="note">{esc(usage["start"])} to {esc(usage["end"])} UTC</p>'
             '<div class="usage-totals">'
@@ -5340,7 +5405,10 @@ def usage_panel(usage, label):
             + usage_graph(usage, "input_tokens", "Input tokens")
             + usage_graph(usage, "output_tokens", "Output tokens")
             + usage_graph(usage, "tokens_per_second", "Effective output tokens/s", " tokens/s")
-            + '</div></section>')
+            + '</div>' + close)
+
+
+USAGE_STYLE = """.usage-totals{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:.8rem}.usage-totals>div{display:grid;gap:.2rem;background:#102024;border:1px solid #365056;border-radius:.7rem;padding:1rem}.usage-totals strong{font-size:clamp(1.3rem,3vw,2rem);color:#f1bf81}.usage-totals small{color:#b6c6c4}.usage-charts{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:.8rem;margin-top:1rem}.usage-chart{background:#102024;border:1px solid #365056;border-radius:.7rem;padding:1rem;min-width:0}.usage-chart h3{margin:.1rem 0 .8rem}.usage-chart p{font-size:.78rem}.usage-bars{height:9rem;display:flex;align-items:end;gap:2px;border-bottom:1px solid #8ba9a1}.usage-bar{flex:1;min-width:2px;background:linear-gradient(#f1bf81,#a87645);border-radius:3px 3px 0 0}@media(max-width:900px){.usage-charts{grid-template-columns:1fr}}@media(max-width:760px){.usage-totals{grid-template-columns:1fr}}"""
 
 
 EXPLAIN = (
@@ -5366,7 +5434,7 @@ EXPLAIN = (
 
 
 def index(settings, clients, csrf, hardware, server_slots, active_mode=None,
-          parallel_status=None, created=None, message="", selected_usage=None, selected_client_label=""):
+          parallel_status=None, created=None, message="", selected_usage=None, selected_client_label="", all_usage=None):
     recommended = defaults(hardware, server_slots)
     parallel_status = parallel_status or {"busy": False, "job": None}
     parallel_job = parallel_status.get("job") or {}
@@ -5436,9 +5504,10 @@ def index(settings, clients, csrf, hardware, server_slots, active_mode=None,
               '<button type="submit">Create client key</button></form>'
             + '<div class="scroll"><table><tr><th>Client</th><th>Created UTC</th><th>Status</th><th>Action</th></tr>'
             + '<tr><td>Shared legacy key</td><td>Before dedicated keys</td><td>Active</td><td><a href="/sharing?client=legacy#client-usage">View usage</a></td></tr>'
-            + client_rows + '</table></div></div>'
+            + client_rows + '</table></div>'
+            + (usage_panel(all_usage, "all API keys", embedded=True) if all_usage else '') + '</div>'
             + (usage_panel(selected_usage, selected_client_label) if selected_usage else ''))
-    style = """<style>.settings-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1rem}.setting{padding:.8rem;border:1px solid #344b50;border-radius:.6rem;background:#122126}.setting label{display:block;margin-bottom:.3rem}.setting input{width:8rem}.setting p{font-size:.9rem;margin:.5rem 0 0}.secondary{background:#22373a;color:#e6d3b3;border-color:#557070}.secondary:hover{background:#30484b}.new-key{display:block;overflow-wrap:anywhere;padding:1rem;background:#0b181c;border:1px solid #4d696a;border-radius:.5rem}.usage-totals{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:.8rem}.usage-totals>div{display:grid;gap:.2rem;background:#102024;border:1px solid #365056;border-radius:.7rem;padding:1rem}.usage-totals strong{font-size:clamp(1.3rem,3vw,2rem);color:#f1bf81}.usage-totals small{color:#b6c6c4}.usage-charts{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:.8rem;margin-top:1rem}.usage-chart{background:#102024;border:1px solid #365056;border-radius:.7rem;padding:1rem;min-width:0}.usage-chart h3{margin:.1rem 0 .8rem}.usage-chart p{font-size:.78rem}.usage-bars{height:9rem;display:flex;align-items:end;gap:2px;border-bottom:1px solid #8ba9a1}.usage-bar{flex:1;min-width:2px;background:linear-gradient(#f1bf81,#a87645);border-radius:3px 3px 0 0}@media(max-width:900px){.usage-charts{grid-template-columns:1fr}}@media(max-width:760px){.settings-grid,.usage-totals{grid-template-columns:1fr}}</style>"""
+    style = """<style>.settings-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1rem}.setting{padding:.8rem;border:1px solid #344b50;border-radius:.6rem;background:#122126}.setting label{display:block;margin-bottom:.3rem}.setting input{width:8rem}.setting p{font-size:.9rem;margin:.5rem 0 0}.secondary{background:#22373a;color:#e6d3b3;border-color:#557070}.secondary:hover{background:#30484b}.new-key{display:block;overflow-wrap:anywhere;padding:1rem;background:#0b181c;border:1px solid #4d696a;border-radius:.5rem}.all-key-usage{margin-top:1.5rem;padding-top:1.2rem;border-top:1px solid #365056}@media(max-width:760px){.settings-grid{grid-template-columns:1fr}}</style>""" + '<style>' + USAGE_STYLE + '</style>'
     return shell("Client sharing and rate limits", style + body, refresh=parallel_status["busy"], wide=True)
 SHARING_VIEWS
 
