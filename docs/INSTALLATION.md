@@ -44,7 +44,7 @@ The installer creates `.env` in the installation root and generates credentials.
 | Benchmark and switcher database | `~/ai_setup/gpu_control/results/benchmarks.sqlite3` |
 | Open WebUI data | Docker volume `local-ai_webui_data` |
 
-Download progress for selected GGUF models is visible in the installer output and the model directory; in-progress files end in `.part`. Hugging Face repository models use the cache in `AI_MODEL_CACHE`. ComfyUI model downloads use `.part` files until complete. The switcher's **Find models** page can install additional supported GPU models after setup. On a CPU-only host, use the installer selection to change CPU choices.
+Download progress for selected GGUF models is visible in the installer output and the model directory; in-progress files end in `.part`. Hugging Face repository models use the cache in `AI_MODEL_CACHE`. ComfyUI model downloads use `.part` files until complete. After setup, the switcher's **Find models** page can search Hugging Face and install a verified standalone GGUF on a GPU or CPU host. The controller verifies its SHA256 before creating the stopped serving container. The installer selection still controls the built-in workload choices; rerun with `AI_MODEL_SELECTION` to change those.
 
 ## Upgrading an existing host
 

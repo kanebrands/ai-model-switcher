@@ -46,6 +46,32 @@ class CatalogTests(unittest.TestCase):
             _, suggestions = self.manager.recommendations()
         self.assertEqual(suggestions, [])
 
+    def test_cpu_search_requires_explicit_memory_override(self):
+        candidate = {"id": "discovered-" + "a" * 16, "repo": "other/large-GGUF",
+                     "file": "large-Q8_0.gguf", "runtime": "cpu"}
+        hardware = {"vram_mib": None, "ram_gib": 8, "disk_free_gib": 100}
+        metadata = {"revision": "a" * 40, "size": 6_000_000_000, "sha256": "b" * 64}
+        with patch.object(self.manager, "hardware", return_value=hardware), \
+             patch.object(self.manager, "_metadata", return_value=metadata):
+            with self.assertRaisesRegex(ValueError, "Try anyway"):
+                self.manager.start_install(candidate["id"], candidate)
+            with patch("model_catalog.threading.Thread") as worker:
+                job = self.manager.start_install(candidate["id"], candidate, allow_unfit=True)
+        self.assertTrue(job)
+        self.assertTrue(worker.called)
+        config = self.manager.serving_config("large.gguf", "local-large", 4096, runtime="cpu")
+        self.assertNotIn("DeviceRequests", config["HostConfig"])
+        self.assertNotIn("--n-gpu-layers", config["Cmd"])
+
+    def test_memory_override_does_not_bypass_disk_check(self):
+        candidate = {"id": "discovered-" + "b" * 16, "repo": "other/large-GGUF",
+                     "file": "large-Q8_0.gguf", "runtime": "cpu"}
+        with patch.object(self.manager, "hardware", return_value={"vram_mib": None, "ram_gib": 8, "disk_free_gib": 1}), \
+             patch.object(self.manager, "_metadata", return_value={"revision": "a" * 40,
+                                                                  "size": 6_000_000_000, "sha256": "b" * 64}):
+            with self.assertRaisesRegex(ValueError, "Insufficient model storage"):
+                self.manager.start_install(candidate["id"], candidate, allow_unfit=True)
+
     def test_installed_models_leave_room_for_available_recommendations(self):
         from model_catalog import CATALOG
         hardware = {"gpu": "NVIDIA GeForce RTX 3090", "vram_mib": 24576,

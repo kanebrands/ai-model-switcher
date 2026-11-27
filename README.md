@@ -26,6 +26,8 @@ The script prints the URLs when ready. With the default ports, substitute your U
 
 The switcher and ComfyUI use HTTP Basic authentication. The username is `operator`; get the generated password from the installed controller with `~/ai_setup/ai-control.sh switch-password`. Get the existing API key with `~/ai_setup/ai-control.sh key`. The switcher can create separate, revocable keys for individual agents under **Client sharing**.
 
+The switcher's **Find models** page can search Hugging Face by model name, repository ID, or repository URL across publishers. It shows verified standalone GGUF quantizations and installs the selected file into a stopped llama.cpp container. It chooses the GPU runtime when the weights fit VRAM and otherwise offers CPU inference. A model that exceeds the memory estimate requires an explicit **Try anyway** choice; insufficient disk space remains a hard stop. This search does not install sharded GGUF, projector files, gated repositories, or non-GGUF formats.
+
 ## What is in this repository
 
 - `ai-setup.sh` is the generated, standalone installer. It embeds the Compose file, controller, gateway, assets, and helper scripts.

@@ -114,6 +114,8 @@ def switch(target):
         raise ValueError("Unknown mode")
     if SELECTED_MODES and target not in SELECTED_MODES and not target.startswith("hf-"):
         raise ValueError("This workload was not selected at installation")
+    if not SELECTED_MODES and workload_state(workloads[target]) == "not created":
+        raise ValueError("This workload is not installed")
     if ENGINE_UPDATES.busy or CONTEXT_TUNER.busy or PARALLEL_TUNER.busy:
         raise RuntimeError("Wait for the engine or context change to finish before switching models")
     with LOCK:
@@ -238,8 +240,15 @@ class Handler(BaseHTTPRequestHandler):
             item = contexts.get(which) or {}
             tokens = item.get("tokens")
             return f'{tokens:,} tokens ({item["state"]})' if tokens else item.get("state", "unavailable")
+        builtin_states = {"cpu-tiny": cpu_tiny_state, "cpu-4b": cpu_4b_state, "llm": llm_state,
+                          "qwen4b": qwen4b_state, "huihui": huihui_state,
+                          "flint-iq4": flint_iq4_state, "flint-q3": flint_q3_state,
+                          "deepseek": deepseek_state, "qwen38": qwen38_state,
+                          "gemma4": gemma4_state, "vision": vision_state, "media": media_state}
+        def available_builtin(which):
+            return which in SELECTED_MODES if SELECTED_MODES else builtin_states.get(which) != "not created"
         model_labels = {**{key: value for key, value in BUILTIN_LABELS.items()
-                           if not SELECTED_MODES or key in SELECTED_MODES},
+                           if available_builtin(key)},
                         **{"hf-" + item["candidate_id"]: item["alias"] + " (Hugging Face)" for item in managed}}
         model_options = "".join(
             f'<option value="{h(which)}" {"selected" if contexts.get(which, {}).get("running") else ""}>'
@@ -280,7 +289,7 @@ class Handler(BaseHTTPRequestHandler):
                   ("gemma4", "Gemma 4", gemma4_state), ("media", "ComfyUI", media_state))
         status_cards = "".join(
             f'<div class="service"><span>{h(label)}</span><strong class="{"ready" if state in ("healthy", "running") else "idle"}">{h(state)}</strong></div>'
-            for key, label, state in states if not SELECTED_MODES or key in SELECTED_MODES)
+            for key, label, state in states if available_builtin(key))
         webui_status = WEBUI_UPDATES.status()
         webui_job = webui_status.get("job") or {}
         webui_card = ""
@@ -324,14 +333,14 @@ class Handler(BaseHTTPRequestHandler):
 <h2>Choose a workload</h2><div class="home-grid"><section class="card"><h3>Language model</h3>
 <form method="post" action="/switch"><input type="hidden" name="token" value="{h(CSRF)}"><label for="model">LLM model and saved context</label><br><select id="model" name="mode">{model_options}</select><button type="submit">Use selected model</button></form>
 <details><summary>Context for every model before loading</summary><table><tr><th>Model</th><th>Context</th></tr>{context_rows}</table></details>
-{'' if SELECTED_MODES and 'media' not in SELECTED_MODES else '<div class="home-actions"><span class="note">Image and video workflow</span>'}
-{'' if SELECTED_MODES and 'media' not in SELECTED_MODES else f'''<form method="post" action="/switch"><input type="hidden" name="token" value="{h(CSRF)}"><button name="mode" value="media">Use ComfyUI</button></form></div>'''}
+{'' if not available_builtin('media') else '<div class="home-actions"><span class="note">Image and video workflow</span>'}
+{'' if not available_builtin('media') else f'''<form method="post" action="/switch"><input type="hidden" name="token" value="{h(CSRF)}"><button name="mode" value="media">Use ComfyUI</button></form></div>'''}
 <p class="note">Switching stops the other model workloads and interrupts active requests. In Open WebUI, choose the matching model after it starts.</p></section>
 <section class="card"><h3>Context tuning</h3>{context_form}{context_note}<p class="note">“Tuned” means the value passed a restart and readiness test on this hardware. Testing briefly interrupts requests; a failed test restores the previous setting. Larger context uses more memory and may reduce speed.</p></section></div>
 <h2>Service status</h2><div class="services">{status_cards}</div><p><a href="/">Refresh status</a></p>
-{'' if SELECTED_MODES and not any(item not in ('cpu-tiny','cpu-4b') for item in SELECTED_MODES) else '<section class="card"><h2>Live GPU status</h2><p class="gpu-note">GPU use and VRAM use over recent samples. Temperature and power are current readings. This panel refreshes every five seconds without reloading the switcher controls.</p><iframe class="gpu-frame" src="/gpu/graph" title="Live GPU utilization and memory graph" loading="lazy"></iframe></section>'}
+{'' if not any(available_builtin(item) for item in ('llm','qwen4b','huihui','flint-iq4','flint-q3','deepseek','qwen38','gemma4','vision','media')) else '<section class="card"><h2>Live GPU status</h2><p class="gpu-note">GPU use and VRAM use over recent samples. Temperature and power are current readings. This panel refreshes every five seconds without reloading the switcher controls.</p><iframe class="gpu-frame" src="/gpu/graph" title="Live GPU utilization and memory graph" loading="lazy"></iframe></section>'}
 <p class="note">If a service fails, check ai-control.sh huihui-logs or media-logs. If Open WebUI still shows local-coder after switching, set its connection URL to http://nginx:8080/v1 in Admin → Settings → Connections.</p>
-<div class="home-footer"><a href="/models">Find models</a><a href="/benchmarks">Benchmarks and results</a><a href="/sharing">Client sharing and rate limits</a><a href="{h(WEB_URL)}">Open WebUI</a>{'' if SELECTED_MODES and 'media' not in SELECTED_MODES else f'<a href="{h(COMFY_URL)}">ComfyUI</a>'}</div></main></html>"""
+<div class="home-footer"><a href="/models">Find models</a><a href="/benchmarks">Benchmarks and results</a><a href="/sharing">Client sharing and rate limits</a><a href="{h(WEB_URL)}">Open WebUI</a>{f'<a href="{h(COMFY_URL)}">ComfyUI</a>' if available_builtin('media') else ''}</div></main></html>"""
         data = page.encode()
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -388,7 +397,7 @@ class Handler(BaseHTTPRequestHandler):
                 media_suggestions = MEDIA_MANAGER.recommendations(hardware, prefer_ablit)
                 self._send_html(model_views.index(hardware, suggestions, MODEL_MANAGER.installed(), MODEL_MANAGER.jobs(), CSRF,
                                                   prefer_ablit, media_suggestions, MEDIA_MANAGER.jobs(), COMFY_URL,
-                                                  DISCOVERY.latest(), ENGINE_UPDATES.status()))
+                                                  DISCOVERY.latest(), ENGINE_UPDATES.status(), DISCOVERY.latest_search()))
             except Exception as exc:
                 self.send_error(503, f"Recommendations unavailable: {type(exc).__name__}")
             return
@@ -516,7 +525,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         if self.path not in ("/switch", "/benchmark", "/context/tune", "/benchmarks/delete", "/models/install",
-                             "/models/media/install", "/models/refresh", "/models/hardware/rescan", "/models/discovered/install",
+                             "/models/media/install", "/models/refresh", "/models/search", "/models/hardware/rescan", "/models/discovered/install",
                              "/models/engine/check", "/models/engine/update", "/webui/update", "/webui/update/dismiss",
                              "/sharing/save", "/sharing/reset", "/sharing/client", "/sharing/revoke",
                              "/sharing/parallel"):
@@ -647,10 +656,15 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
-        if self.path in ("/models/refresh", "/models/hardware/rescan", "/models/engine/check", "/models/engine/update", "/models/discovered/install"):
+        if self.path in ("/models/refresh", "/models/search", "/models/hardware/rescan", "/models/engine/check", "/models/engine/update", "/models/discovered/install"):
             try:
                 if self.path == "/models/refresh":
                     DISCOVERY.start_refresh(fields.get("search", [""])[0])
+                elif self.path == "/models/search":
+                    values = fields.get("query", [])
+                    if len(values) != 1:
+                        raise ValueError("Enter one model name or Hugging Face repository")
+                    DISCOVERY.start_search(values[0])
                 elif self.path == "/models/hardware/rescan":
                     hardware = MODEL_MANAGER.hardware(force=True)
                     SHARING.settings(hardware, active_server_slots())
@@ -667,8 +681,12 @@ class Handler(BaseHTTPRequestHandler):
                         raise ValueError("Select one discovered model")
                     candidate = DISCOVERY.candidate(selected[0])
                     if not candidate:
-                        raise ValueError("Candidate is no longer in the latest catalog refresh")
-                    MODEL_MANAGER.start_install(selected[0], candidate, ENGINE_UPDATES.status().get("local_build"))
+                        raise ValueError("Candidate is no longer in the latest search or catalog refresh")
+                    override = fields.get("override_fit", [])
+                    if override not in ([], ["1"]):
+                        raise ValueError("Invalid memory override")
+                    MODEL_MANAGER.start_install(selected[0], candidate, ENGINE_UPDATES.status().get("local_build"),
+                                                allow_unfit=override == ["1"])
             except ValueError as exc:
                 self.send_error(400, str(exc))
                 return

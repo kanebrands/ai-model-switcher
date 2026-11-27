@@ -6,6 +6,8 @@ The installer generates API, WebUI, terminal, switcher, and CSRF secrets on the 
 
 The default API URL uses HTTP on a private LAN address. Bearer keys sent through HTTP are visible to anyone able to observe that traffic. If access is needed beyond a trusted LAN, place a properly configured HTTPS reverse proxy in front of the API and restrict firewall access. Do not expose the switcher, ComfyUI, Docker socket, or model backends directly to the internet.
 
+Hugging Face search accepts public model repositories but installs only verified standalone GGUF weight files. The controller pins the download to a repository commit and verifies the downloaded SHA256. It does not execute repository scripts. The optional memory-fit override can cause a model to fail to load or exhaust available memory; it does not bypass disk-space or integrity checks.
+
 The controller has access to the Docker socket so it can switch and update containers. Treat access to the switcher as administrative access to this host. Use the generated Basic Auth password and restrict network access to trusted operators.
 
 If a credential is accidentally committed, revoke or rotate it on the Ubuntu host and remove it from the Git history. Making a repository private does not make committed secrets safe.

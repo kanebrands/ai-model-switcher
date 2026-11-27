@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from catalog_discovery import CatalogDiscovery, candidate_id, selected_gguf
+from catalog_discovery import CatalogDiscovery, candidate_id, normalize_search, selected_gguf, verified_ggufs
 from engine_updates import EngineUpdates
 from model_catalog import ModelManager
 from model_views import index
@@ -35,6 +35,63 @@ class CatalogRefreshTests(unittest.TestCase):
         self.assertEqual(selected_gguf(siblings)[2], "model-Q4_K_M.gguf")
         self.assertEqual(selected_gguf([{"rfilename": "large-Q4_K_M.gguf", "size": 42_000_000_000,
                                          "lfs": {"sha256": "d" * 64}}])[1], 42_000_000_000)
+
+    def test_specific_search_accepts_any_publisher_and_quantization(self):
+        repo = "another-publisher/Specific-Model-GGUF"
+        self.assertEqual(normalize_search("https://huggingface.co/" + repo), repo)
+        with self.assertRaises(ValueError):
+            normalize_search("https://example.com/" + repo)
+        info = {"sha": "a" * 40, "pipeline_tag": "text-generation", "siblings": [
+            {"rfilename": "Specific-Q2_K.gguf", "size": 2_000_000_000, "lfs": {"sha256": "b" * 64}},
+            {"rfilename": "Specific-Q8_0.gguf", "size": 6_000_000_000, "lfs": {"sha256": "c" * 64}},
+            {"rfilename": "Specific-Q4_K_M-00001-of-00002.gguf", "size": 9_000_000_000,
+             "lfs": {"sha256": "d" * 64}},
+            {"rfilename": "mmproj-Specific.gguf", "size": 500_000_000, "lfs": {"sha256": "e" * 64}},
+        ]}
+        self.assertEqual(len(verified_ggufs(info["siblings"])), 2)
+        with patch.object(self.manager, "hardware", return_value={"vram_mib": None, "ram_gib": 8, "disk_free_gib": 100}), \
+             patch("catalog_discovery.fetch_json", return_value=info):
+            with self.discovery.connect() as db:
+                db.execute("INSERT INTO model_searches(id,started_at,query,status) VALUES(?,?,?,?)",
+                           ("search", "2026-11-27T00:00:00+00:00", repo, "running"))
+            self.discovery._search("search", repo)
+        result = self.discovery.latest_search()
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual([item["file"] for item in result["items"]], ["Specific-Q2_K.gguf", "Specific-Q8_0.gguf"])
+        self.assertEqual([item["fits"] for item in result["items"]], [True, False])
+        self.assertTrue(all(item["runtime"] == "cpu" for item in result["items"]))
+        self.assertEqual(self.discovery.candidate(result["items"][0]["id"])["repo"], repo)
+
+    def test_specific_search_form_warns_and_requires_override(self):
+        hardware = {"gpu": None, "vram_mib": None, "ram_gib": 8, "disk_free_gib": 100}
+        item = {"id": "discovered-" + "a" * 16, "repo": "other/large-GGUF", "file": "large-Q8_0.gguf",
+                "sha256": "b" * 64, "size_gb": 20, "runtime": "cpu", "fits": False}
+        page = index(hardware, [], [], [], "test", search={"status": "completed", "query": "large",
+                                                     "items": [item], "error": None})
+        self.assertIn('action="/models/search"', page)
+        self.assertIn('name="override_fit" value="1" required', page)
+        self.assertIn("Memory estimate exceeded", page)
+        self.assertIn("other/large-GGUF", page)
+
+    def test_keyword_search_reaches_non_curated_publisher_and_blocks_low_disk(self):
+        repo = "independent/Example-GGUF"
+        summary = {"id": repo, "pipeline_tag": "text-generation"}
+        info = {"sha": "a" * 40, "siblings": [{"rfilename": "Example-Q6_K.gguf",
+                 "size": 4_000_000_000, "lfs": {"sha256": "b" * 64}}]}
+        hardware = {"vram_mib": 24576, "ram_gib": 64, "disk_free_gib": 1}
+        with patch.object(self.manager, "hardware", return_value=hardware), \
+             patch("catalog_discovery.fetch_json", side_effect=lambda url: [summary] if "api/models?" in url else info):
+            with self.discovery.connect() as db:
+                db.execute("INSERT INTO model_searches(id,started_at,query,status) VALUES(?,?,?,?)",
+                           ("keyword", "2026-11-27T00:00:00+00:00", "Example", "running"))
+            self.discovery._search("keyword", "Example")
+        item = self.discovery.latest_search()["items"][0]
+        self.assertEqual(item["repo"], repo)
+        self.assertEqual(item["runtime"], "gpu")
+        self.assertFalse(item["disk_fits"])
+        page = index({"gpu": "GPU", **hardware}, [], [], [], "test", search=self.discovery.latest_search())
+        self.assertIn("Insufficient disk", page)
+        self.assertIn('type="submit" disabled', page)
 
     def test_search_stores_inkling_with_engine_requirement(self):
         repo = "bartowski/Inkling-2-Mini-GGUF"

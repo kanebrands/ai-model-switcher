@@ -8,8 +8,59 @@ def esc(value):
     return html.escape(str(value if value is not None else "—"), quote=True)
 
 
+def specific_search_section(search, installed, jobs, csrf, engine=None):
+    search = search or {"status": "not searched", "items": [], "query": "", "error": None}
+    installing = {job["candidate_id"] for job in jobs if job["status"] in ("queued", "running")}
+    installed_files = {(item["repo"], item["sha256"]) for item in installed}
+    engine_build = (engine or {}).get("local_build") or 0
+    rows = []
+    for item in search["items"]:
+        installed_here = item.get("installed") or (item["repo"], item["sha256"]) in installed_files
+        needs_engine = (item.get("runtime") == "gpu" and item.get("min_engine_build", 0) > engine_build)
+        busy = item["id"] in installing
+        fit = bool(item.get("fits"))
+        disk_fits = item.get("disk_fits", True)
+        state = ("Installed" if installed_here else "Installing" if busy else
+                 "Insufficient disk" if not disk_fits else "Engine update needed" if needs_engine else
+                 "Likely fits" if fit else "Memory estimate exceeded")
+        disabled = " disabled" if installed_here or busy or needs_engine or not disk_fits else ""
+        override = ('' if fit else
+                    '<label class="note"><input type="checkbox" name="override_fit" value="1" required> '
+                    'Try anyway; loading may fail or use swap and run slowly</label><br>')
+        action = (f'<form method="post" action="/models/discovered/install">'
+                  f'<input type="hidden" name="token" value="{esc(csrf)}">'
+                  f'<input type="hidden" name="candidate" value="{esc(item["id"])}">'
+                  f'{override}<button type="submit"{disabled}>{"Install" if not installed_here else "Installed"}</button></form>')
+        rows.append(f'<tr><td><a href="https://huggingface.co/{esc(item["repo"])}" target="_blank" rel="noopener noreferrer">'
+                    f'{esc(item["repo"])}</a></td><td>{esc(item["file"])}</td><td>{esc(item["size_gb"])} GB</td>'
+                    f'<td>{esc(item.get("runtime", "gpu").upper())}</td><td>{esc(state)}</td><td>{action}</td></tr>')
+    status = esc(search["status"])
+    if search.get("error"):
+        status += ': ' + esc(search["error"])
+    if search["status"] == "completed" and not rows:
+        status += ' — no verified standalone GGUF files found. Gated repositories and sharded files are not supported by this installer.'
+    installed_rows = ''.join(f'<tr><td>{esc(item["alias"])}</td><td>{esc(item["repo"])}</td>'
+                             f'<td>{esc(item.get("runtime", "gpu").upper())}</td></tr>' for item in installed)
+    return (f'<section class="card" id="specific-search"><h2>Search a specific Hugging Face model</h2>'
+            '<p>Search by model name, exact owner/repository ID, or a Hugging Face repository URL. '
+            'Searches any publisher and lists verified single-file GGUF variants, including other quantizations. '
+            'A model is downloaded only after you choose Install. The initial memory check reserves 4 GiB for serving; '
+            'you can explicitly try a model that exceeds this estimate. Disk capacity and SHA256 verification still apply. '
+            'CPU fallback is available when GPU memory is insufficient. Loading, context, and speed are unverified until the model runs. '
+            'Gated models, sharded GGUF files, projector files, and non-GGUF formats are not supported by this search.</p>'
+            f'<form method="post" action="/models/search"><input type="hidden" name="token" value="{esc(csrf)}">'
+            f'<label for="specific-model">Model or repository</label> <input id="specific-model" type="text" name="query" '
+            f'maxlength="200" required value="{esc(search.get("query") or "")}" placeholder="owner/model-GGUF or model name"> '
+            '<button type="submit">Search Hugging Face</button></form>'
+            f'<p role="status">Search: {status}</p>'
+            '<div class="scroll"><table><thead><tr><th>Repository</th><th>GGUF variant</th><th>Size</th><th>Runtime</th><th>Fit/status</th><th>Action</th></tr></thead>'
+            f'<tbody>{"".join(rows) if rows else "<tr><td colspan=6>No search results yet.</td></tr>"}</tbody></table></div>'
+            '<h3>Installed Hugging Face models</h3><div class="scroll"><table><tr><th>API name</th><th>Repository</th><th>Runtime</th></tr>'
+            f'{installed_rows if installed_rows else "<tr><td colspan=3>None yet.</td></tr>"}</table></div></section>')
+
+
 def index(hardware, suggestions, installed, jobs, csrf, prefer_ablit=True,
-          media_suggestions=(), media_jobs=(), comfy_url="", discovery=None, engine=None):
+          media_suggestions=(), media_jobs=(), comfy_url="", discovery=None, engine=None, search=None):
     selected_on = " selected" if prefer_ablit else ""
     selected_off = "" if prefer_ablit else " selected"
     hardware_line = (f'<h2>Detected hardware</h2><p>GPU: <strong>{esc(hardware["gpu"] or "unavailable")}</strong> · '
@@ -23,14 +74,16 @@ def index(hardware, suggestions, installed, jobs, csrf, prefer_ablit=True,
                      'CPU details are shown, but CPU upgrades do not increase the GPU memory available to models.</p>'
                      f'<form method="post" action="/models/hardware/rescan"><input type="hidden" name="token" value="{esc(csrf)}">'
                      '<button type="submit">Rescan hardware and suggestions</button></form>')
+    search_section = specific_search_section(search, installed, jobs, csrf, engine)
     if not hardware.get("vram_mib"):
         body = ('<section class="card">' + hardware_line + '</section>'
                 '<section class="card"><h2>CPU model choices</h2>'
                 '<p>The current installation has no compatible NVIDIA GPU. The installer offers CPU models according to detected RAM. '
                 'Installed choices are available on the switcher home page. To change the selection, rerun the installer with '
                 '<code>AI_MODEL_SELECTION=cpu-tiny,cpu-4b</code> after checking which choices fit this host. '
-                'The GPU catalog and engine updates appear when a supported GPU is detected and the installer is rerun.</p></section>')
-        return shell("Hardware and model choices", body, wide=True)
+                'The GPU catalog and engine updates appear when a supported GPU is detected and the installer is rerun.</p></section>'
+                + search_section)
+        return shell("Hardware and model choices", body, refresh=(search or {}).get("status") == "running", wide=True)
     discovery = discovery or {"status": "not checked", "items": [], "query": "", "error": None}
     engine = engine or {"checked_at": None, "checking": False, "update_available": None,
                         "local_build": None, "error": None, "job": None, "busy": False}
@@ -129,7 +182,8 @@ def index(hardware, suggestions, installed, jobs, csrf, prefer_ablit=True,
     refreshing = (refreshing or bool(media_installing) or discovery["status"] == "running"
                   or bool(engine.get("checking")) or bool(engine.get("busy")))
     comfy_link = f'<a href="{esc(comfy_url)}">Open ComfyUI</a>' if comfy_url else "Open ComfyUI from the switcher"
-    body = ('<div class="section-links" aria-label="Page sections"><a href="#text-models">Text and code</a><a href="#media-models">Image and video</a><a href="#discovered-models">Recent discoveries</a><a href="#installed-models">Installed</a></div>'
+    body = ('<div class="section-links" aria-label="Page sections"><a href="#specific-search">Search Hugging Face</a><a href="#text-models">Text and code</a><a href="#media-models">Image and video</a><a href="#discovered-models">Recent discoveries</a><a href="#installed-models">Installed</a></div>'
+            + search_section
             + '<div class="overview-grid"><section class="card" id="hardware">' + hardware_line + '</section><section class="card" id="engine">' + engine_box + '</section></div>'
             + '<h2 id="text-models">Text and code models</h2><p class="note">Top 10 reviewed Hugging Face GGUF candidates, including already installed models. New downloads fit current GPU memory with a 4 GiB serving reserve and available disk. '
               'Features describe intended use, not measured quality. Tokens/s is a broad estimate calibrated from completed short-prompt runs on this GPU; run a benchmark after installation. '
@@ -170,4 +224,5 @@ def index(hardware, suggestions, installed, jobs, csrf, prefer_ablit=True,
               f'{"".join(media_job_rows) if media_job_rows else "<tr><td colspan=4>No media downloads yet</td></tr>"}</table></div>'
             + '<h2>Recent installations</h2><div class="scroll"><table><tr><th>Model</th><th>Status</th><th>Stage</th><th>Error</th></tr>'
               f'{"".join(job_rows) if job_rows else "<tr><td colspan=4>No download jobs yet</td></tr>"}</table></div>')
-    return shell("Hugging Face model recommendations", body, refresh=refreshing, wide=True)
+    return shell("Hugging Face model recommendations", body,
+                 refresh=refreshing or (search or {}).get("status") == "running", wide=True)

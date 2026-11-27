@@ -40,7 +40,18 @@ REFERENCE_ACTIVE_B = {"local-coder": (3, True), "local-qwen4b": (4, False),
                       "local-flint-q3": (2.5, True), "local-deepseek-v4-distill": (9, False),
                       "local-qwen38-ablit": (3, True), "local-gemma4-ablit": (4, True)}
 GGUF_IMAGE = "ghcr.io/ggml-org/llama.cpp:server-cuda13"
-DOWNLOAD_IMAGE = "vllm/vllm-openai:v0.32.0-ubuntu2404"
+CPU_GGUF_IMAGE = "ghcr.io/ggml-org/llama.cpp:server"
+DOWNLOAD_IMAGE = "python:3.12-alpine"
+DOWNLOAD_SCRIPT = """import pathlib, sys, urllib.request
+url, target = sys.argv[1:]
+path = pathlib.Path(target)
+path.parent.mkdir(parents=True, exist_ok=True)
+request = urllib.request.Request(url, headers={"User-Agent": "local-ai-model-switcher/2"})
+with urllib.request.urlopen(request, timeout=60) as response, path.open("wb") as output:
+    while chunk := response.read(4 * 1024 * 1024):
+        output.write(chunk)
+print("Downloaded", path.name, path.stat().st_size, "bytes")
+"""
 NATIVE_CONTEXT = {"gpt-oss-20b": 131072}
 DEFAULT_NATIVE_CONTEXT = 262144  # Qwen3.5 and Gemma 4 catalog families
 
@@ -103,6 +114,8 @@ class ModelManager:
                 db.execute("UPDATE installed_models SET context_tokens=32768 WHERE context_tokens IS NULL")
             if "parallel_slots" not in columns:
                 db.execute("ALTER TABLE installed_models ADD COLUMN parallel_slots INTEGER NOT NULL DEFAULT 1")
+            if "runtime" not in columns:
+                db.execute("ALTER TABLE installed_models ADD COLUMN runtime TEXT NOT NULL DEFAULT 'gpu'")
             db.execute("""CREATE TABLE IF NOT EXISTS model_jobs (
                 id TEXT PRIMARY KEY, candidate_id TEXT NOT NULL, started_at TEXT NOT NULL,
                 ended_at TEXT, status TEXT NOT NULL, stage TEXT NOT NULL, error TEXT)""")
@@ -285,46 +298,65 @@ class ModelManager:
         chosen.sort(key=lambda item: (-item["score"], item["name"]))
         return hardware, chosen
 
-    def start_install(self, candidate_id, candidate=None, engine_build=None):
+    def start_install(self, candidate_id, candidate=None, engine_build=None, allow_unfit=False):
         candidate = candidate or BY_ID.get(candidate_id)
         if not candidate:
             raise ValueError("Unknown catalog model")
         if candidate["id"] != candidate_id or not re.fullmatch(r"[a-z0-9-]{2,64}", candidate_id):
             raise ValueError("Invalid catalog candidate")
-        if candidate.get("min_engine_build", 0) and (engine_build or 0) < candidate["min_engine_build"]:
+        if candidate.get("runtime", "gpu") == "gpu" and candidate.get("min_engine_build", 0) and (engine_build or 0) < candidate["min_engine_build"]:
             raise ValueError(f"This model requires llama.cpp build {candidate['min_engine_build']} or newer; update the engine first")
         with self.lock:
             if self.busy:
                 raise RuntimeError("A model download is already running")
-            if any(item["candidate_id"] == candidate_id for item in self.installed()):
+            installed = self.installed()
+            if any(item["candidate_id"] == candidate_id for item in installed):
                 raise ValueError("Model already installed")
             metadata = self._metadata(candidate)
+            if (candidate.get("revision") and candidate["revision"] != metadata["revision"] or
+                    candidate.get("sha256") and candidate["sha256"] != metadata["sha256"]):
+                raise ValueError("Model changed since the search; search again before installing")
+            if any(item["repo"] == candidate["repo"] and item["sha256"] == metadata["sha256"] for item in installed):
+                raise ValueError("This GGUF file is already installed")
             hardware = self.hardware()
-            if not hardware["vram_mib"] or metadata["size"] + 4 * 2**30 > hardware["vram_mib"] * 2**20:
-                raise ValueError("Model does not fit GPU with the required 4 GiB reserve")
+            runtime = candidate.get("runtime", "gpu")
+            if runtime not in ("cpu", "gpu"):
+                raise ValueError("Unsupported runtime")
+            available_bytes = ((hardware.get("vram_mib") or 0) * 2**20 if runtime == "gpu"
+                               else hardware.get("ram_gib", 0) * 2**30)
+            if runtime == "gpu" and not hardware.get("vram_mib"):
+                raise ValueError("No compatible GPU is available for this model")
+            if not allow_unfit and metadata["size"] + 4 * 2**30 > available_bytes:
+                raise ValueError("Estimated model memory exceeds available " + ("GPU memory" if runtime == "gpu" else "RAM") + "; select Try anyway to override")
             if metadata["size"] * 1.2 > hardware["disk_free_gib"] * 2**30:
                 raise ValueError("Insufficient model storage")
-            context_tokens = context_for_hardware(candidate, metadata["size"], hardware["vram_mib"])
+            context_tokens = (context_for_hardware(candidate, metadata["size"], hardware["vram_mib"])
+                              if runtime == "gpu" else
+                              min(16384 if available_bytes - metadata["size"] >= 16 * 2**30 else
+                                  8192 if available_bytes - metadata["size"] >= 8 * 2**30 else 4096,
+                                  NATIVE_CONTEXT.get(candidate_id, DEFAULT_NATIVE_CONTEXT)))
+            if context_tokens is None:
+                context_tokens = 4096
             job_id = str(uuid.uuid4())
             with self.connect() as db:
                 db.execute("INSERT INTO model_jobs(id,candidate_id,started_at,status,stage) VALUES(?,?,?,?,?)",
                            (job_id, candidate_id, now(), "queued", "queued"))
             self.busy = True
-            threading.Thread(target=self._install, args=(job_id, candidate, metadata, context_tokens), daemon=True).start()
+            threading.Thread(target=self._install, args=(job_id, candidate, metadata, context_tokens, runtime), daemon=True).start()
             return job_id
 
-    def _install(self, job_id, candidate, metadata, context_tokens):
+    def _install(self, job_id, candidate, metadata, context_tokens, runtime="gpu"):
         downloader = None
         serving = None
         try:
             self._job(job_id, status="running", stage="downloading")
             name = "local-ai-hf-download-" + job_id[:12]
             stage_dir = ".catalog_downloads/" + candidate["id"]
-            config = {"Image": DOWNLOAD_IMAGE, "Entrypoint": ["hf"],
-                      "Cmd": ["download", candidate["repo"], candidate["file"], "--revision", metadata["revision"],
-                              "--local-dir", "/models/" + stage_dir],
-                      "Env": ["HF_HOME=/tmp/hf"],
-                      "HostConfig": {"Binds": [self.host_dir + ":/models"], "NetworkMode": "bridge", "Memory": 8 * 2**30}}
+            source_url = ("https://huggingface.co/" + urllib.parse.quote(candidate["repo"], safe="/") +
+                          "/resolve/" + metadata["revision"] + "/" + urllib.parse.quote(candidate["file"], safe=""))
+            config = {"Image": DOWNLOAD_IMAGE, "Cmd": ["python", "-c", DOWNLOAD_SCRIPT, source_url,
+                      "/models/" + stage_dir + "/" + candidate["file"]],
+                      "HostConfig": {"Binds": [self.host_dir + ":/models"], "NetworkMode": "bridge", "Memory": 512 * 2**20}}
             downloader = docker_api("POST", "/containers/create?name=" + name, config)["Id"]
             docker_api("POST", f"/containers/{downloader}/start")
             for _ in range(720):
@@ -366,11 +398,13 @@ class ModelManager:
             self._job(job_id, stage="creating serving container")
             container = "local-ai-hf-" + candidate["id"]
             alias = "local-hf-" + candidate["id"]
-            serving_config = self.serving_config(filename, alias, context_tokens)
+            image = GGUF_IMAGE if runtime == "gpu" else CPU_GGUF_IMAGE
+            self._ensure_image(image)
+            serving_config = self.serving_config(filename, alias, context_tokens, runtime=runtime)
             serving = docker_api("POST", "/containers/create?name=" + container, serving_config)["Id"]
             with self.connect() as db:
-                db.execute("INSERT INTO installed_models(candidate_id,repo,filename,revision,sha256,size,installed_at,alias,container,context_tokens) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                           (candidate["id"], candidate["repo"], filename, metadata["revision"], metadata["sha256"], metadata["size"], now(), alias, container, context_tokens))
+                db.execute("INSERT INTO installed_models(candidate_id,repo,filename,revision,sha256,size,installed_at,alias,container,context_tokens,runtime) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                           (candidate["id"], candidate["repo"], filename, metadata["revision"], metadata["sha256"], metadata["size"], now(), alias, container, context_tokens, runtime))
             MODELS["hf-" + candidate["id"]] = (alias, container)
             serving = None
             self._job(job_id, status="completed", stage="installed; ready to select", ended_at=now())
@@ -386,15 +420,42 @@ class ModelManager:
             with self.lock:
                 self.busy = False
 
-    def serving_config(self, filename, alias, context_tokens, image=GGUF_IMAGE, parallel_slots=1):
-        return {"Image": image, "Env": ["LLAMA_API_KEY=" + self.api_key],
-                "Cmd": ["--model", "/models/" + filename, "--alias", alias, "--host", "0.0.0.0", "--port", "8080",
-                        "--ctx-size", str(context_tokens or 16384), "--n-gpu-layers", "auto", "--fit-target", "2048",
-                        "--flash-attn", "on", "--parallel", str(parallel_slots)],
-                "Labels": {"local-ai.model-manager": "1"},
-                "HostConfig": {"Binds": [self.host_dir + ":/models:ro"], "NetworkMode": self.network,
-                               "DeviceRequests": [{"Driver": "nvidia", "Count": 1, "Capabilities": [["gpu"]]}],
-                               "RestartPolicy": {"Name": "unless-stopped"}}}
+    def _ensure_image(self, image):
+        try:
+            docker_api("GET", "/images/" + urllib.parse.quote(image, safe="") + "/json")
+            return
+        except RuntimeError as exc:
+            if "Docker API 404" not in str(exc):
+                raise
+        name = "local-ai-image-pull-" + uuid.uuid4().hex[:12]
+        helper = docker_api("POST", "/containers/create?name=" + name, {
+            "Image": "docker:cli", "Cmd": ["docker", "pull", image],
+            "HostConfig": {"Binds": ["/var/run/docker.sock:/var/run/docker.sock"],
+                           "NetworkMode": "bridge", "Memory": 512 * 2**20}})["Id"]
+        try:
+            docker_api("POST", "/containers/" + helper + "/start")
+            for _ in range(600):
+                state = docker_api("GET", "/containers/" + helper + "/json")["State"]
+                if not state.get("Running"):
+                    if state.get("ExitCode") != 0:
+                        raise RuntimeError("Could not download the selected llama.cpp engine image")
+                    return
+                time.sleep(2)
+            raise TimeoutError("Engine image download exceeded 20 minutes")
+        finally:
+            docker_api("DELETE", "/containers/" + helper + "?force=1")
+
+    def serving_config(self, filename, alias, context_tokens, image=None, parallel_slots=1, runtime="gpu"):
+        image = image or (GGUF_IMAGE if runtime == "gpu" else CPU_GGUF_IMAGE)
+        command = ["--model", "/models/" + filename, "--alias", alias, "--host", "0.0.0.0", "--port", "8080",
+                   "--ctx-size", str(context_tokens or 4096), "--parallel", str(parallel_slots)]
+        host = {"Binds": [self.host_dir + ":/models:ro"], "NetworkMode": self.network,
+                "RestartPolicy": {"Name": "unless-stopped"}}
+        if runtime == "gpu":
+            command += ["--n-gpu-layers", "auto", "--fit-target", "2048", "--flash-attn", "on"]
+            host["DeviceRequests"] = [{"Driver": "nvidia", "Count": 1, "Capabilities": [["gpu"]]}]
+        return {"Image": image, "Env": ["LLAMA_API_KEY=" + self.api_key], "Cmd": command,
+                "Labels": {"local-ai.model-manager": "1"}, "HostConfig": host}
 
     def ensure_current_engine(self, mode):
         """Recreate a stopped managed container on the latest pulled image.
@@ -410,7 +471,8 @@ class ModelManager:
         inspect = docker_api("GET", "/containers/" + name + "/json")
         if inspect["State"].get("Running"):
             return None
-        image = docker_api("GET", "/images/" + urllib.parse.quote(GGUF_IMAGE, safe="") + "/json")["Id"]
+        image_name = CPU_GGUF_IMAGE if row.get("runtime") == "cpu" else GGUF_IMAGE
+        image = docker_api("GET", "/images/" + urllib.parse.quote(image_name, safe="") + "/json")["Id"]
         if inspect["Image"] == image:
             return None
         backup = name + "-rollback-" + uuid.uuid4().hex[:8]
@@ -418,7 +480,7 @@ class ModelManager:
         try:
             docker_api("POST", "/containers/create?name=" + name,
                        self.serving_config(row["filename"], row["alias"], row["context_tokens"],
-                                           parallel_slots=row["parallel_slots"]))
+                                           parallel_slots=row["parallel_slots"], runtime=row.get("runtime", "gpu")))
         except Exception:
             docker_api("POST", "/containers/" + backup + "/rename?name=" + name)
             raise

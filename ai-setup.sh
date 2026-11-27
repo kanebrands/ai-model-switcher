@@ -958,6 +958,8 @@ def switch(target):
         raise ValueError("Unknown mode")
     if SELECTED_MODES and target not in SELECTED_MODES and not target.startswith("hf-"):
         raise ValueError("This workload was not selected at installation")
+    if not SELECTED_MODES and workload_state(workloads[target]) == "not created":
+        raise ValueError("This workload is not installed")
     if ENGINE_UPDATES.busy or CONTEXT_TUNER.busy or PARALLEL_TUNER.busy:
         raise RuntimeError("Wait for the engine or context change to finish before switching models")
     with LOCK:
@@ -1082,8 +1084,15 @@ class Handler(BaseHTTPRequestHandler):
             item = contexts.get(which) or {}
             tokens = item.get("tokens")
             return f'{tokens:,} tokens ({item["state"]})' if tokens else item.get("state", "unavailable")
+        builtin_states = {"cpu-tiny": cpu_tiny_state, "cpu-4b": cpu_4b_state, "llm": llm_state,
+                          "qwen4b": qwen4b_state, "huihui": huihui_state,
+                          "flint-iq4": flint_iq4_state, "flint-q3": flint_q3_state,
+                          "deepseek": deepseek_state, "qwen38": qwen38_state,
+                          "gemma4": gemma4_state, "vision": vision_state, "media": media_state}
+        def available_builtin(which):
+            return which in SELECTED_MODES if SELECTED_MODES else builtin_states.get(which) != "not created"
         model_labels = {**{key: value for key, value in BUILTIN_LABELS.items()
-                           if not SELECTED_MODES or key in SELECTED_MODES},
+                           if available_builtin(key)},
                         **{"hf-" + item["candidate_id"]: item["alias"] + " (Hugging Face)" for item in managed}}
         model_options = "".join(
             f'<option value="{h(which)}" {"selected" if contexts.get(which, {}).get("running") else ""}>'
@@ -1124,7 +1133,7 @@ class Handler(BaseHTTPRequestHandler):
                   ("gemma4", "Gemma 4", gemma4_state), ("media", "ComfyUI", media_state))
         status_cards = "".join(
             f'<div class="service"><span>{h(label)}</span><strong class="{"ready" if state in ("healthy", "running") else "idle"}">{h(state)}</strong></div>'
-            for key, label, state in states if not SELECTED_MODES or key in SELECTED_MODES)
+            for key, label, state in states if available_builtin(key))
         webui_status = WEBUI_UPDATES.status()
         webui_job = webui_status.get("job") or {}
         webui_card = ""
@@ -1168,14 +1177,14 @@ class Handler(BaseHTTPRequestHandler):
 <h2>Choose a workload</h2><div class="home-grid"><section class="card"><h3>Language model</h3>
 <form method="post" action="/switch"><input type="hidden" name="token" value="{h(CSRF)}"><label for="model">LLM model and saved context</label><br><select id="model" name="mode">{model_options}</select><button type="submit">Use selected model</button></form>
 <details><summary>Context for every model before loading</summary><table><tr><th>Model</th><th>Context</th></tr>{context_rows}</table></details>
-{'' if SELECTED_MODES and 'media' not in SELECTED_MODES else '<div class="home-actions"><span class="note">Image and video workflow</span>'}
-{'' if SELECTED_MODES and 'media' not in SELECTED_MODES else f'''<form method="post" action="/switch"><input type="hidden" name="token" value="{h(CSRF)}"><button name="mode" value="media">Use ComfyUI</button></form></div>'''}
+{'' if not available_builtin('media') else '<div class="home-actions"><span class="note">Image and video workflow</span>'}
+{'' if not available_builtin('media') else f'''<form method="post" action="/switch"><input type="hidden" name="token" value="{h(CSRF)}"><button name="mode" value="media">Use ComfyUI</button></form></div>'''}
 <p class="note">Switching stops the other model workloads and interrupts active requests. In Open WebUI, choose the matching model after it starts.</p></section>
 <section class="card"><h3>Context tuning</h3>{context_form}{context_note}<p class="note">“Tuned” means the value passed a restart and readiness test on this hardware. Testing briefly interrupts requests; a failed test restores the previous setting. Larger context uses more memory and may reduce speed.</p></section></div>
 <h2>Service status</h2><div class="services">{status_cards}</div><p><a href="/">Refresh status</a></p>
-{'' if SELECTED_MODES and not any(item not in ('cpu-tiny','cpu-4b') for item in SELECTED_MODES) else '<section class="card"><h2>Live GPU status</h2><p class="gpu-note">GPU use and VRAM use over recent samples. Temperature and power are current readings. This panel refreshes every five seconds without reloading the switcher controls.</p><iframe class="gpu-frame" src="/gpu/graph" title="Live GPU utilization and memory graph" loading="lazy"></iframe></section>'}
+{'' if not any(available_builtin(item) for item in ('llm','qwen4b','huihui','flint-iq4','flint-q3','deepseek','qwen38','gemma4','vision','media')) else '<section class="card"><h2>Live GPU status</h2><p class="gpu-note">GPU use and VRAM use over recent samples. Temperature and power are current readings. This panel refreshes every five seconds without reloading the switcher controls.</p><iframe class="gpu-frame" src="/gpu/graph" title="Live GPU utilization and memory graph" loading="lazy"></iframe></section>'}
 <p class="note">If a service fails, check ai-control.sh huihui-logs or media-logs. If Open WebUI still shows local-coder after switching, set its connection URL to http://nginx:8080/v1 in Admin → Settings → Connections.</p>
-<div class="home-footer"><a href="/models">Find models</a><a href="/benchmarks">Benchmarks and results</a><a href="/sharing">Client sharing and rate limits</a><a href="{h(WEB_URL)}">Open WebUI</a>{'' if SELECTED_MODES and 'media' not in SELECTED_MODES else f'<a href="{h(COMFY_URL)}">ComfyUI</a>'}</div></main></html>"""
+<div class="home-footer"><a href="/models">Find models</a><a href="/benchmarks">Benchmarks and results</a><a href="/sharing">Client sharing and rate limits</a><a href="{h(WEB_URL)}">Open WebUI</a>{f'<a href="{h(COMFY_URL)}">ComfyUI</a>' if available_builtin('media') else ''}</div></main></html>"""
         data = page.encode()
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -1232,7 +1241,7 @@ class Handler(BaseHTTPRequestHandler):
                 media_suggestions = MEDIA_MANAGER.recommendations(hardware, prefer_ablit)
                 self._send_html(model_views.index(hardware, suggestions, MODEL_MANAGER.installed(), MODEL_MANAGER.jobs(), CSRF,
                                                   prefer_ablit, media_suggestions, MEDIA_MANAGER.jobs(), COMFY_URL,
-                                                  DISCOVERY.latest(), ENGINE_UPDATES.status()))
+                                                  DISCOVERY.latest(), ENGINE_UPDATES.status(), DISCOVERY.latest_search()))
             except Exception as exc:
                 self.send_error(503, f"Recommendations unavailable: {type(exc).__name__}")
             return
@@ -1360,7 +1369,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         if self.path not in ("/switch", "/benchmark", "/context/tune", "/benchmarks/delete", "/models/install",
-                             "/models/media/install", "/models/refresh", "/models/hardware/rescan", "/models/discovered/install",
+                             "/models/media/install", "/models/refresh", "/models/search", "/models/hardware/rescan", "/models/discovered/install",
                              "/models/engine/check", "/models/engine/update", "/webui/update", "/webui/update/dismiss",
                              "/sharing/save", "/sharing/reset", "/sharing/client", "/sharing/revoke",
                              "/sharing/parallel"):
@@ -1491,10 +1500,15 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
-        if self.path in ("/models/refresh", "/models/hardware/rescan", "/models/engine/check", "/models/engine/update", "/models/discovered/install"):
+        if self.path in ("/models/refresh", "/models/search", "/models/hardware/rescan", "/models/engine/check", "/models/engine/update", "/models/discovered/install"):
             try:
                 if self.path == "/models/refresh":
                     DISCOVERY.start_refresh(fields.get("search", [""])[0])
+                elif self.path == "/models/search":
+                    values = fields.get("query", [])
+                    if len(values) != 1:
+                        raise ValueError("Enter one model name or Hugging Face repository")
+                    DISCOVERY.start_search(values[0])
                 elif self.path == "/models/hardware/rescan":
                     hardware = MODEL_MANAGER.hardware(force=True)
                     SHARING.settings(hardware, active_server_slots())
@@ -1511,8 +1525,12 @@ class Handler(BaseHTTPRequestHandler):
                         raise ValueError("Select one discovered model")
                     candidate = DISCOVERY.candidate(selected[0])
                     if not candidate:
-                        raise ValueError("Candidate is no longer in the latest catalog refresh")
-                    MODEL_MANAGER.start_install(selected[0], candidate, ENGINE_UPDATES.status().get("local_build"))
+                        raise ValueError("Candidate is no longer in the latest search or catalog refresh")
+                    override = fields.get("override_fit", [])
+                    if override not in ([], ["1"]):
+                        raise ValueError("Invalid memory override")
+                    MODEL_MANAGER.start_install(selected[0], candidate, ENGINE_UPDATES.status().get("local_build"),
+                                                allow_unfit=override == ["1"])
             except ValueError as exc:
                 self.send_error(400, str(exc))
                 return
@@ -2440,7 +2458,18 @@ REFERENCE_ACTIVE_B = {"local-coder": (3, True), "local-qwen4b": (4, False),
                       "local-flint-q3": (2.5, True), "local-deepseek-v4-distill": (9, False),
                       "local-qwen38-ablit": (3, True), "local-gemma4-ablit": (4, True)}
 GGUF_IMAGE = "ghcr.io/ggml-org/llama.cpp:server-cuda13"
-DOWNLOAD_IMAGE = "vllm/vllm-openai:v0.32.0-ubuntu2404"
+CPU_GGUF_IMAGE = "ghcr.io/ggml-org/llama.cpp:server"
+DOWNLOAD_IMAGE = "python:3.12-alpine"
+DOWNLOAD_SCRIPT = """import pathlib, sys, urllib.request
+url, target = sys.argv[1:]
+path = pathlib.Path(target)
+path.parent.mkdir(parents=True, exist_ok=True)
+request = urllib.request.Request(url, headers={"User-Agent": "local-ai-model-switcher/2"})
+with urllib.request.urlopen(request, timeout=60) as response, path.open("wb") as output:
+    while chunk := response.read(4 * 1024 * 1024):
+        output.write(chunk)
+print("Downloaded", path.name, path.stat().st_size, "bytes")
+"""
 NATIVE_CONTEXT = {"gpt-oss-20b": 131072}
 DEFAULT_NATIVE_CONTEXT = 262144  # Qwen3.5 and Gemma 4 catalog families
 
@@ -2503,6 +2532,8 @@ class ModelManager:
                 db.execute("UPDATE installed_models SET context_tokens=32768 WHERE context_tokens IS NULL")
             if "parallel_slots" not in columns:
                 db.execute("ALTER TABLE installed_models ADD COLUMN parallel_slots INTEGER NOT NULL DEFAULT 1")
+            if "runtime" not in columns:
+                db.execute("ALTER TABLE installed_models ADD COLUMN runtime TEXT NOT NULL DEFAULT 'gpu'")
             db.execute("""CREATE TABLE IF NOT EXISTS model_jobs (
                 id TEXT PRIMARY KEY, candidate_id TEXT NOT NULL, started_at TEXT NOT NULL,
                 ended_at TEXT, status TEXT NOT NULL, stage TEXT NOT NULL, error TEXT)""")
@@ -2685,46 +2716,65 @@ class ModelManager:
         chosen.sort(key=lambda item: (-item["score"], item["name"]))
         return hardware, chosen
 
-    def start_install(self, candidate_id, candidate=None, engine_build=None):
+    def start_install(self, candidate_id, candidate=None, engine_build=None, allow_unfit=False):
         candidate = candidate or BY_ID.get(candidate_id)
         if not candidate:
             raise ValueError("Unknown catalog model")
         if candidate["id"] != candidate_id or not re.fullmatch(r"[a-z0-9-]{2,64}", candidate_id):
             raise ValueError("Invalid catalog candidate")
-        if candidate.get("min_engine_build", 0) and (engine_build or 0) < candidate["min_engine_build"]:
+        if candidate.get("runtime", "gpu") == "gpu" and candidate.get("min_engine_build", 0) and (engine_build or 0) < candidate["min_engine_build"]:
             raise ValueError(f"This model requires llama.cpp build {candidate['min_engine_build']} or newer; update the engine first")
         with self.lock:
             if self.busy:
                 raise RuntimeError("A model download is already running")
-            if any(item["candidate_id"] == candidate_id for item in self.installed()):
+            installed = self.installed()
+            if any(item["candidate_id"] == candidate_id for item in installed):
                 raise ValueError("Model already installed")
             metadata = self._metadata(candidate)
+            if (candidate.get("revision") and candidate["revision"] != metadata["revision"] or
+                    candidate.get("sha256") and candidate["sha256"] != metadata["sha256"]):
+                raise ValueError("Model changed since the search; search again before installing")
+            if any(item["repo"] == candidate["repo"] and item["sha256"] == metadata["sha256"] for item in installed):
+                raise ValueError("This GGUF file is already installed")
             hardware = self.hardware()
-            if not hardware["vram_mib"] or metadata["size"] + 4 * 2**30 > hardware["vram_mib"] * 2**20:
-                raise ValueError("Model does not fit GPU with the required 4 GiB reserve")
+            runtime = candidate.get("runtime", "gpu")
+            if runtime not in ("cpu", "gpu"):
+                raise ValueError("Unsupported runtime")
+            available_bytes = ((hardware.get("vram_mib") or 0) * 2**20 if runtime == "gpu"
+                               else hardware.get("ram_gib", 0) * 2**30)
+            if runtime == "gpu" and not hardware.get("vram_mib"):
+                raise ValueError("No compatible GPU is available for this model")
+            if not allow_unfit and metadata["size"] + 4 * 2**30 > available_bytes:
+                raise ValueError("Estimated model memory exceeds available " + ("GPU memory" if runtime == "gpu" else "RAM") + "; select Try anyway to override")
             if metadata["size"] * 1.2 > hardware["disk_free_gib"] * 2**30:
                 raise ValueError("Insufficient model storage")
-            context_tokens = context_for_hardware(candidate, metadata["size"], hardware["vram_mib"])
+            context_tokens = (context_for_hardware(candidate, metadata["size"], hardware["vram_mib"])
+                              if runtime == "gpu" else
+                              min(16384 if available_bytes - metadata["size"] >= 16 * 2**30 else
+                                  8192 if available_bytes - metadata["size"] >= 8 * 2**30 else 4096,
+                                  NATIVE_CONTEXT.get(candidate_id, DEFAULT_NATIVE_CONTEXT)))
+            if context_tokens is None:
+                context_tokens = 4096
             job_id = str(uuid.uuid4())
             with self.connect() as db:
                 db.execute("INSERT INTO model_jobs(id,candidate_id,started_at,status,stage) VALUES(?,?,?,?,?)",
                            (job_id, candidate_id, now(), "queued", "queued"))
             self.busy = True
-            threading.Thread(target=self._install, args=(job_id, candidate, metadata, context_tokens), daemon=True).start()
+            threading.Thread(target=self._install, args=(job_id, candidate, metadata, context_tokens, runtime), daemon=True).start()
             return job_id
 
-    def _install(self, job_id, candidate, metadata, context_tokens):
+    def _install(self, job_id, candidate, metadata, context_tokens, runtime="gpu"):
         downloader = None
         serving = None
         try:
             self._job(job_id, status="running", stage="downloading")
             name = "local-ai-hf-download-" + job_id[:12]
             stage_dir = ".catalog_downloads/" + candidate["id"]
-            config = {"Image": DOWNLOAD_IMAGE, "Entrypoint": ["hf"],
-                      "Cmd": ["download", candidate["repo"], candidate["file"], "--revision", metadata["revision"],
-                              "--local-dir", "/models/" + stage_dir],
-                      "Env": ["HF_HOME=/tmp/hf"],
-                      "HostConfig": {"Binds": [self.host_dir + ":/models"], "NetworkMode": "bridge", "Memory": 8 * 2**30}}
+            source_url = ("https://huggingface.co/" + urllib.parse.quote(candidate["repo"], safe="/") +
+                          "/resolve/" + metadata["revision"] + "/" + urllib.parse.quote(candidate["file"], safe=""))
+            config = {"Image": DOWNLOAD_IMAGE, "Cmd": ["python", "-c", DOWNLOAD_SCRIPT, source_url,
+                      "/models/" + stage_dir + "/" + candidate["file"]],
+                      "HostConfig": {"Binds": [self.host_dir + ":/models"], "NetworkMode": "bridge", "Memory": 512 * 2**20}}
             downloader = docker_api("POST", "/containers/create?name=" + name, config)["Id"]
             docker_api("POST", f"/containers/{downloader}/start")
             for _ in range(720):
@@ -2766,11 +2816,13 @@ class ModelManager:
             self._job(job_id, stage="creating serving container")
             container = "local-ai-hf-" + candidate["id"]
             alias = "local-hf-" + candidate["id"]
-            serving_config = self.serving_config(filename, alias, context_tokens)
+            image = GGUF_IMAGE if runtime == "gpu" else CPU_GGUF_IMAGE
+            self._ensure_image(image)
+            serving_config = self.serving_config(filename, alias, context_tokens, runtime=runtime)
             serving = docker_api("POST", "/containers/create?name=" + container, serving_config)["Id"]
             with self.connect() as db:
-                db.execute("INSERT INTO installed_models(candidate_id,repo,filename,revision,sha256,size,installed_at,alias,container,context_tokens) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                           (candidate["id"], candidate["repo"], filename, metadata["revision"], metadata["sha256"], metadata["size"], now(), alias, container, context_tokens))
+                db.execute("INSERT INTO installed_models(candidate_id,repo,filename,revision,sha256,size,installed_at,alias,container,context_tokens,runtime) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                           (candidate["id"], candidate["repo"], filename, metadata["revision"], metadata["sha256"], metadata["size"], now(), alias, container, context_tokens, runtime))
             MODELS["hf-" + candidate["id"]] = (alias, container)
             serving = None
             self._job(job_id, status="completed", stage="installed; ready to select", ended_at=now())
@@ -2786,15 +2838,42 @@ class ModelManager:
             with self.lock:
                 self.busy = False
 
-    def serving_config(self, filename, alias, context_tokens, image=GGUF_IMAGE, parallel_slots=1):
-        return {"Image": image, "Env": ["LLAMA_API_KEY=" + self.api_key],
-                "Cmd": ["--model", "/models/" + filename, "--alias", alias, "--host", "0.0.0.0", "--port", "8080",
-                        "--ctx-size", str(context_tokens or 16384), "--n-gpu-layers", "auto", "--fit-target", "2048",
-                        "--flash-attn", "on", "--parallel", str(parallel_slots)],
-                "Labels": {"local-ai.model-manager": "1"},
-                "HostConfig": {"Binds": [self.host_dir + ":/models:ro"], "NetworkMode": self.network,
-                               "DeviceRequests": [{"Driver": "nvidia", "Count": 1, "Capabilities": [["gpu"]]}],
-                               "RestartPolicy": {"Name": "unless-stopped"}}}
+    def _ensure_image(self, image):
+        try:
+            docker_api("GET", "/images/" + urllib.parse.quote(image, safe="") + "/json")
+            return
+        except RuntimeError as exc:
+            if "Docker API 404" not in str(exc):
+                raise
+        name = "local-ai-image-pull-" + uuid.uuid4().hex[:12]
+        helper = docker_api("POST", "/containers/create?name=" + name, {
+            "Image": "docker:cli", "Cmd": ["docker", "pull", image],
+            "HostConfig": {"Binds": ["/var/run/docker.sock:/var/run/docker.sock"],
+                           "NetworkMode": "bridge", "Memory": 512 * 2**20}})["Id"]
+        try:
+            docker_api("POST", "/containers/" + helper + "/start")
+            for _ in range(600):
+                state = docker_api("GET", "/containers/" + helper + "/json")["State"]
+                if not state.get("Running"):
+                    if state.get("ExitCode") != 0:
+                        raise RuntimeError("Could not download the selected llama.cpp engine image")
+                    return
+                time.sleep(2)
+            raise TimeoutError("Engine image download exceeded 20 minutes")
+        finally:
+            docker_api("DELETE", "/containers/" + helper + "?force=1")
+
+    def serving_config(self, filename, alias, context_tokens, image=None, parallel_slots=1, runtime="gpu"):
+        image = image or (GGUF_IMAGE if runtime == "gpu" else CPU_GGUF_IMAGE)
+        command = ["--model", "/models/" + filename, "--alias", alias, "--host", "0.0.0.0", "--port", "8080",
+                   "--ctx-size", str(context_tokens or 4096), "--parallel", str(parallel_slots)]
+        host = {"Binds": [self.host_dir + ":/models:ro"], "NetworkMode": self.network,
+                "RestartPolicy": {"Name": "unless-stopped"}}
+        if runtime == "gpu":
+            command += ["--n-gpu-layers", "auto", "--fit-target", "2048", "--flash-attn", "on"]
+            host["DeviceRequests"] = [{"Driver": "nvidia", "Count": 1, "Capabilities": [["gpu"]]}]
+        return {"Image": image, "Env": ["LLAMA_API_KEY=" + self.api_key], "Cmd": command,
+                "Labels": {"local-ai.model-manager": "1"}, "HostConfig": host}
 
     def ensure_current_engine(self, mode):
         """Recreate a stopped managed container on the latest pulled image.
@@ -2810,7 +2889,8 @@ class ModelManager:
         inspect = docker_api("GET", "/containers/" + name + "/json")
         if inspect["State"].get("Running"):
             return None
-        image = docker_api("GET", "/images/" + urllib.parse.quote(GGUF_IMAGE, safe="") + "/json")["Id"]
+        image_name = CPU_GGUF_IMAGE if row.get("runtime") == "cpu" else GGUF_IMAGE
+        image = docker_api("GET", "/images/" + urllib.parse.quote(image_name, safe="") + "/json")["Id"]
         if inspect["Image"] == image:
             return None
         backup = name + "-rollback-" + uuid.uuid4().hex[:8]
@@ -2818,7 +2898,7 @@ class ModelManager:
         try:
             docker_api("POST", "/containers/create?name=" + name,
                        self.serving_config(row["filename"], row["alias"], row["context_tokens"],
-                                           parallel_slots=row["parallel_slots"]))
+                                           parallel_slots=row["parallel_slots"], runtime=row.get("runtime", "gpu")))
         except Exception:
             docker_api("POST", "/containers/" + backup + "/rename?name=" + name)
             raise
@@ -2846,8 +2926,59 @@ def esc(value):
     return html.escape(str(value if value is not None else "—"), quote=True)
 
 
+def specific_search_section(search, installed, jobs, csrf, engine=None):
+    search = search or {"status": "not searched", "items": [], "query": "", "error": None}
+    installing = {job["candidate_id"] for job in jobs if job["status"] in ("queued", "running")}
+    installed_files = {(item["repo"], item["sha256"]) for item in installed}
+    engine_build = (engine or {}).get("local_build") or 0
+    rows = []
+    for item in search["items"]:
+        installed_here = item.get("installed") or (item["repo"], item["sha256"]) in installed_files
+        needs_engine = (item.get("runtime") == "gpu" and item.get("min_engine_build", 0) > engine_build)
+        busy = item["id"] in installing
+        fit = bool(item.get("fits"))
+        disk_fits = item.get("disk_fits", True)
+        state = ("Installed" if installed_here else "Installing" if busy else
+                 "Insufficient disk" if not disk_fits else "Engine update needed" if needs_engine else
+                 "Likely fits" if fit else "Memory estimate exceeded")
+        disabled = " disabled" if installed_here or busy or needs_engine or not disk_fits else ""
+        override = ('' if fit else
+                    '<label class="note"><input type="checkbox" name="override_fit" value="1" required> '
+                    'Try anyway; loading may fail or use swap and run slowly</label><br>')
+        action = (f'<form method="post" action="/models/discovered/install">'
+                  f'<input type="hidden" name="token" value="{esc(csrf)}">'
+                  f'<input type="hidden" name="candidate" value="{esc(item["id"])}">'
+                  f'{override}<button type="submit"{disabled}>{"Install" if not installed_here else "Installed"}</button></form>')
+        rows.append(f'<tr><td><a href="https://huggingface.co/{esc(item["repo"])}" target="_blank" rel="noopener noreferrer">'
+                    f'{esc(item["repo"])}</a></td><td>{esc(item["file"])}</td><td>{esc(item["size_gb"])} GB</td>'
+                    f'<td>{esc(item.get("runtime", "gpu").upper())}</td><td>{esc(state)}</td><td>{action}</td></tr>')
+    status = esc(search["status"])
+    if search.get("error"):
+        status += ': ' + esc(search["error"])
+    if search["status"] == "completed" and not rows:
+        status += ' — no verified standalone GGUF files found. Gated repositories and sharded files are not supported by this installer.'
+    installed_rows = ''.join(f'<tr><td>{esc(item["alias"])}</td><td>{esc(item["repo"])}</td>'
+                             f'<td>{esc(item.get("runtime", "gpu").upper())}</td></tr>' for item in installed)
+    return (f'<section class="card" id="specific-search"><h2>Search a specific Hugging Face model</h2>'
+            '<p>Search by model name, exact owner/repository ID, or a Hugging Face repository URL. '
+            'Searches any publisher and lists verified single-file GGUF variants, including other quantizations. '
+            'A model is downloaded only after you choose Install. The initial memory check reserves 4 GiB for serving; '
+            'you can explicitly try a model that exceeds this estimate. Disk capacity and SHA256 verification still apply. '
+            'CPU fallback is available when GPU memory is insufficient. Loading, context, and speed are unverified until the model runs. '
+            'Gated models, sharded GGUF files, projector files, and non-GGUF formats are not supported by this search.</p>'
+            f'<form method="post" action="/models/search"><input type="hidden" name="token" value="{esc(csrf)}">'
+            f'<label for="specific-model">Model or repository</label> <input id="specific-model" type="text" name="query" '
+            f'maxlength="200" required value="{esc(search.get("query") or "")}" placeholder="owner/model-GGUF or model name"> '
+            '<button type="submit">Search Hugging Face</button></form>'
+            f'<p role="status">Search: {status}</p>'
+            '<div class="scroll"><table><thead><tr><th>Repository</th><th>GGUF variant</th><th>Size</th><th>Runtime</th><th>Fit/status</th><th>Action</th></tr></thead>'
+            f'<tbody>{"".join(rows) if rows else "<tr><td colspan=6>No search results yet.</td></tr>"}</tbody></table></div>'
+            '<h3>Installed Hugging Face models</h3><div class="scroll"><table><tr><th>API name</th><th>Repository</th><th>Runtime</th></tr>'
+            f'{installed_rows if installed_rows else "<tr><td colspan=3>None yet.</td></tr>"}</table></div></section>')
+
+
 def index(hardware, suggestions, installed, jobs, csrf, prefer_ablit=True,
-          media_suggestions=(), media_jobs=(), comfy_url="", discovery=None, engine=None):
+          media_suggestions=(), media_jobs=(), comfy_url="", discovery=None, engine=None, search=None):
     selected_on = " selected" if prefer_ablit else ""
     selected_off = "" if prefer_ablit else " selected"
     hardware_line = (f'<h2>Detected hardware</h2><p>GPU: <strong>{esc(hardware["gpu"] or "unavailable")}</strong> · '
@@ -2861,14 +2992,16 @@ def index(hardware, suggestions, installed, jobs, csrf, prefer_ablit=True,
                      'CPU details are shown, but CPU upgrades do not increase the GPU memory available to models.</p>'
                      f'<form method="post" action="/models/hardware/rescan"><input type="hidden" name="token" value="{esc(csrf)}">'
                      '<button type="submit">Rescan hardware and suggestions</button></form>')
+    search_section = specific_search_section(search, installed, jobs, csrf, engine)
     if not hardware.get("vram_mib"):
         body = ('<section class="card">' + hardware_line + '</section>'
                 '<section class="card"><h2>CPU model choices</h2>'
                 '<p>The current installation has no compatible NVIDIA GPU. The installer offers CPU models according to detected RAM. '
                 'Installed choices are available on the switcher home page. To change the selection, rerun the installer with '
                 '<code>AI_MODEL_SELECTION=cpu-tiny,cpu-4b</code> after checking which choices fit this host. '
-                'The GPU catalog and engine updates appear when a supported GPU is detected and the installer is rerun.</p></section>')
-        return shell("Hardware and model choices", body, wide=True)
+                'The GPU catalog and engine updates appear when a supported GPU is detected and the installer is rerun.</p></section>'
+                + search_section)
+        return shell("Hardware and model choices", body, refresh=(search or {}).get("status") == "running", wide=True)
     discovery = discovery or {"status": "not checked", "items": [], "query": "", "error": None}
     engine = engine or {"checked_at": None, "checking": False, "update_available": None,
                         "local_build": None, "error": None, "job": None, "busy": False}
@@ -2967,7 +3100,8 @@ def index(hardware, suggestions, installed, jobs, csrf, prefer_ablit=True,
     refreshing = (refreshing or bool(media_installing) or discovery["status"] == "running"
                   or bool(engine.get("checking")) or bool(engine.get("busy")))
     comfy_link = f'<a href="{esc(comfy_url)}">Open ComfyUI</a>' if comfy_url else "Open ComfyUI from the switcher"
-    body = ('<div class="section-links" aria-label="Page sections"><a href="#text-models">Text and code</a><a href="#media-models">Image and video</a><a href="#discovered-models">Recent discoveries</a><a href="#installed-models">Installed</a></div>'
+    body = ('<div class="section-links" aria-label="Page sections"><a href="#specific-search">Search Hugging Face</a><a href="#text-models">Text and code</a><a href="#media-models">Image and video</a><a href="#discovered-models">Recent discoveries</a><a href="#installed-models">Installed</a></div>'
+            + search_section
             + '<div class="overview-grid"><section class="card" id="hardware">' + hardware_line + '</section><section class="card" id="engine">' + engine_box + '</section></div>'
             + '<h2 id="text-models">Text and code models</h2><p class="note">Top 10 reviewed Hugging Face GGUF candidates, including already installed models. New downloads fit current GPU memory with a 4 GiB serving reserve and available disk. '
               'Features describe intended use, not measured quality. Tokens/s is a broad estimate calibrated from completed short-prompt runs on this GPU; run a benchmark after installation. '
@@ -3008,7 +3142,8 @@ def index(hardware, suggestions, installed, jobs, csrf, prefer_ablit=True,
               f'{"".join(media_job_rows) if media_job_rows else "<tr><td colspan=4>No media downloads yet</td></tr>"}</table></div>'
             + '<h2>Recent installations</h2><div class="scroll"><table><tr><th>Model</th><th>Status</th><th>Stage</th><th>Error</th></tr>'
               f'{"".join(job_rows) if job_rows else "<tr><td colspan=4>No download jobs yet</td></tr>"}</table></div>')
-    return shell("Hugging Face model recommendations", body, refresh=refreshing, wide=True)
+    return shell("Hugging Face model recommendations", body,
+                 refresh=refreshing or (search or {}).get("status") == "running", wide=True)
 MODEL_VIEWS
 
 cat > "$INSTALL_DIR/gpu_control/catalog_discovery.py" <<'CATALOG_DISCOVERY'
@@ -3028,6 +3163,8 @@ import uuid
 AUTHORS = ("bartowski", "unsloth", "mradermacher")
 USER_AGENT = {"User-Agent": "local-ai-model-switcher/2"}
 MAX_RESULTS = 10
+SEARCH_RESULTS = 40
+REPO_PATTERN = r"[A-Za-z0-9][A-Za-z0-9_.-]{0,95}/[A-Za-z0-9][A-Za-z0-9_.-]{0,95}"
 MIN_ENGINE_BUILD = {"inkling-2-mini": 12600}
 
 
@@ -3042,6 +3179,33 @@ def fetch_json(url):
 
 def candidate_id(repo, filename):
     return "discovered-" + hashlib.sha256((repo + "/" + filename).encode()).hexdigest()[:16]
+
+
+def normalize_search(value):
+    value = value.strip()
+    if value.startswith("https://huggingface.co/"):
+        value = value[len("https://huggingface.co/"):].rstrip("/")
+    if not value or len(value) > 200 or not re.fullmatch(r"[A-Za-z0-9_./ -]+", value):
+        raise ValueError("Enter a model name or Hugging Face owner/repository URL")
+    if "/" in value and not re.fullmatch(REPO_PATTERN, value):
+        raise ValueError("Use an exact owner/repository ID or a model name")
+    return value
+
+
+def verified_ggufs(siblings):
+    """Only standalone GGUF weights with a verifiable Hub LFS digest are installable."""
+    files = []
+    for row in siblings:
+        name = row.get("rfilename", "")
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+\.gguf", name, re.I):
+            continue
+        if "mmproj" in name.lower() or re.search(r"-\d{5}-of-\d{5}\.gguf$", name, re.I):
+            continue
+        size = row.get("size") or (row.get("lfs") or {}).get("size")
+        digest = (row.get("lfs") or {}).get("sha256")
+        if isinstance(size, int) and 100_000_000 < size < 100_000_000_000 and re.fullmatch(r"[0-9a-f]{64}", digest or ""):
+            files.append((name, size, digest))
+    return sorted(files, key=lambda item: (item[1], item[0].lower()))
 
 
 def selected_gguf(siblings):
@@ -3075,6 +3239,10 @@ class CatalogDiscovery:
             if "hardware_fingerprint" not in columns:
                 db.execute("ALTER TABLE catalog_refreshes ADD COLUMN hardware_fingerprint TEXT")
             db.execute("UPDATE catalog_refreshes SET status='interrupted', ended_at=? WHERE status='running'", (utc_now(),))
+            db.execute("""CREATE TABLE IF NOT EXISTS model_searches (
+                id TEXT PRIMARY KEY, started_at TEXT NOT NULL, ended_at TEXT,
+                query TEXT NOT NULL, status TEXT NOT NULL, error TEXT, items_json TEXT)""")
+            db.execute("UPDATE model_searches SET status='interrupted', ended_at=? WHERE status='running'", (utc_now(),))
 
     def connect(self):
         db = sqlite3.connect(self.db_path, timeout=20)
@@ -3095,6 +3263,93 @@ class CatalogDiscovery:
             item["installed"] = (item["id"] in installed_ids
                                  or (item["repo"], item["sha256"]) in installed_files)
         return result
+
+    def latest_search(self):
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM model_searches ORDER BY started_at DESC, rowid DESC LIMIT 1").fetchone()
+        if not row:
+            return {"status": "not searched", "items": [], "query": "", "error": None}
+        result = dict(row)
+        result["items"] = json.loads(result.pop("items_json") or "[]")
+        installed = {(item["repo"], item["sha256"]) for item in self.model_manager.installed()}
+        for item in result["items"]:
+            item["installed"] = (item["repo"], item["sha256"]) in installed
+        return result
+
+    def start_search(self, query):
+        query = normalize_search(query)
+        with self.lock:
+            if self.busy:
+                raise RuntimeError("Another Hugging Face search is running")
+            run_id = str(uuid.uuid4())
+            with self.connect() as db:
+                db.execute("INSERT INTO model_searches(id,started_at,query,status) VALUES(?,?,?,?)",
+                           (run_id, utc_now(), query, "running"))
+            self.busy = True
+        threading.Thread(target=self._search, args=(run_id, query), daemon=True).start()
+        return run_id
+
+    def _search(self, run_id, query):
+        try:
+            hardware = self.model_manager.hardware()
+            if re.fullmatch(REPO_PATTERN, query):
+                repos = [{"id": query}]
+            else:
+                url = "https://huggingface.co/api/models?" + urllib.parse.urlencode(
+                    {"search": query, "sort": "downloads", "direction": "-1", "limit": 40})
+                repos = fetch_json(url)
+                if not isinstance(repos, list):
+                    raise ValueError("Hugging Face search returned an unexpected response")
+            def inspect(summary):
+                repo = summary.get("id", "")
+                if not isinstance(repo, str) or not re.fullmatch(REPO_PATTERN, repo):
+                    return []
+                url = "https://huggingface.co/api/models/" + urllib.parse.quote(repo, safe="/") + "/revision/main?blobs=true"
+                try:
+                    info = fetch_json(url)
+                except (OSError, ValueError, KeyError):
+                    return []
+                if info.get("gated") or not re.fullmatch(r"[0-9a-f]{40}", info.get("sha", "")):
+                    return []
+                pipeline = info.get("pipeline_tag") or summary.get("pipeline_tag") or "Unknown"
+                if pipeline not in ("text-generation", "conversational", "image-text-to-text", "Unknown"):
+                    return []
+                lower = repo.lower()
+                minimum = max((build for family, build in MIN_ENGINE_BUILD.items() if family in lower), default=0)
+                return [{"id": candidate_id(repo, filename), "name": repo.split("/", 1)[1],
+                         "repo": repo, "file": filename, "revision": info["sha"], "sha256": digest,
+                         "size": size, "size_gb": round(size / 1e9, 1), "pipeline": pipeline,
+                         "ablit": any(word in lower for word in ("abliterat", "uncensor", "unbound")),
+                         "min_engine_build": minimum,
+                         "runtime": "gpu" if hardware.get("vram_mib") and size + 4 * 2**30 <= hardware["vram_mib"] * 2**20 else "cpu",
+                         "disk_fits": size * 1.2 <= hardware.get("disk_free_gib", 0) * 2**30,
+                         "fits": (size + 4 * 2**30 <= (hardware.get("vram_mib") or 0) * 2**20 or
+                                  size + 4 * 2**30 <= hardware.get("ram_gib", 0) * 2**30)}
+                        for filename, size, digest in verified_ggufs(info.get("siblings", []))]
+            with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+                batches = list(pool.map(inspect, repos[:20]))
+            items = [item for batch in batches for item in batch]
+            # Exact repository searches show all verified variants; broad searches
+            # keep a couple of small variants per repository for useful diversity.
+            if not re.fullmatch(REPO_PATTERN, query):
+                counts = {}
+                limited = []
+                for item in items:
+                    if counts.get(item["repo"], 0) >= 2:
+                        continue
+                    counts[item["repo"]] = counts.get(item["repo"], 0) + 1
+                    limited.append(item)
+                items = limited
+            with self.connect() as db:
+                db.execute("UPDATE model_searches SET status='completed', ended_at=?, items_json=? WHERE id=?",
+                           (utc_now(), json.dumps(items[:SEARCH_RESULTS]), run_id))
+        except Exception as exc:
+            with self.connect() as db:
+                db.execute("UPDATE model_searches SET status='failed', ended_at=?, error=? WHERE id=?",
+                           (utc_now(), f"{type(exc).__name__}: {str(exc)[:180]}", run_id))
+        finally:
+            with self.lock:
+                self.busy = False
 
     def maybe_refresh(self, hardware=None):
         hardware = hardware or self.model_manager.hardware()
@@ -3195,10 +3450,13 @@ class CatalogDiscovery:
     def candidate(self, candidate_id_value):
         if not re.fullmatch(r"discovered-[0-9a-f]{16}", candidate_id_value or ""):
             return None
-        item = next((row for row in self.latest()["items"] if row["id"] == candidate_id_value), None)
+        item = next((row for row in self.latest_search()["items"] + self.latest()["items"]
+                     if row["id"] == candidate_id_value), None)
         if not item or item["installed"]:
             return None
-        if item["repo"].split("/", 1)[0] not in AUTHORS or not re.fullmatch(r"[A-Za-z0-9_.-]+\.gguf", item["file"]):
+        if (not re.fullmatch(REPO_PATTERN, item["repo"]) or
+                not re.fullmatch(r"[A-Za-z0-9_.-]+\.gguf", item["file"], re.I) or
+                candidate_id(item["repo"], item["file"]) != item["id"]):
             return None
         return {**item, "active_b": 0, "moe": False, "features": "New GGUF; capabilities unverified", "priority": 0}
 CATALOG_DISCOVERY
@@ -4450,7 +4708,8 @@ class ParallelTuner:
                 backup = backup_name
                 docker_api("POST", "/containers/create?name=" + current["container"],
                            self.model_manager.serving_config(row["filename"], row["alias"],
-                                                             row["context_tokens"], old["Image"], slots))
+                                                             row["context_tokens"], old["Image"], slots,
+                                                             row.get("runtime", "gpu")))
                 docker_api("POST", "/containers/" + current["container"] + "/start")
             self._job(job_id, stage="waiting for model readiness")
             if not self._wait_ready(current, slots, old_id):
@@ -4809,7 +5068,8 @@ class ContextTuner:
                 docker_api("POST", "/containers/" + current["container"] + "/rename?name=" + backup_name)
                 backup = backup_name
                 docker_api("POST", "/containers/create?name=" + current["container"],
-                           self.model_manager.serving_config(row["filename"], row["alias"], tokens, old["Image"], row["parallel_slots"]))
+                           self.model_manager.serving_config(row["filename"], row["alias"], tokens, old["Image"],
+                                                             row["parallel_slots"], row.get("runtime", "gpu")))
                 docker_api("POST", "/containers/" + current["container"] + "/start")
             self._job(job_id, stage="waiting for model readiness")
             if not self._wait_ready(current, tokens, old_id):

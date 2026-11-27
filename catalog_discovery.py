@@ -14,6 +14,8 @@ import uuid
 AUTHORS = ("bartowski", "unsloth", "mradermacher")
 USER_AGENT = {"User-Agent": "local-ai-model-switcher/2"}
 MAX_RESULTS = 10
+SEARCH_RESULTS = 40
+REPO_PATTERN = r"[A-Za-z0-9][A-Za-z0-9_.-]{0,95}/[A-Za-z0-9][A-Za-z0-9_.-]{0,95}"
 MIN_ENGINE_BUILD = {"inkling-2-mini": 12600}
 
 
@@ -28,6 +30,33 @@ def fetch_json(url):
 
 def candidate_id(repo, filename):
     return "discovered-" + hashlib.sha256((repo + "/" + filename).encode()).hexdigest()[:16]
+
+
+def normalize_search(value):
+    value = value.strip()
+    if value.startswith("https://huggingface.co/"):
+        value = value[len("https://huggingface.co/"):].rstrip("/")
+    if not value or len(value) > 200 or not re.fullmatch(r"[A-Za-z0-9_./ -]+", value):
+        raise ValueError("Enter a model name or Hugging Face owner/repository URL")
+    if "/" in value and not re.fullmatch(REPO_PATTERN, value):
+        raise ValueError("Use an exact owner/repository ID or a model name")
+    return value
+
+
+def verified_ggufs(siblings):
+    """Only standalone GGUF weights with a verifiable Hub LFS digest are installable."""
+    files = []
+    for row in siblings:
+        name = row.get("rfilename", "")
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+\.gguf", name, re.I):
+            continue
+        if "mmproj" in name.lower() or re.search(r"-\d{5}-of-\d{5}\.gguf$", name, re.I):
+            continue
+        size = row.get("size") or (row.get("lfs") or {}).get("size")
+        digest = (row.get("lfs") or {}).get("sha256")
+        if isinstance(size, int) and 100_000_000 < size < 100_000_000_000 and re.fullmatch(r"[0-9a-f]{64}", digest or ""):
+            files.append((name, size, digest))
+    return sorted(files, key=lambda item: (item[1], item[0].lower()))
 
 
 def selected_gguf(siblings):
@@ -61,6 +90,10 @@ class CatalogDiscovery:
             if "hardware_fingerprint" not in columns:
                 db.execute("ALTER TABLE catalog_refreshes ADD COLUMN hardware_fingerprint TEXT")
             db.execute("UPDATE catalog_refreshes SET status='interrupted', ended_at=? WHERE status='running'", (utc_now(),))
+            db.execute("""CREATE TABLE IF NOT EXISTS model_searches (
+                id TEXT PRIMARY KEY, started_at TEXT NOT NULL, ended_at TEXT,
+                query TEXT NOT NULL, status TEXT NOT NULL, error TEXT, items_json TEXT)""")
+            db.execute("UPDATE model_searches SET status='interrupted', ended_at=? WHERE status='running'", (utc_now(),))
 
     def connect(self):
         db = sqlite3.connect(self.db_path, timeout=20)
@@ -81,6 +114,93 @@ class CatalogDiscovery:
             item["installed"] = (item["id"] in installed_ids
                                  or (item["repo"], item["sha256"]) in installed_files)
         return result
+
+    def latest_search(self):
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM model_searches ORDER BY started_at DESC, rowid DESC LIMIT 1").fetchone()
+        if not row:
+            return {"status": "not searched", "items": [], "query": "", "error": None}
+        result = dict(row)
+        result["items"] = json.loads(result.pop("items_json") or "[]")
+        installed = {(item["repo"], item["sha256"]) for item in self.model_manager.installed()}
+        for item in result["items"]:
+            item["installed"] = (item["repo"], item["sha256"]) in installed
+        return result
+
+    def start_search(self, query):
+        query = normalize_search(query)
+        with self.lock:
+            if self.busy:
+                raise RuntimeError("Another Hugging Face search is running")
+            run_id = str(uuid.uuid4())
+            with self.connect() as db:
+                db.execute("INSERT INTO model_searches(id,started_at,query,status) VALUES(?,?,?,?)",
+                           (run_id, utc_now(), query, "running"))
+            self.busy = True
+        threading.Thread(target=self._search, args=(run_id, query), daemon=True).start()
+        return run_id
+
+    def _search(self, run_id, query):
+        try:
+            hardware = self.model_manager.hardware()
+            if re.fullmatch(REPO_PATTERN, query):
+                repos = [{"id": query}]
+            else:
+                url = "https://huggingface.co/api/models?" + urllib.parse.urlencode(
+                    {"search": query, "sort": "downloads", "direction": "-1", "limit": 40})
+                repos = fetch_json(url)
+                if not isinstance(repos, list):
+                    raise ValueError("Hugging Face search returned an unexpected response")
+            def inspect(summary):
+                repo = summary.get("id", "")
+                if not isinstance(repo, str) or not re.fullmatch(REPO_PATTERN, repo):
+                    return []
+                url = "https://huggingface.co/api/models/" + urllib.parse.quote(repo, safe="/") + "/revision/main?blobs=true"
+                try:
+                    info = fetch_json(url)
+                except (OSError, ValueError, KeyError):
+                    return []
+                if info.get("gated") or not re.fullmatch(r"[0-9a-f]{40}", info.get("sha", "")):
+                    return []
+                pipeline = info.get("pipeline_tag") or summary.get("pipeline_tag") or "Unknown"
+                if pipeline not in ("text-generation", "conversational", "image-text-to-text", "Unknown"):
+                    return []
+                lower = repo.lower()
+                minimum = max((build for family, build in MIN_ENGINE_BUILD.items() if family in lower), default=0)
+                return [{"id": candidate_id(repo, filename), "name": repo.split("/", 1)[1],
+                         "repo": repo, "file": filename, "revision": info["sha"], "sha256": digest,
+                         "size": size, "size_gb": round(size / 1e9, 1), "pipeline": pipeline,
+                         "ablit": any(word in lower for word in ("abliterat", "uncensor", "unbound")),
+                         "min_engine_build": minimum,
+                         "runtime": "gpu" if hardware.get("vram_mib") and size + 4 * 2**30 <= hardware["vram_mib"] * 2**20 else "cpu",
+                         "disk_fits": size * 1.2 <= hardware.get("disk_free_gib", 0) * 2**30,
+                         "fits": (size + 4 * 2**30 <= (hardware.get("vram_mib") or 0) * 2**20 or
+                                  size + 4 * 2**30 <= hardware.get("ram_gib", 0) * 2**30)}
+                        for filename, size, digest in verified_ggufs(info.get("siblings", []))]
+            with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+                batches = list(pool.map(inspect, repos[:20]))
+            items = [item for batch in batches for item in batch]
+            # Exact repository searches show all verified variants; broad searches
+            # keep a couple of small variants per repository for useful diversity.
+            if not re.fullmatch(REPO_PATTERN, query):
+                counts = {}
+                limited = []
+                for item in items:
+                    if counts.get(item["repo"], 0) >= 2:
+                        continue
+                    counts[item["repo"]] = counts.get(item["repo"], 0) + 1
+                    limited.append(item)
+                items = limited
+            with self.connect() as db:
+                db.execute("UPDATE model_searches SET status='completed', ended_at=?, items_json=? WHERE id=?",
+                           (utc_now(), json.dumps(items[:SEARCH_RESULTS]), run_id))
+        except Exception as exc:
+            with self.connect() as db:
+                db.execute("UPDATE model_searches SET status='failed', ended_at=?, error=? WHERE id=?",
+                           (utc_now(), f"{type(exc).__name__}: {str(exc)[:180]}", run_id))
+        finally:
+            with self.lock:
+                self.busy = False
 
     def maybe_refresh(self, hardware=None):
         hardware = hardware or self.model_manager.hardware()
@@ -181,9 +301,12 @@ class CatalogDiscovery:
     def candidate(self, candidate_id_value):
         if not re.fullmatch(r"discovered-[0-9a-f]{16}", candidate_id_value or ""):
             return None
-        item = next((row for row in self.latest()["items"] if row["id"] == candidate_id_value), None)
+        item = next((row for row in self.latest_search()["items"] + self.latest()["items"]
+                     if row["id"] == candidate_id_value), None)
         if not item or item["installed"]:
             return None
-        if item["repo"].split("/", 1)[0] not in AUTHORS or not re.fullmatch(r"[A-Za-z0-9_.-]+\.gguf", item["file"]):
+        if (not re.fullmatch(REPO_PATTERN, item["repo"]) or
+                not re.fullmatch(r"[A-Za-z0-9_.-]+\.gguf", item["file"], re.I) or
+                candidate_id(item["repo"], item["file"]) != item["id"]):
             return None
         return {**item, "active_b": 0, "moe": False, "features": "New GGUF; capabilities unverified", "priority": 0}
