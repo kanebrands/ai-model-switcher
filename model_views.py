@@ -1,5 +1,6 @@
 """Escaped model recommendation and installation page."""
 import html
+from urllib.parse import quote
 
 from benchmark_views import shell
 from hybrid_memory import memory_plan
@@ -8,6 +9,13 @@ from model_catalog import BY_ID, model_display_name, preferred_alias
 
 def esc(value):
     return html.escape(str(value if value is not None else "—"), quote=True)
+
+
+def hugging_face_source(repo):
+    if not repo:
+        return ""
+    url = "https://huggingface.co/" + quote(str(repo), safe="/")
+    return f'<br><a href="{esc(url)}" target="_blank" rel="noopener noreferrer">Hugging Face source</a>'
 
 
 def uninstall_form(item, csrf, active_models=()):
@@ -96,7 +104,7 @@ def specific_search_section(search, installed, jobs, csrf, engine=None, hardware
                           f'<input type="hidden" name="candidate" value="{esc(item["candidate_id"])}">'
                           f'{override}<button type="submit">Apply saved preference</button></form>')
         installed_rows.append(f'<tr><td><strong>{esc(model_display_name(item))}</strong><br>'
-                              f'<small class="note">API ID: {esc(item["alias"])}</small></td><td>{esc(item["repo"])}</td>'
+                              f'<small class="note">API ID: {esc(item["alias"])}</small>{hugging_face_source(item.get("repo"))}</td><td>{esc(item["repo"])}</td>'
                               f'<td>{esc(item.get("format", "gguf").upper())} / {esc(item.get("runtime", "gpu").upper())}</td>'
                               f'<td>{esc(assistance)}</td>'
                               f'<td><form method="post" action="/switch"><input type="hidden" name="token" value="{esc(csrf)}">'
@@ -223,7 +231,7 @@ def index(hardware, suggestions, installed, jobs, csrf, prefer_ablit=True,
                 f'<button name="mode" value="{esc(mode)}" type="submit">Activate</button></form>')
         configured_context = f'{item.get("context_tokens") or 32768:,} tokens'
         installed_rows.append(f'<tr><td><strong>{esc(model_display_name(item))}</strong><br>'
-                              f'<small class="note">API ID: {esc(item["alias"])}</small></td><td>{esc(item["repo"])}</td>'
+                              f'<small class="note">API ID: {esc(item["alias"])}</small>{hugging_face_source(item.get("repo"))}</td><td>{esc(item["repo"])}</td>'
                               f'<td>{esc(configured_context)}</td><td>{esc(item["installed_at"])}</td>'
                               f'<td>{form}{rename_form(item, csrf, installed, active_models)}'
                               f'{uninstall_form(item, csrf, active_models)}</td></tr>')
