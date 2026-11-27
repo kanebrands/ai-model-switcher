@@ -105,7 +105,11 @@ class ModelUninstallTests(unittest.TestCase):
     def test_active_model_has_no_uninstall_button(self):
         row = {"candidate_id": self.candidate, "alias": self.alias}
         self.assertNotIn("/models/uninstall", uninstall_form(row, "csrf", {self.candidate}))
-        self.assertIn("/models/uninstall", uninstall_form(row, "csrf"))
+        form = uninstall_form(row, "csrf")
+        self.assertIn("/models/uninstall", form)
+        self.assertIn('type="checkbox" name="delete_ack" value="1" required', form)
+        self.assertIn(f'name="confirm" value="{self.alias}"', form)
+        self.assertNotIn('type="text"', form)
 
     def test_rename_inactive_api_id_and_rollback_on_create_failure(self):
         self.install_row()

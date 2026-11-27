@@ -17,6 +17,30 @@ STYLE = """*{box-sizing:border-box}html{color-scheme:dark}body{font:16px/1.55 sy
 
 STYLE += """.section-links{display:flex;gap:.5rem;flex-wrap:wrap;margin:1rem 0 1.5rem}.section-links a{display:inline-block;padding:.48rem .75rem;border:1px solid #435a5a;border-radius:99px;background:#17272a;color:#e9c18b;text-decoration:none;font-size:.88rem;font-weight:650}.section-links a:hover{background:#274044}.overview-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1rem}.overview-grid .card{margin:0}.overview-grid h2{margin:.2rem 0 .7rem}@media(max-width:900px){.overview-grid{grid-template-columns:1fr}}"""
 
+STYLE += """
+.installed-models-table th:last-child,.installed-models-table td:last-child{width:20rem}
+.installed-models-table td:first-child{overflow-wrap:anywhere}
+.model-meta,.model-source{display:block;font-size:.84rem;line-height:1.4;margin-top:.25rem}
+.model-source{width:max-content;max-width:100%;margin-top:.4rem}
+.model-actions{display:grid;gap:.4rem;max-width:19rem}
+.model-actions form{margin:0}
+.model-actions button{width:100%}
+.model-action-panel{border:1px solid #385056;border-radius:.55rem;background:#102024}
+.model-action-panel summary{cursor:pointer;padding:.45rem .7rem;font-size:.88rem;font-weight:650;color:#d6e5e1}
+.model-action-panel summary:hover{background:#203539}
+.model-action-panel[open] form{padding:0 .7rem .7rem}
+.model-action-panel label{display:block;margin:0;font-size:.82rem;color:#c6d4d0}
+.model-action-panel .model-delete-check{cursor:pointer;line-height:1.4}
+.model-delete-check input{accent-color:#e9b977;vertical-align:middle;margin-right:.35rem}
+.model-action-panel input[type=text]{display:block;width:100%;margin-top:.35rem}
+.model-action-panel button{margin-top:.6rem}
+.model-action-panel.danger summary{color:#efb0aa}
+.model-action-panel.danger button{background:#6e3735;border-color:#a85c56;color:#fff1ed}
+.model-action-panel.danger button:hover{background:#894440}
+.model-action-note{margin:.3rem 0;font-size:.84rem}
+@media(max-width:740px){.installed-models-table th:last-child,.installed-models-table td:last-child{min-width:15rem}}
+"""
+
 
 def shell(title, body, refresh=False, wide=False, monitor_url=None):
     if refresh and not monitor_url:

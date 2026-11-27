@@ -1511,8 +1511,8 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/models/uninstall":
             candidate = fields.get("candidate", [])
             confirmation = fields.get("confirm", [])
-            if len(candidate) != 1 or len(confirmation) != 1:
-                self.send_error(400, "Select one model and confirm its API name")
+            if len(candidate) != 1 or len(confirmation) != 1 or fields.get("delete_ack") != ["1"]:
+                self.send_error(400, "Select one model and confirm deletion")
                 return
             try:
                 if any((BENCHMARKS.busy, MEDIA_MANAGER.busy, CONTEXT_TUNER.busy,
@@ -2350,6 +2350,30 @@ STYLE = """*{box-sizing:border-box}html{color-scheme:dark}body{font:16px/1.55 sy
 
 
 STYLE += """.section-links{display:flex;gap:.5rem;flex-wrap:wrap;margin:1rem 0 1.5rem}.section-links a{display:inline-block;padding:.48rem .75rem;border:1px solid #435a5a;border-radius:99px;background:#17272a;color:#e9c18b;text-decoration:none;font-size:.88rem;font-weight:650}.section-links a:hover{background:#274044}.overview-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1rem}.overview-grid .card{margin:0}.overview-grid h2{margin:.2rem 0 .7rem}@media(max-width:900px){.overview-grid{grid-template-columns:1fr}}"""
+
+STYLE += """
+.installed-models-table th:last-child,.installed-models-table td:last-child{width:20rem}
+.installed-models-table td:first-child{overflow-wrap:anywhere}
+.model-meta,.model-source{display:block;font-size:.84rem;line-height:1.4;margin-top:.25rem}
+.model-source{width:max-content;max-width:100%;margin-top:.4rem}
+.model-actions{display:grid;gap:.4rem;max-width:19rem}
+.model-actions form{margin:0}
+.model-actions button{width:100%}
+.model-action-panel{border:1px solid #385056;border-radius:.55rem;background:#102024}
+.model-action-panel summary{cursor:pointer;padding:.45rem .7rem;font-size:.88rem;font-weight:650;color:#d6e5e1}
+.model-action-panel summary:hover{background:#203539}
+.model-action-panel[open] form{padding:0 .7rem .7rem}
+.model-action-panel label{display:block;margin:0;font-size:.82rem;color:#c6d4d0}
+.model-action-panel .model-delete-check{cursor:pointer;line-height:1.4}
+.model-delete-check input{accent-color:#e9b977;vertical-align:middle;margin-right:.35rem}
+.model-action-panel input[type=text]{display:block;width:100%;margin-top:.35rem}
+.model-action-panel button{margin-top:.6rem}
+.model-action-panel.danger summary{color:#efb0aa}
+.model-action-panel.danger button{background:#6e3735;border-color:#a85c56;color:#fff1ed}
+.model-action-panel.danger button:hover{background:#894440}
+.model-action-note{margin:.3rem 0;font-size:.84rem}
+@media(max-width:740px){.installed-models-table th:last-child,.installed-models-table td:last-child{min-width:15rem}}
+"""
 
 
 def shell(title, body, refresh=False, wide=False, monitor_url=None):
@@ -3769,20 +3793,28 @@ def hugging_face_source(repo):
     if not repo:
         return ""
     url = "https://huggingface.co/" + quote(str(repo), safe="/")
-    return f'<br><a href="{esc(url)}" target="_blank" rel="noopener noreferrer">Hugging Face source</a>'
+    return f'<a class="model-source" href="{esc(url)}" target="_blank" rel="noopener noreferrer">Hugging Face source</a>'
+
+
+def installed_model_identity(item):
+    return (f'<strong>{esc(model_display_name(item))}</strong>'
+            f'<small class="note model-meta">API ID: {esc(item["alias"])}</small>'
+            f'<small class="note model-meta">Repository: {esc(item["repo"])}</small>'
+            f'{hugging_face_source(item.get("repo"))}')
 
 
 def uninstall_form(item, csrf, active_models=()):
     active = item["candidate_id"] in active_models
     if active:
-        return '<p class="note">Active: switch workloads before uninstalling.</p>'
-    return (f'<form method="post" action="/models/uninstall">'
+        return '<p class="note model-action-note">Switch workloads before uninstalling.</p>'
+    return (f'<details class="model-action-panel danger"><summary>Uninstall model</summary>'
+            f'<form method="post" action="/models/uninstall">'
             f'<input type="hidden" name="token" value="{esc(csrf)}">'
             f'<input type="hidden" name="candidate" value="{esc(item["candidate_id"])}">'
-            f'<label>Confirm model name <input type="text" name="confirm" required maxlength="128" '
-            f'autocomplete="off" placeholder="{esc(model_display_name(item))}" '
-            f'aria-label="Type {esc(model_display_name(item))} to uninstall"></label> '
-            '<button type="submit">Uninstall</button></form>')
+            f'<input type="hidden" name="confirm" value="{esc(item["alias"])}">'
+            '<label class="model-delete-check"><input type="checkbox" name="delete_ack" value="1" required> '
+            'Delete this model and its downloaded files</label>'
+            '<button type="submit">Delete model and files</button></form></details>')
 
 
 def rename_form(item, csrf, installed, active_models=()):
@@ -3791,11 +3823,12 @@ def rename_form(item, csrf, installed, active_models=()):
     suggested = preferred_alias({"id": item["candidate_id"], "repo": item["repo"],
                                  "file": (item.get("filename") or "").split("--")[-1]},
                                 {other["alias"] for other in installed if other["candidate_id"] != item["candidate_id"]})
-    return (f'<form method="post" action="/models/rename">'
+    return (f'<details class="model-action-panel"><summary>Change API ID</summary>'
+            f'<form method="post" action="/models/rename">'
             f'<input type="hidden" name="token" value="{esc(csrf)}">'
             f'<input type="hidden" name="candidate" value="{esc(item["candidate_id"])}">'
-            f'<label>API ID <input type="text" name="alias" required maxlength="64" value="{esc(suggested)}"></label> '
-            '<button type="submit">Change API ID</button></form>')
+            f'<label>New API ID <input type="text" name="alias" required maxlength="64" value="{esc(suggested)}"></label>'
+            '<button type="submit">Save API ID</button></form></details>')
 
 
 def specific_search_section(search, installed, jobs, csrf, engine=None, hardware=None, hybrid_enabled=True,
@@ -3853,18 +3886,19 @@ def specific_search_section(search, installed, jobs, csrf, engine=None, hardware
         if differs:
             override = ('' if plan["fits"] else
                         '<label class="note"><input type="checkbox" name="override_fit" value="1" required> Try anyway</label> ')
-            apply_form = (f'<form method="post" action="/models/hybrid/apply">'
+            apply_form = (f'<details class="model-action-panel"><summary>Update memory setting</summary>'
+                          f'<form method="post" action="/models/hybrid/apply">'
                           f'<input type="hidden" name="token" value="{esc(csrf)}">'
                           f'<input type="hidden" name="candidate" value="{esc(item["candidate_id"])}">'
-                          f'{override}<button type="submit">Apply saved preference</button></form>')
-        installed_rows.append(f'<tr><td><strong>{esc(model_display_name(item))}</strong><br>'
-                              f'<small class="note">API ID: {esc(item["alias"])}</small>{hugging_face_source(item.get("repo"))}</td><td>{esc(item["repo"])}</td>'
+                          f'{override}<button type="submit">Apply saved preference</button></form></details>')
+        installed_rows.append(f'<tr><td>{installed_model_identity(item)}</td>'
                               f'<td>{esc(item.get("format", "gguf").upper())} / {esc(item.get("runtime", "gpu").upper())}</td>'
                               f'<td>{esc(assistance)}</td>'
-                              f'<td><form method="post" action="/switch"><input type="hidden" name="token" value="{esc(csrf)}">'
+                              f'<td><div class="model-actions"><form class="model-primary-action" method="post" action="/switch">'
+                              f'<input type="hidden" name="token" value="{esc(csrf)}">'
                               f'<button name="mode" value="hf-{esc(item["candidate_id"])}">Activate</button></form>'
                               f'{apply_form}{rename_form(item, csrf, installed, active_models)}'
-                              f'{uninstall_form(item, csrf, active_models)}</td></tr>')
+                              f'{uninstall_form(item, csrf, active_models)}</div></td></tr>')
     return (f'<section class="card" id="specific-search"><h2>Search a specific Hugging Face model</h2>'
             '<p>Search by model name, exact owner/repository ID, or a Hugging Face repository URL. '
             'Searches any publisher and lists complete GGUF shard sets, single-file GGUF, and Safetensors repositories with standard tokenizer and configuration files. '
@@ -3888,8 +3922,8 @@ def specific_search_section(search, installed, jobs, csrf, engine=None, hardware
             'Uninstall removes the selected switcher-managed files and serving container; benchmark history stays available. '
             'Changing an API ID requires switching away first and will require API clients to use the new ID; old benchmark labels remain as recorded. '
             'Switch away from an active model first. Files you added manually and shared ComfyUI assets are not removed.</p>'
-            '<div class="scroll"><table><tr><th>Model</th><th>Repository</th><th>Engine</th><th>Memory setting</th><th>Action</th></tr>'
-            f'{"".join(installed_rows) if installed_rows else "<tr><td colspan=5>None yet.</td></tr>"}</table></div></section>')
+            '<div class="scroll"><table class="installed-models-table"><tr><th>Model</th><th>Engine</th><th>Memory setting</th><th>Action</th></tr>'
+            f'{"".join(installed_rows) if installed_rows else "<tr><td colspan=4>None yet.</td></tr>"}</table></div></section>')
 
 
 def index(hardware, suggestions, installed, jobs, csrf, prefer_ablit=True,
@@ -3984,11 +4018,10 @@ def index(hardware, suggestions, installed, jobs, csrf, prefer_ablit=True,
         form = (f'<form method="post" action="/switch"><input type="hidden" name="token" value="{esc(csrf)}">'
                 f'<button name="mode" value="{esc(mode)}" type="submit">Activate</button></form>')
         configured_context = f'{item.get("context_tokens") or 32768:,} tokens'
-        installed_rows.append(f'<tr><td><strong>{esc(model_display_name(item))}</strong><br>'
-                              f'<small class="note">API ID: {esc(item["alias"])}</small>{hugging_face_source(item.get("repo"))}</td><td>{esc(item["repo"])}</td>'
+        installed_rows.append(f'<tr><td>{installed_model_identity(item)}</td>'
                               f'<td>{esc(configured_context)}</td><td>{esc(item["installed_at"])}</td>'
-                              f'<td>{form}{rename_form(item, csrf, installed, active_models)}'
-                              f'{uninstall_form(item, csrf, active_models)}</td></tr>')
+                              f'<td><div class="model-actions">{form}{rename_form(item, csrf, installed, active_models)}'
+                              f'{uninstall_form(item, csrf, active_models)}</div></td></tr>')
     job_rows = []
     job_names = {item["candidate_id"]: model_display_name(item) for item in installed}
     job_names.update({item["id"]: item.get("name") or model_display_name(item) for item in suggestions})
@@ -4072,8 +4105,8 @@ def index(hardware, suggestions, installed, jobs, csrf, prefer_ablit=True,
               f'<p>Catalog refresh: {discovery_status}</p>'
             + '<div class="scroll"><table class="results-table"><thead><tr><th>#</th><th>Model</th><th>Published UTC</th><th>GGUF file</th><th>Size</th><th>Source type</th><th>Abliterated</th><th>Engine status</th><th>Action</th></tr></thead>'
               f'<tbody>{"".join(discovery_rows) if discovery_rows else "<tr><td colspan=9>No matching, verified GGUF files are in this refresh.</td></tr>"}</tbody></table></div>'
-            + '<h2 id="installed-models">Installed from this page</h2><div class="scroll"><table><tr><th>Model</th><th>Source</th><th>Configured context</th><th>Installed UTC</th><th>Action</th></tr>'
-              f'{"".join(installed_rows) if installed_rows else "<tr><td colspan=5>None yet</td></tr>"}</table></div>'
+            + '<h2 id="installed-models">Installed from this page</h2><div class="scroll"><table class="installed-models-table"><tr><th>Model</th><th>Configured context</th><th>Installed UTC</th><th>Action</th></tr>'
+              f'{"".join(installed_rows) if installed_rows else "<tr><td colspan=4>None yet</td></tr>"}</table></div>'
             + '<h2 id="media-models">Image and video models for ComfyUI</h2><p class="note">A separate top 10 chosen for the detected GPU, RAM, and available media storage. '
               'The abliteration selector above also applies here: when preferred, Z-Image uses an abliterated Qwen prompt encoder; other entries have no verified abliterated bundle. '
               'VRAM values are conservative starting targets, not measured peaks; video resolution and clip length affect memory use. '

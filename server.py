@@ -662,8 +662,8 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/models/uninstall":
             candidate = fields.get("candidate", [])
             confirmation = fields.get("confirm", [])
-            if len(candidate) != 1 or len(confirmation) != 1:
-                self.send_error(400, "Select one model and confirm its API name")
+            if len(candidate) != 1 or len(confirmation) != 1 or fields.get("delete_ack") != ["1"]:
+                self.send_error(400, "Select one model and confirm deletion")
                 return
             try:
                 if any((BENCHMARKS.busy, MEDIA_MANAGER.busy, CONTEXT_TUNER.busy,
