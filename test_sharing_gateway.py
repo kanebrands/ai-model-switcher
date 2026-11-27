@@ -171,8 +171,14 @@ class GatewayIntegrationTests(unittest.TestCase):
             for thread in threads:
                 thread.start()
             try:
+                usage_recorded = threading.Event()
+                original_record_usage = manager.record_usage
+                def record_usage(*args, **kwargs):
+                    original_record_usage(*args, **kwargs)
+                    usage_recorded.set()
                 with patch.object(gateway, "SHARING", manager), \
                      patch.object(gateway, "USAGE", manager), \
+                     patch.object(manager, "record_usage", side_effect=record_usage), \
                      patch.object(gateway, "BACKEND", re.compile(r"127\.0\.0\.1:\d+\Z")), \
                      patch.object(gateway.urllib.request, "urlopen", return_value=Route(f"127.0.0.1:{backend.server_port}")):
                     conn = http.client.HTTPConnection("127.0.0.1", gateway_server.server_port, timeout=5)
@@ -183,6 +189,7 @@ class GatewayIntegrationTests(unittest.TestCase):
                     self.assertEqual(response.status, 200)
                     self.assertIn(b"[DONE]", response.read())
                     conn.close()
+                    self.assertTrue(usage_recorded.wait(5), "Gateway did not finish recording usage")
                 self.assertEqual(seen["auth"], "Bearer legacy-test-key")
                 self.assertEqual(seen["body"]["max_tokens"], 8192)
                 self.assertTrue(seen["body"]["stream_options"]["include_usage"])
