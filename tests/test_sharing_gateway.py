@@ -80,7 +80,7 @@ class SharingTests(unittest.TestCase):
         responses.feed(b'{"usage":{"input_tokens":20,"output_tokens":7}}')
         self.assertEqual(responses.result(), (20, 7))
 
-    def test_per_key_window_counts_and_graph_visibility(self):
+    def test_per_key_window_counts_and_inline_stats(self):
         with tempfile.TemporaryDirectory() as directory:
             manager = SharingManager(directory + "/sharing.db")
             client = manager.create_client("Deck Builder")
@@ -98,13 +98,17 @@ class SharingTests(unittest.TestCase):
             hardware = {"vram_mib": 0, "ram_gib": 16, "cpu_threads": 8}
             settings = manager.settings(hardware, 1)
             clients = manager.clients()
-            hidden = sharing_page(settings, clients, "csrf", hardware, 1)
-            self.assertNotIn('id="client-usage"', hidden)
-            visible = sharing_page(settings, clients, "csrf", hardware, 1,
-                                   selected_usage=report, selected_client_label="Deck Builder")
-            self.assertIn('id="client-usage"', visible)
-            self.assertIn("25.00", visible)
-            self.assertIn("Input tokens", visible)
+            page = sharing_page(settings, clients, "csrf", hardware, 1,
+                                all_usage=manager.usage_summary("all", 1, "hours"),
+                                client_usage={client["id"]: report,
+                                              "legacy": manager.usage_summary("legacy", 1, "hours")})
+            self.assertRegex(page, r'Deck Builder</td>.*?</tr><tr class="client-usage-row">')
+            self.assertIn("25.00", page)
+            self.assertIn("Input tokens", page)
+            self.assertNotIn("View usage", page)
+            self.assertEqual(page.count('name="all_amount"'), 1)
+            self.assertEqual(page.count('name="all_unit"'), 1)
+            self.assertIn('class="plot-grid"', page)
 
     def test_all_key_usage_includes_legacy_and_revoked_keys(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -126,12 +130,17 @@ class SharingTests(unittest.TestCase):
             self.assertEqual(manager.usage_summary(second["id"], 1, "hours")["totals"]["input_tokens"], 20)
             hardware = {"vram_mib": 0, "ram_gib": 16, "cpu_threads": 8}
             page = sharing_page(manager.settings(hardware, 1), manager.clients(), "csrf", hardware, 1,
-                                all_usage=aggregate)
+                                all_usage=aggregate,
+                                client_usage={"legacy": manager.usage_summary("legacy", 1, "hours"),
+                                              first["id"]: manager.usage_summary(first["id"], 1, "hours"),
+                                              second["id"]: manager.usage_summary(second["id"], 1, "hours")})
             self.assertIn('id="all-key-usage"', page)
             self.assertIn('name="all_amount"', page)
             self.assertIn('name="all_unit"', page)
             self.assertIn("Usage for all API keys", page)
             self.assertIn("Effective output tokens/s", page)
+            self.assertEqual(page.count('class="client-usage-row"'), 3)
+            self.assertIn('width:9rem;min-width:9rem;max-width:9rem', page)
 
     def test_gpu_parser_accepts_optional_power_and_multiple_devices(self):
         samples = parse_samples("0, GPU A, 52, 8000, 24000, 61, 210.5\n1, GPU B, 0, 10, 16000, N/A, N/A",
@@ -147,6 +156,9 @@ class SharingTests(unittest.TestCase):
             page = monitor.render()
         self.assertIn("GPU use <strong>54%</strong>", page)
         self.assertIn("VRAM <strong>12000 / 24000 MiB</strong>", page)
+        self.assertIn('>25%</text>', page)
+        self.assertIn('>75%</text>', page)
+        self.assertIn('class="plot-grid"', page)
 
     def test_failed_parallel_restart_attempts_rollback_and_reports_failure(self):
         with tempfile.TemporaryDirectory() as directory:

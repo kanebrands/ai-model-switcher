@@ -169,14 +169,14 @@ class SharingManager:
                        "VALUES(?,?,?,?,?,?)",
                        (client_id, started_at, int(status), max(0, float(duration_seconds)), input_tokens, output_tokens))
 
-    def usage_summary(self, client_id, amount=24, unit="hours", buckets=30):
+    def usage_summary(self, client_id, amount=24, unit="hours", buckets=30, end=None):
         """Aggregate one key, or all recorded keys, over a chosen UTC window."""
         seconds_per = {"minutes": 60, "hours": 3600, "days": 86400}
         if unit not in seconds_per or not isinstance(amount, int) or not 1 <= amount or amount * seconds_per[unit] > 90 * 86400:
             raise ValueError("Choose a window from one minute through 90 days")
         if not isinstance(buckets, int) or not 1 <= buckets <= 120:
             raise ValueError("Invalid graph resolution")
-        end = dt.datetime.now(dt.timezone.utc)
+        end = end or dt.datetime.now(dt.timezone.utc)
         start = end - dt.timedelta(seconds=amount * seconds_per[unit])
         start_text = start.isoformat(timespec="seconds")
         end_text = end.isoformat(timespec="seconds")

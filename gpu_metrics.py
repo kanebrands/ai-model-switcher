@@ -85,14 +85,20 @@ class GPUMonitor:
             util = points(lambda item: item["util"])
             memory = points(lambda item: 100 * item["used"] / item["total"])
             label = html.escape(last["name"])
+            y_grid = ''.join(f'<path d="M55 {210 - level * 1.7:.1f}H775" class="plot-grid"/>'
+                             f'<text x="48" y="{214 - level * 1.7:.1f}" text-anchor="end">{level}%</text>'
+                             for level in (0, 25, 50, 75, 100))
+            x_grid = ''.join(f'<path d="M{x} 40V210" class="plot-grid"/>' for x in (55, 235, 415, 595, 775))
+            x_labels = ''.join(f'<text x="{x}" y="232" text-anchor="middle">'
+                               f'{html.escape(dt.datetime.fromisoformat(records[position]["time"]).strftime("%H:%M:%S"))}</text>'
+                               for x, position in ((55, 0), (415, (len(records) - 1) // 2), (775, len(records) - 1)))
             cards.append(f'''<section><h2>GPU {index}: {label}</h2>
                 <div class="stats"><span>GPU use <strong>{last["util"]:.0f}%</strong></span>
                 <span>VRAM <strong>{last["used"]:.0f} / {last["total"]:.0f} MiB</strong></span>
                 <span>Temperature <strong>{f'{last["temp"]:.0f} °C' if last["temp"] is not None else 'NA'}</strong></span>
                 <span>Power <strong>{f'{last["power"]:.0f} W' if last["power"] is not None else 'NA'}</strong></span></div>
-                <svg viewBox="0 0 800 225" role="img" aria-label="GPU utilization and VRAM use over the last {len(records) * 5} seconds">
-                <path d="M55 40H775 M55 125H775 M55 210H775" stroke="#34494d" fill="none"/>
-                <text x="5" y="44">100%</text><text x="15" y="129">50%</text><text x="22" y="214">0%</text>
+                <svg viewBox="0 0 800 245" role="img" aria-label="GPU utilization and VRAM use over the last {len(records) * 5} seconds, UTC time on the horizontal axis and percent on the vertical axis">
+                {y_grid}{x_grid}{x_labels}
                 <polyline points="{util}" fill="none" stroke="#f2bd79" stroke-width="3"/>
                 <polyline points="{memory}" fill="none" stroke="#71cdbf" stroke-width="3"/></svg>
                 <p class="legend"><span class="gpu-dot"></span> GPU use <span class="memory-dot"></span> VRAM use
@@ -103,7 +109,7 @@ class GPUMonitor:
             <style>html{{color-scheme:dark}}body{{margin:0;background:#17262a;color:#eaf2ee;font:14px/1.4 system-ui,sans-serif}}
             section{{margin:0 0 1rem}}h2{{font-size:1rem;margin:.25rem 0 .65rem}}.stats{{display:flex;gap:.6rem;flex-wrap:wrap}}
             .stats span{{padding:.4rem .65rem;border:1px solid #385156;border-radius:.45rem;background:#102125}}
-            strong{{color:#fff2d9}}svg{{display:block;width:100%;height:auto;max-height:235px;margin:.45rem 0}}
+            strong{{color:#fff2d9}}svg{{display:block;width:100%;height:auto;max-height:245px;margin:.45rem 0}}.plot-grid{{stroke:#4c6467;stroke-width:1;stroke-dasharray:3 5;fill:none}}
             text{{fill:#b7c9c7;font:12px system-ui}}.legend{{display:flex;align-items:center;gap:.45rem;margin:0}}
             .legend small{{margin-left:auto;color:#a9bdba}}.gpu-dot,.memory-dot{{display:inline-block;width:.65rem;height:.2rem;background:#f2bd79}}
             .memory-dot{{background:#71cdbf;margin-left:1rem}}.note{{color:#b7c9c7}}</style>

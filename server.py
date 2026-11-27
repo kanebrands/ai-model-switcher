@@ -567,16 +567,11 @@ class Handler(BaseHTTPRequestHandler):
                 settings = SHARING.settings(hardware, active_server_slots())
                 clients = SHARING.clients()
                 query = urllib.parse.parse_qs(path.query)
-                all_usage = SHARING.usage_summary("all", *usage_window(query, "all_"))
-                selected = query.get("client", [])
-                usage = None
-                selected_label = ""
-                if selected:
-                    if len(selected) != 1 or selected[0] not in {"legacy", *(item["id"] for item in clients)}:
-                        raise ValueError("Unknown API key")
-                    usage = SHARING.usage_summary(selected[0], *usage_window(query))
-                    selected_label = ("Shared legacy key" if selected[0] == "legacy" else
-                                      next(item["label"] for item in clients if item["id"] == selected[0]))
+                amount, unit = usage_window(query, "all_")
+                window_end = dt.datetime.now(dt.timezone.utc)
+                all_usage = SHARING.usage_summary("all", amount, unit, end=window_end)
+                client_usage = {client_id: SHARING.usage_summary(client_id, amount, unit, end=window_end)
+                                for client_id in ["legacy", *(item["id"] for item in clients)]}
                 notice = {"limits_saved": "Sharing limits saved and confirmed by the API gateway.",
                           "defaults_restored": "Detected hardware defaults restored and confirmed by the API gateway.",
                           "key_revoked": "Client key revoked. New requests using it are denied.",
@@ -584,8 +579,7 @@ class Handler(BaseHTTPRequestHandler):
                               query.get("status", [""])[0], "")
                 self._send_html(sharing_views.index(settings, clients, CSRF, hardware, active_server_slots(),
                                                     active_mode(), PARALLEL_TUNER.status(), message=notice,
-                                                    selected_usage=usage, selected_client_label=selected_label,
-                                                    all_usage=all_usage))
+                                                    all_usage=all_usage, client_usage=client_usage))
             except ValueError as exc:
                 self.send_error(400, str(exc))
             except Exception as exc:
