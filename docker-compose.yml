@@ -469,6 +469,7 @@ services:
       - ./gpu_control/assets:/app/assets:ro
       - ./gpu_control/benchmarks.py:/app/benchmarks.py:ro
       - ./gpu_control/benchmark_views.py:/app/benchmark_views.py:ro
+      - ./gpu_control/harness_views.py:/app/harness_views.py:ro
       - ./gpu_control/model_catalog.py:/app/model_catalog.py:ro
       - ./gpu_control/hybrid_memory.py:/app/hybrid_memory.py:ro
       - ./gpu_control/model_artifacts.py:/app/model_artifacts.py:ro

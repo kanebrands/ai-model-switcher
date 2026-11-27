@@ -14,6 +14,8 @@ cd ~/ai_setup
 
 Keep the API key and switcher password private. The switcher and ComfyUI Basic Auth username is `operator`.
 
+Open **Coding harnesses** in the switcher for official install and local API setup links for Hermes Agent, OpenCode, Pi, Aider, Cline, and Goose. The page compares their strengths and tradeoffs. Install a harness on the machine where it will edit files; use a dedicated key from **Client sharing** and the active model ID from `/v1/models`.
+
 ## Switch models and workloads
 
 Open the switcher URL and select one of the models chosen during installation. ComfyUI appears only if selected. One model workload runs at a time. The home page shows the active workload; a GPU/VRAM graph appears when a GPU workload is available. **Find models** lists compatible recommendations on GPU hosts and offers a specific Hugging Face model search on both GPU and CPU hosts. **Benchmarks** records results with timestamps and detected hardware details.

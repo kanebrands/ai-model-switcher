@@ -1,5 +1,7 @@
 # AI Model Switcher
 
+The switcher's **Coding harnesses** page links to official installation and local API guides for Hermes Agent, OpenCode, Pi, Aider, Cline, and Goose, with strengths and tradeoffs for each.
+
 An all-in-one Ubuntu 24.04 installation for local AI. It runs an OpenAI-compatible LLM API, Open WebUI, and a browser-based model switcher behind Nginx. On compatible NVIDIA hardware, selected GPU models and ComfyUI are available too. The switcher manages model selection, hardware-aware recommendations, benchmark history, context and generation-slot tuning, client limits, and live GPU metrics when a GPU is available.
 
 No GPU is required. The installer measures host RAM and, when present, NVIDIA VRAM and CUDA compatibility. It offers CPU and compatible NVIDIA workload choices; AMD and Intel owners can add GGUF models through the switcher's Vulkan path after installation. It downloads no model until you select one or more at the installation prompt; at least one text or vision model is required. ComfyUI is optional and its image/video model files are chosen separately later.
