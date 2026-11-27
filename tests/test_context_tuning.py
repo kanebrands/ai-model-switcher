@@ -3,11 +3,15 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from context_tuning import ContextTuner, context_flag
+from context_tuning import ContextTuner, context_flag, context_presets
 from model_catalog import ModelManager
 
 
 class ContextTuningTests(unittest.TestCase):
+    def test_context_presets_exclude_current_and_reported_native_excess(self):
+        self.assertEqual(context_presets(8192, 32768), [4096, 16384, 32768])
+        self.assertIn(262144, context_presets(32768))
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.env = patch.dict(os.environ, {"MODEL_DIR": self.temp.name,

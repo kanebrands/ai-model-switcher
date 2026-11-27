@@ -875,7 +875,7 @@ from model_catalog import BY_ID, ModelManager, model_display_name
 from media_catalog import MediaManager
 from catalog_discovery import CatalogDiscovery
 from engine_updates import EngineUpdates
-from context_tuning import ContextTuner
+from context_tuning import ContextTuner, context_presets
 from webui_updates import WebUIUpdates
 from sharing import SharingManager, FIELDS
 from gpu_metrics import GPUMonitor
@@ -1031,24 +1031,32 @@ def workload_snapshot():
     state = workload_state(container)
     if state.startswith(("exited", "dead")) or state in ("not created", "created", "unhealthy"):
         return {"mode": mode, "state": "failed", "detail": "Container " + state, "api_id": api_id}
-    if state not in ("running", "healthy"):
+    if state not in ("running", "healthy", "starting"):
         return {"mode": mode, "state": "loading", "detail": "Container " + state, "api_id": api_id}
     if mode == "media":
         ready = state == "healthy"
+        native_context = None
     else:
         ready = False
+        native_context = None
         try:
             request = urllib.request.Request("http://nginx:8080/v1/models",
                                              headers={"Authorization": "Bearer " + os.environ["BENCHMARK_API_KEY"]})
             with urllib.request.urlopen(request, timeout=3) as response:
-                ready = api_id in {item.get("id") for item in json.load(response).get("data", [])}
+                item = next((item for item in json.load(response).get("data", [])
+                             if isinstance(item, dict) and item.get("id") == api_id), None)
+                ready = bool(item)
+                if item:
+                    candidate = (item.get("meta") or {}).get("n_ctx_train")
+                    if isinstance(candidate, int) and candidate > 0:
+                        native_context = candidate
         except (OSError, ValueError, KeyError, TypeError):
             pass
     return {"mode": mode, "state": "ready" if ready else "loading",
             "detail": ("ComfyUI is ready; the language model API is unavailable until you select a language model"
                        if mode == "media" and ready else "Ready for requests" if ready else
                        "Model is loading; API requests may fail until ready"),
-            "api_id": api_id}
+            "api_id": api_id, "native_context_tokens": native_context}
 
 
 def active_server_slots():
@@ -1133,6 +1141,11 @@ class Handler(BaseHTTPRequestHandler):
         mode = active[0] if len(active) == 1 else "No model running" if not active else "Conflict: " + ", ".join(active)
         h = lambda s: html.escape(s, quote=True)
         try:
+            api_port = urllib.parse.urlsplit(PUBLIC_API_URL).port
+        except ValueError:
+            api_port = None
+        api_port_note = f'<span class="api-port">Port: {api_port}</span>' if api_port else ''
+        try:
             snapshot = workload_snapshot()
         except (OSError, RuntimeError, ValueError, KeyError):
             snapshot = {"state": "unavailable", "detail": "Could not check model status"}
@@ -1176,14 +1189,25 @@ class Handler(BaseHTTPRequestHandler):
                         f'{h(context_job.get("mode", ""))}: {h(str(context_job.get("previous_tokens", "")))} → '
                         f'{h(str(context_job.get("requested_tokens", "")))} tokens · '
                         f'{h(context_job.get("stage", ""))} · {h(context_job.get("error") or "")}</p>') if context_job else ""
-        context_form = (f'<p>Loaded model: <strong>{h(context_active["alias"])}</strong> · '
-                        f'Context: <strong>{h(context_text(context_active["mode"]))}</strong></p>'
-                        f'<form method="post" action="/context/tune"><input type="hidden" name="token" value="{h(CSRF)}">'
-                        f'<input type="hidden" name="mode" value="{h(context_active["mode"])}">'
-                        f'<label for="context-tokens">New context (tokens)</label><br><input id="context-tokens" '
-                        f'name="context_tokens" type="number" min="4096" max="262144" step="1024" '
-                        f'value="{context_active["tokens"]}" required> '
-                        '<button type="submit">Test and save context</button></form>') if context_active else '<p>Start one model to tune its context.</p>'
+        if context_active:
+            native_limit = (snapshot.get("native_context_tokens")
+                            if snapshot.get("mode") == context_active["mode"] else None)
+            choices = context_presets(context_active["tokens"], native_limit)
+            options = "".join(f'<option value="{tokens}">{tokens:,} tokens</option>' for tokens in choices)
+            limit_note = (f'Reported native limit: {native_limit:,} tokens.' if native_limit else
+                          'The model did not report a native context limit.')
+            context_form = (f'<p>Loaded model: <strong>{h(context_active["alias"])}</strong> · '
+                            f'Context: <strong>{h(context_text(context_active["mode"]))}</strong></p>'
+                            f'<p class="note">{h(limit_note)} Choose a preset to test; only a successful test is saved.</p>'
+                            f'<form method="post" action="/context/tune"><input type="hidden" name="token" value="{h(CSRF)}">'
+                            f'<input type="hidden" name="mode" value="{h(context_active["mode"])}">'
+                            '<label for="context-tokens">New context size</label><br>'
+                            '<select id="context-tokens" name="context_tokens" required>'
+                            f'<option value="" selected disabled>Select a preset to test</option>{options}</select> '
+                            '<button type="submit">Test and save context</button></form>' if choices else
+                            '<p>No different supported context preset is available for this model.</p>')
+        else:
+            context_form = '<p>Start one model to tune its context.</p>'
         if context_status["busy"]:
             context_form = '<p>Context test running. Progress updates above without reloading this page.</p>'
         states = (("cpu-tiny", "Qwen3 0.6B CPU", cpu_tiny_state),
@@ -1230,10 +1254,11 @@ class Handler(BaseHTTPRequestHandler):
         home_style += ".message-banner{display:flex;align-items:center;justify-content:space-between;gap:1rem}.message-banner p,.message-banner form{margin:0}.message-banner button{min-height:2.2rem;padding:.3rem .7rem;background:transparent;border-color:#c5a976;color:#f8d9a5;white-space:nowrap}.message-banner button:hover{background:#3a4437}@media(max-width:740px){.message-banner{align-items:flex-start;flex-direction:column}}"
         home_style += ".gpu-frame{width:100%;height:345px;border:0;background:#17262a}.gpu-note{font-size:.9rem;color:#b6c6c4}@media(max-width:740px){.gpu-frame{height:440px}}"
         home_style += ".active-caption{font-size:.83rem;font-weight:750;color:#d4e3db}.active-badge:not(.is-ready){background:#443926;border-color:#987445;color:#ffe1ad}.active-badge:not(.is-ready):before{background:#f0b967;box-shadow:0 0 0 3px #f0b96726}.active-badge.is-failed{background:#492a2a;border-color:#a85b55;color:#ffcbc5}.active-badge.is-failed:before{background:#f28b83}.active-detail{margin:.45rem 0;color:#d5e0db}.api-connection{display:flex;gap:.75rem 1.2rem;flex-wrap:wrap;align-items:end;margin-top:.7rem}.api-connection label{display:grid;gap:.2rem;color:#cad9d5;font-size:.82rem}.api-connection input{width:min(100%,22rem);font-family:ui-monospace,SFMono-Regular,monospace;font-size:.88rem}.api-connection .api-base{width:min(100%,28rem)}.api-note{font-size:.84rem;color:#c4d5d0;margin:.45rem 0 0}"
+        home_style += ".api-connection{display:grid;grid-template-columns:minmax(0,12rem) minmax(0,1fr);gap:1rem;align-items:start}.api-connection label{min-width:0;margin:0}.api-connection input[type=text]{width:100%;max-width:none}.api-port{display:block;color:#e8ba78;font-size:.78rem;font-weight:700}@media(max-width:680px){.api-connection{grid-template-columns:1fr}}"
         page = f"""<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>AI Model Switcher</title><style>{benchmark_views.STYLE}{home_style}</style>
 <main><nav aria-label="Main navigation"><a href="/">AI Model Switcher</a><a href="/models">Find models</a><a href="/benchmarks">Benchmarks</a><a href="/sharing">Client sharing</a><a href="/harnesses">Coding harnesses</a></nav>
-<header class="hero"><div class="hero-copy"><div class="eyebrow">Local AI / Control desk</div><h1>AI Model Switcher</h1><p>Manage local workloads and model context from one place.</p><div class="active-line"><span class="active-caption">Active workload</span><span class="active-badge {'is-ready' if snapshot['state'] == 'ready' else 'is-failed' if snapshot['state'] == 'failed' else ''}" data-workload-badge>{h(badge_label)}</span><strong data-workload-label>{h(mode)}</strong></div><p class="active-detail" role="status" data-workload-detail>{h(snapshot['detail'])}</p><div class="api-connection"><label>Stable API model ID<input readonly value="local-llm-api" data-copy-field aria-label="Copyable stable API model ID"></label><label>OpenAI API base URL<input class="api-base" readonly value="{h(PUBLIC_API_URL)}" data-copy-field aria-label="Copyable OpenAI API base URL"></label></div><p class="api-note">Use <code>local-llm-api</code> as the model in your harness to reach the currently loaded language model. Wait for “Ready to use” before sending requests.</p></div></header>
+<header class="hero"><div class="hero-copy"><div class="eyebrow">Local AI / Control desk</div><h1>AI Model Switcher</h1><p>Manage local workloads and model context from one place.</p><div class="active-line"><span class="active-caption">Active workload</span><span class="active-badge {'is-ready' if snapshot['state'] == 'ready' else 'is-failed' if snapshot['state'] == 'failed' else ''}" data-workload-badge>{h(badge_label)}</span><strong data-workload-label>{h(mode)}</strong></div><p class="active-detail" role="status" data-workload-detail>{h(snapshot['detail'])}</p><div class="api-connection"><label>Stable API model ID<input type="text" readonly value="local-llm-api" data-copy-field aria-label="Copyable stable API model ID"></label><label>OpenAI API base URL<input type="text" class="api-base" readonly value="{h(PUBLIC_API_URL)}" data-copy-field aria-label="Copyable OpenAI API base URL">{api_port_note}</label></div><p class="api-note">Use <code>local-llm-api</code> as the model in your harness to reach the currently loaded language model. Wait for “Ready to use” before sending requests.</p></div></header>
 <script src="/assets/operation_poll.js?v=workload-status-1" defer></script>
 {'<p class="message" role="status" data-operation-monitor="/operations/status?scope=home">Checking operation status…</p>' if context_status['busy'] or webui_status['checking'] or webui_status['busy'] else ''}
 {webui_card}
@@ -6208,6 +6233,13 @@ SERVICES = {"cpu-tiny": "cpu-tiny", "cpu-4b": "cpu-4b", "llm": "llm", "qwen4b": 
             "deepseek": "deepseek-v4-distill", "qwen38": "qwen38-ablit",
             "gemma4": "gemma4-ablit", "vision": "vision"}
 HELPER_IMAGE = "docker:cli"
+CONTEXT_PRESETS = (4096, 8192, 16384, 32768, 65536, 131072, 262144)
+
+
+def context_presets(current_tokens, native_limit=None):
+    """Offer tuner-accepted sizes no larger than a reported native limit."""
+    ceiling = min(262144, native_limit) if isinstance(native_limit, int) and native_limit > 0 else 262144
+    return [tokens for tokens in CONTEXT_PRESETS if tokens <= ceiling and tokens != current_tokens]
 
 
 def now():

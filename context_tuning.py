@@ -17,6 +17,13 @@ SERVICES = {"cpu-tiny": "cpu-tiny", "cpu-4b": "cpu-4b", "llm": "llm", "qwen4b": 
             "deepseek": "deepseek-v4-distill", "qwen38": "qwen38-ablit",
             "gemma4": "gemma4-ablit", "vision": "vision"}
 HELPER_IMAGE = "docker:cli"
+CONTEXT_PRESETS = (4096, 8192, 16384, 32768, 65536, 131072, 262144)
+
+
+def context_presets(current_tokens, native_limit=None):
+    """Offer tuner-accepted sizes no larger than a reported native limit."""
+    ceiling = min(262144, native_limit) if isinstance(native_limit, int) and native_limit > 0 else 262144
+    return [tokens for tokens in CONTEXT_PRESETS if tokens <= ceiling and tokens != current_tokens]
 
 
 def now():
