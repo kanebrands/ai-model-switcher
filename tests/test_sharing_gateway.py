@@ -103,6 +103,7 @@ class SharingTests(unittest.TestCase):
                                 client_usage={client["id"]: report,
                                               "legacy": manager.usage_summary("legacy", 1, "hours")})
             self.assertRegex(page, r'Deck Builder</td>.*?</tr><tr class="client-usage-row">')
+            self.assertIn('<details class="client-usage-details"><summary>Usage for Deck Builder</summary>', page)
             self.assertIn("25.00", page)
             self.assertIn("Input tokens", page)
             self.assertNotIn("View usage", page)
@@ -140,6 +141,8 @@ class SharingTests(unittest.TestCase):
             self.assertIn("Usage for all API keys", page)
             self.assertIn("Effective output tokens/s", page)
             self.assertEqual(page.count('class="client-usage-row"'), 3)
+            self.assertEqual(page.count('<details class="client-usage-details">'), 3)
+            self.assertNotIn('<details class="client-usage-details" open', page)
             self.assertIn('width:9rem;min-width:9rem;max-width:9rem', page)
 
     def test_gpu_parser_accepts_optional_power_and_multiple_devices(self):
