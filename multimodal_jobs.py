@@ -8,7 +8,7 @@ import uuid
 
 
 CPU_KINDS = frozenset({"pdf", "ocr", "transcription", "speech"})
-GPU_KINDS = frozenset({"image"})
+GPU_KINDS = frozenset({"image", "image_edit"})
 KINDS = CPU_KINDS | GPU_KINDS
 
 

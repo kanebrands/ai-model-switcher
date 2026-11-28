@@ -63,7 +63,7 @@ fi
 if [[ -d "$INSTALL_DIR/gpu_control/assets" && ! -w "$INSTALL_DIR/gpu_control/assets" ]]; then
   sudo chown "$(id -u):$(id -g)" "$INSTALL_DIR/gpu_control/assets"
 fi
-for generated in docker-compose.yml multimodal/Dockerfile gpu_control/server.py gpu_control/benchmarks.py gpu_control/benchmark_views.py gpu_control/operation_poll.js gpu_control/harness_views.py gpu_control/model_catalog.py gpu_control/model_artifacts.py gpu_control/hybrid_memory.py gpu_control/model_views.py gpu_control/catalog_discovery.py gpu_control/engine_updates.py gpu_control/webui_updates.py gpu_control/sharing.py gpu_control/sharing_views.py gpu_control/fairness_gateway.py gpu_control/gpu_metrics.py gpu_control/parallel_tuning.py gpu_control/install_profile.py gpu_control/install_models.sh gpu_control/context_tuning.py gpu_control/update-engine.sh gpu_control/update-webui.sh gpu_control/tune-parallel.sh gpu_control/tune-context.sh gpu_control/media_catalog.py gpu_control/multimodal_jobs.py gpu_control/multimodal_workers.py gpu_control/multimodal_service.py gpu_control/multimodal_profiles.py gpu_control/assets/gpu-workstation.webp ai-control.sh start-selected.sh; do
+for generated in docker-compose.yml multimodal/Dockerfile gpu_control/server.py gpu_control/benchmarks.py gpu_control/benchmark_views.py gpu_control/operation_poll.js gpu_control/harness_views.py gpu_control/model_catalog.py gpu_control/model_artifacts.py gpu_control/hybrid_memory.py gpu_control/model_views.py gpu_control/catalog_discovery.py gpu_control/engine_updates.py gpu_control/webui_updates.py gpu_control/sharing.py gpu_control/sharing_views.py gpu_control/fairness_gateway.py gpu_control/gpu_metrics.py gpu_control/parallel_tuning.py gpu_control/install_profile.py gpu_control/install_models.sh gpu_control/context_tuning.py gpu_control/update-engine.sh gpu_control/update-webui.sh gpu_control/tune-parallel.sh gpu_control/tune-context.sh gpu_control/media_catalog.py gpu_control/multimodal_jobs.py gpu_control/multimodal_workers.py gpu_control/multimodal_service.py gpu_control/multimodal_profiles.py gpu_control/image_edit.py gpu_control/image_edit_views.py gpu_control/image_edit_poll.js gpu_control/assets/gpu-workstation.webp ai-control.sh start-selected.sh; do
   if [[ -e "$INSTALL_DIR/$generated" && ! -w "$INSTALL_DIR/$generated" ]]; then
     sudo chown "$(id -u):$(id -g)" "$INSTALL_DIR/$generated"
   fi
@@ -614,13 +614,17 @@ services:
       XDG_CACHE_HOME: /app/data/multimodal/cache
       HOME: /tmp
       HF_HUB_DISABLE_XET: "1"
+      EDIT_MODEL_DIR: /app/data/multimodal/edit-models
+      COMFY_INPUT_DIR: /app/media_input
       PYTHONDONTWRITEBYTECODE: "1"
     volumes:
       - ./gpu_control/multimodal_service.py:/app/multimodal_service.py:ro
       - ./gpu_control/multimodal_jobs.py:/app/multimodal_jobs.py:ro
       - ./gpu_control/multimodal_workers.py:/app/multimodal_workers.py:ro
+      - ./gpu_control/image_edit.py:/app/image_edit.py:ro
       - ./gpu_control/results:/app/data
       - ${AI_MEDIA_DIR:?set AI_MEDIA_DIR in .env}/models:/app/media_models:ro
+      - ${AI_MEDIA_DIR:?set AI_MEDIA_DIR in .env}/input:/app/media_input
     read_only: true
     tmpfs:
       - /tmp:rw,nosuid,size=512m
@@ -663,6 +667,8 @@ services:
       - ./gpu_control/context_tuning.py:/app/context_tuning.py:ro
       - ./gpu_control/media_catalog.py:/app/media_catalog.py:ro
       - ./gpu_control/multimodal_profiles.py:/app/multimodal_profiles.py:ro
+      - ./gpu_control/image_edit_views.py:/app/image_edit_views.py:ro
+      - ./gpu_control/image_edit_poll.js:/app/image_edit_poll.js:ro
       - ./gpu_control/sharing.py:/app/sharing.py:ro
       - ./gpu_control/sharing_views.py:/app/sharing_views.py:ro
       - ./gpu_control/gpu_metrics.py:/app/gpu_metrics.py:ro
@@ -775,6 +781,7 @@ http {
     server {
         listen 3001;
         server_name _;
+        client_max_body_size 24m;
             auth_basic "AI Model Switcher";
         auth_basic_user_file /etc/nginx/.htpasswd;
         error_page 502 503 504 = @switcher_unavailable;
@@ -890,6 +897,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     pip install --no-cache-dir 'faster-whisper>=1.1,<2'
 # faster-whisper 1.2.1 still passes metadata_errors to av.open; PyAV 19 removed it.
 RUN pip install --no-cache-dir 'av>=11,<19'
+RUN pip install --no-cache-dir torch==2.5.1+cpu torchvision==0.20.1+cpu \
+    --index-url https://download.pytorch.org/whl/cpu
+RUN pip install --no-cache-dir 'transformers==4.57.3' 'Pillow>=10,<12'
 WORKDIR /app
 CMD ["python", "/app/multimodal_service.py"]
 MULTIMODAL_DOCKERFILE
@@ -900,6 +910,9 @@ cat > "$INSTALL_DIR/gpu_control/server.py" <<'GPU_CONTROLLER'
 import html
 import http.client
 import datetime as dt
+from email.parser import BytesParser
+from email.policy import default as email_policy
+import base64
 import json
 import os
 from pathlib import Path
@@ -909,6 +922,7 @@ import sqlite3
 import threading
 import urllib.parse
 import urllib.request
+import urllib.error
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from benchmarks import BenchmarkManager, MODELS
@@ -926,6 +940,7 @@ import sharing_views
 import model_views
 import harness_views
 import multimodal_profiles
+import image_edit_views
 
 PROFILE_PATH = "/app/data/multimodal/active_profile.json"
 
@@ -941,6 +956,25 @@ def profile_recommendations():
                                          os.environ.get("AI_MULTIMODAL_ENABLED") == "1", checkpoints,
                                          active_mode())
     return hardware, rows
+
+
+def image_edit_job(ident):
+    try:
+        if uuid.UUID(ident).version != 4:
+            return None
+    except (ValueError, TypeError):
+        return None
+    path = Path("/app/data/multimodal/jobs.sqlite3")
+    if not path.is_file():
+        return None
+    db = sqlite3.connect(path)
+    try:
+        db.row_factory = sqlite3.Row
+        row = db.execute("SELECT * FROM jobs WHERE id=? AND owner='switcher-admin' AND kind='image_edit'",
+                         (ident,)).fetchone()
+    finally:
+        db.close()
+    return dict(row) if row else None
 
 
 def usage_window(query, prefix=""):
@@ -1381,7 +1415,7 @@ class Handler(BaseHTTPRequestHandler):
         home_style += ".api-connection{display:grid;grid-template-columns:minmax(0,12rem) minmax(0,1fr);gap:1rem;align-items:start}.api-connection label{min-width:0;margin:0}.api-connection input[type=text]{width:100%;max-width:none}.api-port{display:block;color:#e8ba78;font-size:.78rem;font-weight:700}@media(max-width:680px){.api-connection{grid-template-columns:1fr}}"
         page = f"""<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>AI Model Switcher</title><style>{benchmark_views.STYLE}{home_style}{sharing_views.USAGE_STYLE}</style>
-<main><nav aria-label="Main navigation"><a href="/">AI Model Switcher</a><a href="/models">Find models</a><a href="/benchmarks">Benchmarks</a><a href="/profiles">Task profiles</a><a href="/sharing">Client sharing</a><a href="/harnesses">Coding harnesses</a></nav>
+<main><nav aria-label="Main navigation"><a href="/">AI Model Switcher</a><a href="/models">Find models</a><a href="/benchmarks">Benchmarks</a><a href="/profiles">Task profiles</a><a href="/image-edit">Image editor</a><a href="/sharing">Client sharing</a><a href="/harnesses">Coding harnesses</a></nav>
 <header class="hero"><div class="hero-copy"><div class="eyebrow">Local AI / Control desk</div><h1>AI Model Switcher</h1><p>Manage local workloads and model context from one place.</p><div class="active-line"><span class="active-caption">Active workload</span><span class="active-badge {'is-ready' if snapshot['state'] == 'ready' else 'is-failed' if snapshot['state'] == 'failed' else ''}" data-workload-badge>{h(badge_label)}</span><strong data-workload-label>{h(mode)}</strong></div><p class="active-detail" role="status" data-workload-detail>{h(snapshot['detail'])}</p><div class="api-connection"><label>Stable API model ID<input type="text" readonly value="local-llm-api" data-copy-field aria-label="Copyable stable API model ID"></label><label>OpenAI API base URL<input type="text" class="api-base" readonly value="{h(PUBLIC_API_URL)}" data-copy-field aria-label="Copyable OpenAI API base URL">{api_port_note}</label></div><p class="api-note">Use <code>local-llm-api</code> as the model in your harness to reach the currently loaded language model. Wait for “Ready to use” before sending requests.</p></div></header>
 <script src="/assets/operation_poll.js?v=workload-status-1" defer></script>
 {'<p class="message" role="status" data-operation-monitor="/operations/status?scope=home">Checking operation status…</p>' if context_status['busy'] or webui_status['checking'] or webui_status['busy'] else ''}
@@ -1398,7 +1432,7 @@ class Handler(BaseHTTPRequestHandler):
 <h2>Service status</h2><div class="services">{status_cards}</div><p><a href="/">Refresh status</a></p>
 {gpu_card}
 <p class="note">If a service fails, check ai-control.sh huihui-logs or media-logs. If Open WebUI still shows local-coder after switching, set its connection URL to http://nginx:8080/v1 in Admin → Settings → Connections.</p>
-<div class="home-footer"><a href="/models">Find models</a><a href="/benchmarks">Benchmarks and results</a><a href="/profiles">Task profiles</a><a href="/sharing">Client sharing and rate limits</a><a href="/harnesses">Coding harnesses</a><a href="{h(WEB_URL)}">Open WebUI</a>{f'<a href="{h(COMFY_URL)}">ComfyUI</a>' if available_builtin('media') else ''}</div></main></html>"""
+<div class="home-footer"><a href="/models">Find models</a><a href="/benchmarks">Benchmarks and results</a><a href="/profiles">Task profiles</a><a href="/image-edit">Image editor</a><a href="/sharing">Client sharing and rate limits</a><a href="/harnesses">Coding harnesses</a><a href="{h(WEB_URL)}">Open WebUI</a>{f'<a href="{h(COMFY_URL)}">ComfyUI</a>' if available_builtin('media') else ''}</div></main></html>"""
         data = page.encode()
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -1411,6 +1445,42 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = urllib.parse.urlsplit(self.path)
+        if path.path == "/image-edit":
+            job_id = urllib.parse.parse_qs(path.query).get("job", [None])[0]
+            if job_id and not image_edit_job(job_id):
+                self.send_error(404, "Image edit job not found")
+                return
+            self._send_html(image_edit_views.page(CSRF, job_id))
+            return
+        for prefix, binary in (("/image-edit/status/", False), ("/image-edit/result/", True)):
+            if path.path.startswith(prefix):
+                job = image_edit_job(path.path[len(prefix):])
+                if not job:
+                    self.send_error(404, "Image edit job not found")
+                    return
+                if binary:
+                    if job["status"] != "completed" or job["result_name"] != job["id"] + ".result":
+                        self.send_error(404, "Edited image is not ready")
+                        return
+                    data = (Path("/app/data/multimodal/artifacts") / job["result_name"]).read_bytes()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "image/png")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("X-Content-Type-Options", "nosniff")
+                    self.end_headers()
+                    self.wfile.write(data)
+                else:
+                    data = json.dumps({"id": job["id"], "kind": job["kind"], "status": job["status"],
+                                       "stage": job["stage"], "error": job["error"],
+                                       "result": json.loads(job["result_json"]) if job["result_json"] else None}).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
+                    self.wfile.write(data)
+                return
         if path.path == "/profiles":
             try:
                 hardware, rows = profile_recommendations()
@@ -1433,6 +1503,20 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 with open("/app/operation_poll.js", "rb") as script:
                     data = script.read()
+            except OSError:
+                self.send_error(404)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/javascript; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "public, max-age=3600")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(data)
+            return
+        if path.path == "/assets/image_edit_poll.js":
+            try:
+                data = Path("/app/image_edit_poll.js").read_bytes()
             except OSError:
                 self.send_error(404)
                 return
@@ -1716,7 +1800,71 @@ class Handler(BaseHTTPRequestHandler):
         WEBUI_UPDATES.check_async()
         self._page()
 
+    def _submit_image_edit(self):
+        if self.headers.get("Origin") != ORIGIN or self.headers.get("Host") != urllib.parse.urlsplit(ORIGIN).netloc:
+            self.send_error(403, "Invalid origin")
+            return
+        content_type = self.headers.get("Content-Type", "")
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            length = 0
+        if not 1 <= length <= 24 * 1024 * 1024 or not content_type.startswith("multipart/form-data;"):
+            self.send_error(413, "Upload a JPEG, PNG, or WebP image up to 16 MiB")
+            return
+        raw = self.rfile.read(length)
+        document = BytesParser(policy=email_policy).parsebytes(
+            b"MIME-Version: 1.0\r\nContent-Type: " + content_type.encode("ascii", "ignore") + b"\r\n\r\n" + raw)
+        if not document.is_multipart():
+            self.send_error(400, "Invalid upload form")
+            return
+        fields = {}
+        for part in document.iter_parts():
+            name = part.get_param("name", header="content-disposition")
+            if name not in ("token", "prompt", "image") or name in fields:
+                self.send_error(400, "Invalid upload form fields")
+                return
+            fields[name] = part.get_payload(decode=True)
+        if fields.get("token") != CSRF.encode():
+            self.send_error(403, "Invalid request")
+            return
+        image_data = fields.get("image", b"")
+        try:
+            prompt = fields.get("prompt", b"").decode("utf-8")
+        except UnicodeDecodeError:
+            self.send_error(400, "Instruction must be UTF-8 text")
+            return
+        if not 1 <= len(image_data) <= 16 * 1024 * 1024 or not 1 <= len(prompt) <= 1000:
+            self.send_error(400, "Choose an image up to 16 MiB and a short instruction")
+            return
+        payload = json.dumps({"data": base64.b64encode(image_data).decode(), "prompt": prompt}).encode()
+        request = urllib.request.Request("http://multimodal:8003/v1/images/edits", data=payload,
+                                         headers={"Content-Type": "application/json",
+                                                  "X-Internal-Token": os.environ["BENCHMARK_API_KEY"],
+                                                  "X-AI-Client-ID": "switcher-admin"})
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                ident = json.load(response)["id"]
+        except urllib.error.HTTPError as exc:
+            try:
+                detail = json.load(exc).get("error", {}).get("message", "Image edit was rejected")
+            except (ValueError, TypeError):
+                detail = "Image edit was rejected"
+            self.send_error(exc.code, detail)
+            return
+        except (OSError, KeyError, ValueError):
+            self.send_error(502, "Image-edit worker is unavailable")
+            return
+        self.send_response(303)
+        self.send_header("Location", "/image-edit?job=" + ident)
+        self.send_header("Content-Length", "0")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+
     def do_POST(self):
+        if self.path == "/image-edit/submit":
+            self._submit_image_edit()
+            return
         if self.path in ("/multimodal/acquire", "/multimodal/release"):
             if self.headers.get("Authorization") != "Bearer " + os.environ["BENCHMARK_API_KEY"]:
                 self.send_error(403)
@@ -1783,6 +1931,11 @@ class Handler(BaseHTTPRequestHandler):
                     if len(checkpoint) != 1 or checkpoint[0] not in selected["checkpoints"]:
                         raise ValueError("Select an installed image checkpoint")
                     selected["image_checkpoint"] = checkpoint[0]
+                    if selected["image_edit_checkpoints"]:
+                        edit_checkpoint = fields.get("edit_checkpoint", [])
+                        if len(edit_checkpoint) != 1 or edit_checkpoint[0] not in selected["image_edit_checkpoints"]:
+                            raise ValueError("Select an installed inpainting checkpoint")
+                        selected["image_edit_checkpoint"] = edit_checkpoint[0]
                 previous = active_mode()
                 old_profile = multimodal_profiles.load(PROFILE_PATH)
                 if previous != selected["text_mode"]:
@@ -2685,13 +2838,14 @@ def shell(title, body, refresh=False, wide=False, monitor_url=None):
                    "Find models sized for the hardware in this system." if title == "Hugging Face model recommendations" else
                    "The switcher could not complete this request." if title == "Request failed" else
                    "Configure task workers and review queued jobs for this system." if title == "Multimodal profiles" else
+                   "Remove named objects from photos with a queued inpainting workflow." if title == "Image editor" else
                    "Compare coding agents and connect them to your local API." if title == "Coding harnesses" else
                    "Inspect this model's recorded runs and system details.")
     display_title = "Find models" if title == "Hugging Face model recommendations" else title
     return (f'<!doctype html><html lang="en"><meta charset="utf-8">'
             f'<meta name="viewport" content="width=device-width,initial-scale=1">'
             f'<title>{esc(title)}</title><style>{STYLE}</style><body{body_class}><main><nav aria-label="Main navigation"><a href="/">AI Model Switcher</a>'
-            f'<a href="/benchmarks">Benchmarks</a><a href="/models">Find models</a><a href="/profiles">Task profiles</a><a href="/sharing">Client sharing</a><a href="/harnesses">Coding harnesses</a></nav>'
+            f'<a href="/benchmarks">Benchmarks</a><a href="/models">Find models</a><a href="/profiles">Task profiles</a><a href="/image-edit">Image editor</a><a href="/sharing">Client sharing</a><a href="/harnesses">Coding harnesses</a></nav>'
             f'<header class="hero"><div class="hero-copy"><div class="eyebrow">Local AI / Control desk</div><h1>{esc(display_title)}</h1><p>{description}</p></div></header>{monitor}{body}</main></body></html>')
 
 
@@ -5756,7 +5910,7 @@ HOP_HEADERS = {"connection", "keep-alive", "proxy-authenticate", "proxy-authoriz
 BACKEND = re.compile(r"[a-z0-9-]+:(?:8000|8080)\Z")
 STABLE_MODEL_ID = "local-llm-api"
 MEDIA_POST_ROUTES = {"/v1/documents/parse", "/v1/ocr", "/v1/audio/transcriptions",
-                     "/v1/audio/speech", "/v1/images/generations"}
+                     "/v1/audio/speech", "/v1/images/generations", "/v1/images/edits"}
 
 
 def is_media_route(path, method):
@@ -7109,7 +7263,7 @@ import uuid
 
 
 CPU_KINDS = frozenset({"pdf", "ocr", "transcription", "speech"})
-GPU_KINDS = frozenset({"image"})
+GPU_KINDS = frozenset({"image", "image_edit"})
 KINDS = CPU_KINDS | GPU_KINDS
 
 
@@ -7367,6 +7521,11 @@ def image(job, update):
     if not installed.is_file():
         raise ValueError("Checkpoint is not installed in ComfyUI")
     workflow = sdxl_workflow(prompt, checkpoint, width, height, steps)
+    result, data, mime = render_workflow(job, workflow, update)
+    return {**result, "checkpoint": checkpoint}, data, mime
+
+
+def render_workflow(job, workflow, update, output_node="10"):
     reply = comfy_request("/prompt", {"prompt": workflow, "client_id": job["id"]})
     ref = reply.get("prompt_id")
     if not ref:
@@ -7379,7 +7538,7 @@ def image(job, update):
             if history.get("status", {}).get("status_str") == "error":
                 raise RuntimeError("ComfyUI workflow failed")
             outputs = history.get("outputs", {})
-            images = outputs.get("10", {}).get("images", [])
+            images = outputs.get(output_node, {}).get("images", [])
             if images:
                 item = images[0]
                 from urllib.parse import urlencode
@@ -7389,9 +7548,19 @@ def image(job, update):
                     data = response.read(32 * 1024 * 1024 + 1)
                     if len(data) > 32 * 1024 * 1024:
                         raise ValueError("ComfyUI result exceeds 32 MiB")
-                    return {"prompt_id": ref, "checkpoint": checkpoint}, data, response.headers.get_content_type()
+                    return {"prompt_id": ref}, data, response.headers.get_content_type()
         time.sleep(3)
     raise TimeoutError("ComfyUI image job timed out")
+
+
+def prepare_image_edit(job, payload, update):
+    from image_edit import prepare
+    return prepare(job, payload, update)
+
+
+def image_edit(job, prepared, update):
+    from image_edit import render
+    return render(job, prepared, update, render_workflow)
 MULTIMODAL_WORKERS
 
 cat > "$INSTALL_DIR/gpu_control/multimodal_service.py" <<'MULTIMODAL_SERVICE'
@@ -7417,7 +7586,7 @@ TOKEN = os.environ["MULTIMODAL_INTERNAL_KEY"]
 CONTROLLER = os.environ.get("MULTIMODAL_CONTROLLER", "http://gpu-control:8001")
 ROUTES = {"/v1/documents/parse": "pdf", "/v1/ocr": "ocr",
           "/v1/audio/transcriptions": "transcription", "/v1/audio/speech": "speech",
-          "/v1/images/generations": "image"}
+          "/v1/images/generations": "image", "/v1/images/edits": "image_edit"}
 
 
 def controller(action, ident):
@@ -7448,7 +7617,11 @@ def worker(kinds):
             elif kind == "speech":
                 result, artifact, mime = workers.speech(job)
                 STORE.complete(job["id"], result, artifact, mime)
-            elif kind == "image":
+            elif kind in ("image", "image_edit"):
+                prepared = None
+                if kind == "image_edit":
+                    STORE.update(job["id"], stage="locating object and building mask")
+                    prepared = workers.prepare_image_edit(job, payload, STORE.update)
                 STORE.update(job["id"], stage="waiting for GPU")
                 controller("acquire", job["id"])
                 leased = True
@@ -7462,7 +7635,8 @@ def worker(kinds):
                         if time.monotonic() >= ready_by:
                             raise TimeoutError("ComfyUI did not become ready within five minutes")
                         time.sleep(5)
-                result, artifact, mime = workers.image(job, STORE.update)
+                result, artifact, mime = (workers.image_edit(job, prepared, STORE.update)
+                                          if kind == "image_edit" else workers.image(job, STORE.update))
                 STORE.update(job["id"], stage="restoring language model")
                 release = controller("release", job["id"])
                 leased = False
@@ -7535,8 +7709,17 @@ class Handler(BaseHTTPRequestHandler):
                 request.setdefault("width", 1024)
                 request.setdefault("height", 1024)
                 request.setdefault("steps", 20)
+            if kind == "image_edit":
+                if not profile.get("image"):
+                    raise ValueError("Load a Creative studio profile before editing an image")
+                checkpoints = Path(os.environ.get("COMFY_MODEL_DIR", "/app/media_models")) / "checkpoints"
+                choices = sorted(path.name for path in checkpoints.glob("*inpaint*.safetensors"))
+                request.setdefault("checkpoint", profile.get("image_edit_checkpoint") or (choices[0] if choices else None))
+                if request["checkpoint"] not in choices:
+                    raise ValueError("Install and select an inpainting checkpoint in ComfyUI")
+                request.setdefault("steps", 22)
             data = request.pop("data", None)
-            if kind in {"pdf", "ocr", "transcription"}:
+            if kind in {"pdf", "ocr", "transcription", "image_edit"}:
                 if not isinstance(data, str):
                     raise ValueError("Base64 data field is required")
                 payload = base64.b64decode(data, validate=True)
@@ -7631,6 +7814,7 @@ def recommend(hardware, modes, media_ready, worker_enabled, checkpoints=(), curr
     chosen = current if current in modes else next((mode for mode in preferred if mode in modes), next(iter(sorted(modes)), None))
     if chosen is None:
         return []
+    edit_choices = [name for name in checkpoints if "inpaint" in name.lower()]
     rows = []
     for ident, label, use, asr in RECIPES:
         rows.append({"id": ident, "name": label, "use": use, "text_mode": chosen,
@@ -7639,6 +7823,8 @@ def recommend(hardware, modes, media_ready, worker_enabled, checkpoints=(), curr
                      "pdf": worker_enabled, "ocr": worker_enabled, "audio": worker_enabled,
                      "image": bool(worker_enabled and media_ready and ident == "creative"),
                      "image_checkpoint": checkpoints[0] if checkpoints and ident == "creative" else None,
+                     "image_edit_checkpoint": edit_choices[0] if edit_choices and ident == "creative" else None,
+                     "image_edit_checkpoints": edit_choices if ident == "creative" else [],
                      "checkpoints": list(checkpoints) if ident == "creative" else [],
                      "available": bool(worker_enabled and (ident != "creative" or media_ready)),
                      "reason": ("Ready to configure" if worker_enabled and (ident != "creative" or media_ready) else
@@ -7668,16 +7854,20 @@ def page(rows, active, hardware, csrf, jobs=()):
         checkpoint_choice = (f'<label>Image checkpoint <select name="checkpoint">'
                              + "".join(f'<option value="{esc(name)}">{esc(name)}</option>' for name in row["checkpoints"])
                              + '</select></label>' if row["image"] else "")
+        edit_checkpoint_choice = (f'<label>Inpainting checkpoint <select name="edit_checkpoint">'
+                                  + "".join(f'<option value="{esc(name)}">{esc(name)}</option>' for name in row["image_edit_checkpoints"])
+                                  + '</select></label>' if row["image"] and row["image_edit_checkpoints"] else "")
         text_choice = (f'<label>Language model <select name="text_mode">' +
                        "".join(f'<option value="{esc(mode)}"{" selected" if mode == row["text_mode"] else ""}>'
                                f'{esc(mode)}</option>' for mode in row["text_modes"]) + '</select></label>')
         button = (f'<form method="post" action="/profiles/apply"><input type="hidden" name="token" value="{esc(csrf)}">'
-                  f'<input type="hidden" name="profile" value="{esc(row["id"])}">{text_choice}{checkpoint_choice}<button type="submit"'
+                  f'<input type="hidden" name="profile" value="{esc(row["id"])}">{text_choice}{checkpoint_choice}{edit_checkpoint_choice}<button type="submit"'
                   f'{"" if row["available"] else " disabled"}>Load profile</button></form>')
         cards.append(f'<section class="card"><div class="eyebrow">{esc(state)}</div><h2>{esc(row["name"])}</h2>'
                      f'<p>{esc(row["use"])}</p><p>Language model: {esc(row["text_mode"])} via '
                      '<code>local-llm-api</code>. PDF/OCR and audio run as queued CPU work. '
                      f'Image generation: {"queued on ComfyUI" if row["image"] else "not configured"}. '
+                     f'Object removal: {"available" if row["image_edit_checkpoint"] else "install an inpainting checkpoint"}. '
                      f'ASR size: {esc(row["asr_model"])}.</p><p>{esc(row["reason"])}</p>{button}</section>')
     current = (f'Active profile: {esc(active["name"])}; language model: {esc(active["text_mode"])}.'
                if active else 'No multimodal profile is active.')
@@ -7687,7 +7877,7 @@ def page(rows, active, hardware, csrf, jobs=()):
             'they do not download a language or image model.</p><p>Clients continue using the same '
             'OpenAI compatible base URL and <code>local-llm-api</code> for text. '
             'Document, audio, and image tasks use dedicated paths at that base URL.</p>'
-            '<p><a href="/">Back to switcher</a></p></section>')
+            '<p><a href="/image-edit">Open image editor</a> · <a href="/">Back to switcher</a></p></section>')
     queue = ('<section class="card"><h2>Recent task jobs</h2><p>Jobs stay in the durable queue across worker restarts. '
              'Use the authenticated API job URL to retrieve each result.</p><table><thead><tr><th>Started UTC</th>'
              '<th>Task</th><th>Status</th><th>Stage</th></tr></thead><tbody>' +
@@ -7696,6 +7886,280 @@ def page(rows, active, hardware, csrf, jobs=()):
              '</tbody></table></section>')
     return shell("Multimodal profiles", body + "".join(cards) + queue)
 MULTIMODAL_PROFILES
+
+cat > "$INSTALL_DIR/gpu_control/image_edit.py" <<'IMAGE_EDIT_WORKER'
+"""Grounded object removal: detect, segment, inpaint, and composite."""
+import gc
+from io import BytesIO
+import os
+from pathlib import Path
+import re
+import time
+
+
+DINO_ID = "IDEA-Research/grounding-dino-tiny"
+SAM_ID = "facebook/sam-vit-base"
+MAX_PIXELS = 20_000_000
+
+
+def target_from_prompt(prompt, explicit=None):
+    if explicit is not None:
+        target = explicit
+    else:
+        if not isinstance(prompt, str):
+            raise ValueError("An image-edit prompt is required")
+        cleaned = prompt.strip().lower().rstrip(". !")
+        match = re.search(r"\b(?:remove|erase|delete|take out)\s+(?:the |a |an )?(.+?)"
+                          r"(?:\s+from\s+(?:the |this |my |an? )?(?:attached )?(?:image|photo|picture)|$)", cleaned)
+        if not match:
+            raise ValueError("Say which object to remove, for example: remove the trash can from the image")
+        target = match.group(1)
+    if not isinstance(target, str):
+        raise ValueError("Object name must be text")
+    target = re.sub(r"\b(?:please|in the background|in the foreground)\b", "", target.lower()).strip(" ,.")
+    target = target.replace("trashcan", "trash can")
+    if not 2 <= len(target) <= 80 or not re.fullmatch(r"[a-z0-9][a-z0-9 '-]*", target):
+        raise ValueError("Choose one object name of 2–80 characters")
+    return target
+
+
+def select_box(boxes, scores, minimum=0.22):
+    candidates = sorted(((float(score), [float(value) for value in box])
+                         for box, score in zip(boxes, scores) if float(score) >= minimum), reverse=True)
+    if not candidates:
+        raise ValueError("The requested object was not found with enough confidence")
+    if len(candidates) > 1 and candidates[1][0] >= candidates[0][0] - 0.05:
+        raise ValueError("Several matching objects were found; provide a bounding box to select one")
+    return candidates[0][1], candidates[0][0]
+
+
+def _open_image(payload):
+    from PIL import Image, ImageOps
+    Image.MAX_IMAGE_PIXELS = MAX_PIXELS
+    with Image.open(BytesIO(payload)) as opened:
+        if opened.format not in ("JPEG", "PNG", "WEBP"):
+            raise ValueError("Upload a JPEG, PNG, or WebP image")
+        if opened.width * opened.height > MAX_PIXELS or min(opened.size) < 256:
+            raise ValueError("Image must be at least 256 px per side and at most 20 megapixels")
+        return ImageOps.exif_transpose(opened).convert("RGB")
+
+
+def _detect(image, target):
+    import torch
+    from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
+    cache = os.environ.get("EDIT_MODEL_DIR", "/app/data/multimodal/edit-models")
+    preview = image.copy()
+    preview.thumbnail((1024, 1024))
+    torch.set_num_threads(max(1, min(8, (os.cpu_count() or 4) // 2)))
+    processor = AutoProcessor.from_pretrained(DINO_ID, cache_dir=cache)
+    model = AutoModelForZeroShotObjectDetection.from_pretrained(DINO_ID, cache_dir=cache,
+                                                                 use_safetensors=True).eval()
+    inputs = processor(images=preview, text=[[target]], return_tensors="pt")
+    with torch.inference_mode():
+        output = model(**inputs)
+    result = processor.post_process_grounded_object_detection(
+        output, threshold=0.22, text_threshold=0.22,
+        target_sizes=[(preview.height, preview.width)])[0]
+    box, score = select_box(result["boxes"].tolist(), result["scores"].tolist())
+    del model, processor, inputs, output, result
+    gc.collect()
+    return preview, box, score
+
+
+def _segment(preview, box):
+    import torch
+    from PIL import Image
+    from transformers import SamModel, SamProcessor
+    cache = os.environ.get("EDIT_MODEL_DIR", "/app/data/multimodal/edit-models")
+    processor = SamProcessor.from_pretrained(SAM_ID, cache_dir=cache)
+    model = SamModel.from_pretrained(SAM_ID, cache_dir=cache, use_safetensors=True).eval()
+    inputs = processor(images=preview, input_boxes=[[box]], return_tensors="pt")
+    with torch.inference_mode():
+        output = model(**inputs, multimask_output=False)
+    masks = processor.image_processor.post_process_masks(
+        output.pred_masks.cpu(), inputs["original_sizes"].cpu(), inputs["reshaped_input_sizes"].cpu())
+    mask = masks[0][0][0].cpu().numpy().astype("uint8") * 255
+    result = Image.fromarray(mask, "L")
+    del model, processor, inputs, output, masks, mask
+    gc.collect()
+    return result
+
+
+def prepare(job, payload, update):
+    from PIL import Image
+    request = job["request"]
+    target = target_from_prompt(request.get("prompt"), request.get("target"))
+    image = _open_image(payload)
+    manual_box = request.get("box")
+    if manual_box is not None:
+        if (not isinstance(manual_box, list) or len(manual_box) != 4 or
+                any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in manual_box)):
+            raise ValueError("box must contain four image coordinates")
+        if not (0 <= manual_box[0] < manual_box[2] <= image.width and
+                0 <= manual_box[1] < manual_box[3] <= image.height):
+            raise ValueError("box is outside the image")
+        preview = image.copy()
+        preview.thumbnail((1024, 1024))
+        box = [manual_box[0] * preview.width / image.width,
+               manual_box[1] * preview.height / image.height,
+               manual_box[2] * preview.width / image.width,
+               manual_box[3] * preview.height / image.height]
+        score = None
+    else:
+        preview, box, score = _detect(image, target)
+    update(job["id"], stage="segmenting " + target)
+    mask = _segment(preview, box).resize(image.size, Image.Resampling.NEAREST)
+    coverage = sum(1 for value in mask.resize((128, 128)).getdata() if value > 128) / (128 * 128)
+    if coverage < 0.0001 or coverage > 0.45:
+        raise ValueError("Object mask was empty or covered too much of the image")
+    return {"image": image, "mask": mask, "target": target,
+            "box": [round(box[0] * image.width / preview.width), round(box[1] * image.height / preview.height),
+                    round(box[2] * image.width / preview.width), round(box[3] * image.height / preview.height)],
+            "confidence": round(score, 3) if score is not None else None}
+
+
+def crop_for_edit(image, mask):
+    from PIL import Image, ImageFilter
+    bbox = mask.getbbox()
+    if not bbox:
+        raise ValueError("Segmentation produced an empty mask")
+    object_size = max(bbox[2] - bbox[0], bbox[3] - bbox[1])
+    side = min(min(image.size), max(512, int(object_size * 2.2)))
+    if side < object_size * 1.1:
+        raise ValueError("Object is too large for the current inpainting workflow")
+    center_x, center_y = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
+    left = max(0, min(image.width - side, round(center_x - side / 2)))
+    top = max(0, min(image.height - side, round(center_y - side / 2)))
+    crop_box = (left, top, left + side, top + side)
+    crop = image.crop(crop_box).resize((512, 512), Image.Resampling.LANCZOS)
+    crop_mask = mask.crop(crop_box).resize((512, 512), Image.Resampling.NEAREST)
+    crop_mask = crop_mask.filter(ImageFilter.MaxFilter(11))
+    return crop_box, crop, crop_mask
+
+
+def workflow(checkpoint, image_name, mask_name, target, steps):
+    return {
+        "4": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": checkpoint}},
+        "5": {"class_type": "LoadImage", "inputs": {"image": image_name}},
+        "6": {"class_type": "LoadImageMask", "inputs": {"image": mask_name, "channel": "red"}},
+        "7": {"class_type": "VAEEncodeForInpaint", "inputs": {"pixels": ["5", 0], "vae": ["4", 2],
+                                                       "mask": ["6", 0], "grow_mask_by": 6}},
+        "8": {"class_type": "CLIPTextEncode", "inputs": {"text": "clean natural continuation of the surrounding scene, seamless background, matching lighting and perspective", "clip": ["4", 1]}},
+        "9": {"class_type": "CLIPTextEncode", "inputs": {"text": target + ", object, artifact, distortion", "clip": ["4", 1]}},
+        "10": {"class_type": "KSampler", "inputs": {"seed": int(time.time_ns() % (2**53)),
+                  "steps": steps, "cfg": 7, "sampler_name": "euler", "scheduler": "normal", "denoise": 1,
+                  "model": ["4", 0], "positive": ["8", 0], "negative": ["9", 0], "latent_image": ["7", 0]}},
+        "11": {"class_type": "VAEDecode", "inputs": {"samples": ["10", 0], "vae": ["4", 2]}},
+        "12": {"class_type": "SaveImage", "inputs": {"filename_prefix": "ai-switcher-edit", "images": ["11", 0]}},
+    }
+
+
+def render(job, prepared, update, render_workflow):
+    from PIL import Image, ImageFilter
+    request = job["request"]
+    checkpoint = request.get("checkpoint")
+    steps = request.get("steps", 22)
+    if not isinstance(checkpoint, str) or Path(checkpoint).name != checkpoint or not checkpoint.endswith(".safetensors"):
+        raise ValueError("Select an installed inpainting checkpoint")
+    if not isinstance(steps, int) or isinstance(steps, bool) or not 1 <= steps <= 60:
+        raise ValueError("steps must be 1–60")
+    model = Path(os.environ.get("COMFY_MODEL_DIR", "/app/media_models")) / "checkpoints" / checkpoint
+    if not model.is_file() or "inpaint" not in checkpoint.lower():
+        raise ValueError("A compatible inpainting checkpoint is required")
+    input_dir = Path(os.environ.get("COMFY_INPUT_DIR", "/app/media_input"))
+    crop_box, crop, mask = crop_for_edit(prepared["image"], prepared["mask"])
+    input_name = job["id"] + "-source.png"
+    mask_name = job["id"] + "-mask.png"
+    paths = [input_dir / input_name, input_dir / mask_name]
+    try:
+        for picture, path in zip((crop, mask), paths):
+            picture.save(path, format="PNG")
+            path.chmod(0o644)
+        result, raw, mime = render_workflow(job, workflow(checkpoint, input_name, mask_name,
+                                                          prepared["target"], steps), update, output_node="12")
+        with Image.open(BytesIO(raw)) as generated:
+            edited_crop = generated.convert("RGB").resize((crop_box[2] - crop_box[0],
+                                                             crop_box[3] - crop_box[1]), Image.Resampling.LANCZOS)
+        feather = mask.resize(edited_crop.size, Image.Resampling.LANCZOS).filter(ImageFilter.GaussianBlur(2.5))
+        original = prepared["image"].copy()
+        old_crop = original.crop(crop_box)
+        original.paste(Image.composite(edited_crop, old_crop, feather), crop_box[:2])
+        buffer = BytesIO()
+        original.save(buffer, format="PNG")
+        return {**result, "checkpoint": checkpoint, "target": prepared["target"],
+                "box": prepared["box"], "detection_confidence": prepared["confidence"],
+                "width": original.width, "height": original.height}, buffer.getvalue(), "image/png"
+    finally:
+        for path in paths:
+            path.unlink(missing_ok=True)
+IMAGE_EDIT_WORKER
+
+cat > "$INSTALL_DIR/gpu_control/image_edit_views.py" <<'IMAGE_EDIT_VIEWS'
+"""Browser upload and progress page for grounded object removal."""
+import html
+
+from benchmark_views import shell
+
+
+def page(csrf, job_id=None):
+    esc = lambda value: html.escape(str(value), quote=True)
+    progress = (f'<section class="card" data-edit-job="{esc(job_id)}">'
+                '<h2>Editing progress</h2><p id="edit-status" role="status">Checking job status…</p>'
+                '<p id="edit-detail" class="note"></p>'
+                '<img id="edit-preview" alt="Edited image preview" hidden style="max-width:100%;height:auto">'
+                '<p><a id="edit-download" download="edited-image.png" hidden>Download edited image</a></p></section>'
+                '<script src="/assets/image_edit_poll.js" defer></script>') if job_id else ""
+    body = ('<section class="card"><div class="eyebrow">OBJECT REMOVAL</div><h1>Edit an image</h1>'
+            '<p>Upload a photo and describe the object to remove. The switcher locates it, builds a mask, '
+            'runs the installed inpainting checkpoint, and returns a PNG at the original dimensions. '
+            'The first edit downloads Grounding DINO and SAM into the persistent model cache.</p>'
+            '<form method="post" action="/image-edit/submit" enctype="multipart/form-data">'
+            f'<input type="hidden" name="token" value="{esc(csrf)}">'
+            '<label>Photo <input type="file" name="image" accept="image/jpeg,image/png,image/webp" required></label>'
+            '<label>Instruction <input type="text" name="prompt" maxlength="1000" '
+            'placeholder="Remove the trash can from the attached image" required></label>'
+            '<button type="submit">Remove object</button></form>'
+            '<p class="note">A Creative studio profile and an installed inpainting checkpoint are required. '
+            'If several matching objects are present, the job stops and asks for a more precise selection.</p>'
+            '<p><a href="/profiles">Task profiles</a></p></section>')
+    return shell("Image editor", body + progress)
+IMAGE_EDIT_VIEWS
+
+cat > "$INSTALL_DIR/gpu_control/image_edit_poll.js" <<'IMAGE_EDIT_POLL'
+(() => {
+  const panel = document.querySelector('[data-edit-job]');
+  if (!panel) return;
+  const id = panel.dataset.editJob;
+  const status = document.getElementById('edit-status');
+  const detail = document.getElementById('edit-detail');
+  const preview = document.getElementById('edit-preview');
+  const download = document.getElementById('edit-download');
+  const poll = async () => {
+    try {
+      const response = await fetch(`/image-edit/status/${encodeURIComponent(id)}`, {cache: 'no-store'});
+      if (!response.ok) throw new Error(`Status request failed (${response.status})`);
+      const job = await response.json();
+      status.textContent = `${job.status}: ${job.stage}`;
+      if (job.status === 'completed') {
+        detail.textContent = `Removed ${job.result?.target || 'selected object'}. The original image size was preserved.`;
+        const url = `/image-edit/result/${encodeURIComponent(id)}`;
+        preview.src = url;
+        preview.hidden = false;
+        download.href = url;
+        download.hidden = false;
+      } else if (job.status === 'failed') {
+        detail.textContent = job.error || 'The edit could not be completed.';
+      } else {
+        setTimeout(poll, 2000);
+      }
+    } catch (error) {
+      status.textContent = error.message;
+      setTimeout(poll, 5000);
+    }
+  };
+  poll();
+})();
+IMAGE_EDIT_POLL
 
 cat > "$INSTALL_DIR/gpu_control/update-engine.sh" <<'ENGINE_UPDATE_SCRIPT'
 #!/bin/sh

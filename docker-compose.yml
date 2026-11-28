@@ -461,13 +461,17 @@ services:
       XDG_CACHE_HOME: /app/data/multimodal/cache
       HOME: /tmp
       HF_HUB_DISABLE_XET: "1"
+      EDIT_MODEL_DIR: /app/data/multimodal/edit-models
+      COMFY_INPUT_DIR: /app/media_input
       PYTHONDONTWRITEBYTECODE: "1"
     volumes:
       - ./gpu_control/multimodal_service.py:/app/multimodal_service.py:ro
       - ./gpu_control/multimodal_jobs.py:/app/multimodal_jobs.py:ro
       - ./gpu_control/multimodal_workers.py:/app/multimodal_workers.py:ro
+      - ./gpu_control/image_edit.py:/app/image_edit.py:ro
       - ./gpu_control/results:/app/data
       - ${AI_MEDIA_DIR:?set AI_MEDIA_DIR in .env}/models:/app/media_models:ro
+      - ${AI_MEDIA_DIR:?set AI_MEDIA_DIR in .env}/input:/app/media_input
     read_only: true
     tmpfs:
       - /tmp:rw,nosuid,size=512m
@@ -510,6 +514,8 @@ services:
       - ./gpu_control/context_tuning.py:/app/context_tuning.py:ro
       - ./gpu_control/media_catalog.py:/app/media_catalog.py:ro
       - ./gpu_control/multimodal_profiles.py:/app/multimodal_profiles.py:ro
+      - ./gpu_control/image_edit_views.py:/app/image_edit_views.py:ro
+      - ./gpu_control/image_edit_poll.js:/app/image_edit_poll.js:ro
       - ./gpu_control/sharing.py:/app/sharing.py:ro
       - ./gpu_control/sharing_views.py:/app/sharing_views.py:ro
       - ./gpu_control/gpu_metrics.py:/app/gpu_metrics.py:ro

@@ -20,7 +20,7 @@ TOKEN = os.environ["MULTIMODAL_INTERNAL_KEY"]
 CONTROLLER = os.environ.get("MULTIMODAL_CONTROLLER", "http://gpu-control:8001")
 ROUTES = {"/v1/documents/parse": "pdf", "/v1/ocr": "ocr",
           "/v1/audio/transcriptions": "transcription", "/v1/audio/speech": "speech",
-          "/v1/images/generations": "image"}
+          "/v1/images/generations": "image", "/v1/images/edits": "image_edit"}
 
 
 def controller(action, ident):
@@ -51,7 +51,11 @@ def worker(kinds):
             elif kind == "speech":
                 result, artifact, mime = workers.speech(job)
                 STORE.complete(job["id"], result, artifact, mime)
-            elif kind == "image":
+            elif kind in ("image", "image_edit"):
+                prepared = None
+                if kind == "image_edit":
+                    STORE.update(job["id"], stage="locating object and building mask")
+                    prepared = workers.prepare_image_edit(job, payload, STORE.update)
                 STORE.update(job["id"], stage="waiting for GPU")
                 controller("acquire", job["id"])
                 leased = True
@@ -65,7 +69,8 @@ def worker(kinds):
                         if time.monotonic() >= ready_by:
                             raise TimeoutError("ComfyUI did not become ready within five minutes")
                         time.sleep(5)
-                result, artifact, mime = workers.image(job, STORE.update)
+                result, artifact, mime = (workers.image_edit(job, prepared, STORE.update)
+                                          if kind == "image_edit" else workers.image(job, STORE.update))
                 STORE.update(job["id"], stage="restoring language model")
                 release = controller("release", job["id"])
                 leased = False
@@ -138,8 +143,17 @@ class Handler(BaseHTTPRequestHandler):
                 request.setdefault("width", 1024)
                 request.setdefault("height", 1024)
                 request.setdefault("steps", 20)
+            if kind == "image_edit":
+                if not profile.get("image"):
+                    raise ValueError("Load a Creative studio profile before editing an image")
+                checkpoints = Path(os.environ.get("COMFY_MODEL_DIR", "/app/media_models")) / "checkpoints"
+                choices = sorted(path.name for path in checkpoints.glob("*inpaint*.safetensors"))
+                request.setdefault("checkpoint", profile.get("image_edit_checkpoint") or (choices[0] if choices else None))
+                if request["checkpoint"] not in choices:
+                    raise ValueError("Install and select an inpainting checkpoint in ComfyUI")
+                request.setdefault("steps", 22)
             data = request.pop("data", None)
-            if kind in {"pdf", "ocr", "transcription"}:
+            if kind in {"pdf", "ocr", "transcription", "image_edit"}:
                 if not isinstance(data, str):
                     raise ValueError("Base64 data field is required")
                 payload = base64.b64decode(data, validate=True)

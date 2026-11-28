@@ -53,13 +53,14 @@ def shell(title, body, refresh=False, wide=False, monitor_url=None):
                    "Find models sized for the hardware in this system." if title == "Hugging Face model recommendations" else
                    "The switcher could not complete this request." if title == "Request failed" else
                    "Configure task workers and review queued jobs for this system." if title == "Multimodal profiles" else
+                   "Remove named objects from photos with a queued inpainting workflow." if title == "Image editor" else
                    "Compare coding agents and connect them to your local API." if title == "Coding harnesses" else
                    "Inspect this model's recorded runs and system details.")
     display_title = "Find models" if title == "Hugging Face model recommendations" else title
     return (f'<!doctype html><html lang="en"><meta charset="utf-8">'
             f'<meta name="viewport" content="width=device-width,initial-scale=1">'
             f'<title>{esc(title)}</title><style>{STYLE}</style><body{body_class}><main><nav aria-label="Main navigation"><a href="/">AI Model Switcher</a>'
-            f'<a href="/benchmarks">Benchmarks</a><a href="/models">Find models</a><a href="/profiles">Task profiles</a><a href="/sharing">Client sharing</a><a href="/harnesses">Coding harnesses</a></nav>'
+            f'<a href="/benchmarks">Benchmarks</a><a href="/models">Find models</a><a href="/profiles">Task profiles</a><a href="/image-edit">Image editor</a><a href="/sharing">Client sharing</a><a href="/harnesses">Coding harnesses</a></nav>'
             f'<header class="hero"><div class="hero-copy"><div class="eyebrow">Local AI / Control desk</div><h1>{esc(display_title)}</h1><p>{description}</p></div></header>{monitor}{body}</main></body></html>')
 
 

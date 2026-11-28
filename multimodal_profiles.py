@@ -27,6 +27,7 @@ def recommend(hardware, modes, media_ready, worker_enabled, checkpoints=(), curr
     chosen = current if current in modes else next((mode for mode in preferred if mode in modes), next(iter(sorted(modes)), None))
     if chosen is None:
         return []
+    edit_choices = [name for name in checkpoints if "inpaint" in name.lower()]
     rows = []
     for ident, label, use, asr in RECIPES:
         rows.append({"id": ident, "name": label, "use": use, "text_mode": chosen,
@@ -35,6 +36,8 @@ def recommend(hardware, modes, media_ready, worker_enabled, checkpoints=(), curr
                      "pdf": worker_enabled, "ocr": worker_enabled, "audio": worker_enabled,
                      "image": bool(worker_enabled and media_ready and ident == "creative"),
                      "image_checkpoint": checkpoints[0] if checkpoints and ident == "creative" else None,
+                     "image_edit_checkpoint": edit_choices[0] if edit_choices and ident == "creative" else None,
+                     "image_edit_checkpoints": edit_choices if ident == "creative" else [],
                      "checkpoints": list(checkpoints) if ident == "creative" else [],
                      "available": bool(worker_enabled and (ident != "creative" or media_ready)),
                      "reason": ("Ready to configure" if worker_enabled and (ident != "creative" or media_ready) else
@@ -64,16 +67,20 @@ def page(rows, active, hardware, csrf, jobs=()):
         checkpoint_choice = (f'<label>Image checkpoint <select name="checkpoint">'
                              + "".join(f'<option value="{esc(name)}">{esc(name)}</option>' for name in row["checkpoints"])
                              + '</select></label>' if row["image"] else "")
+        edit_checkpoint_choice = (f'<label>Inpainting checkpoint <select name="edit_checkpoint">'
+                                  + "".join(f'<option value="{esc(name)}">{esc(name)}</option>' for name in row["image_edit_checkpoints"])
+                                  + '</select></label>' if row["image"] and row["image_edit_checkpoints"] else "")
         text_choice = (f'<label>Language model <select name="text_mode">' +
                        "".join(f'<option value="{esc(mode)}"{" selected" if mode == row["text_mode"] else ""}>'
                                f'{esc(mode)}</option>' for mode in row["text_modes"]) + '</select></label>')
         button = (f'<form method="post" action="/profiles/apply"><input type="hidden" name="token" value="{esc(csrf)}">'
-                  f'<input type="hidden" name="profile" value="{esc(row["id"])}">{text_choice}{checkpoint_choice}<button type="submit"'
+                  f'<input type="hidden" name="profile" value="{esc(row["id"])}">{text_choice}{checkpoint_choice}{edit_checkpoint_choice}<button type="submit"'
                   f'{"" if row["available"] else " disabled"}>Load profile</button></form>')
         cards.append(f'<section class="card"><div class="eyebrow">{esc(state)}</div><h2>{esc(row["name"])}</h2>'
                      f'<p>{esc(row["use"])}</p><p>Language model: {esc(row["text_mode"])} via '
                      '<code>local-llm-api</code>. PDF/OCR and audio run as queued CPU work. '
                      f'Image generation: {"queued on ComfyUI" if row["image"] else "not configured"}. '
+                     f'Object removal: {"available" if row["image_edit_checkpoint"] else "install an inpainting checkpoint"}. '
                      f'ASR size: {esc(row["asr_model"])}.</p><p>{esc(row["reason"])}</p>{button}</section>')
     current = (f'Active profile: {esc(active["name"])}; language model: {esc(active["text_mode"])}.'
                if active else 'No multimodal profile is active.')
@@ -83,7 +90,7 @@ def page(rows, active, hardware, csrf, jobs=()):
             'they do not download a language or image model.</p><p>Clients continue using the same '
             'OpenAI compatible base URL and <code>local-llm-api</code> for text. '
             'Document, audio, and image tasks use dedicated paths at that base URL.</p>'
-            '<p><a href="/">Back to switcher</a></p></section>')
+            '<p><a href="/image-edit">Open image editor</a> · <a href="/">Back to switcher</a></p></section>')
     queue = ('<section class="card"><h2>Recent task jobs</h2><p>Jobs stay in the durable queue across worker restarts. '
              'Use the authenticated API job URL to retrieve each result.</p><table><thead><tr><th>Started UTC</th>'
              '<th>Task</th><th>Status</th><th>Stage</th></tr></thead><tbody>' +

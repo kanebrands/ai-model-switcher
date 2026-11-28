@@ -3,6 +3,9 @@
 import html
 import http.client
 import datetime as dt
+from email.parser import BytesParser
+from email.policy import default as email_policy
+import base64
 import json
 import os
 from pathlib import Path
@@ -12,6 +15,7 @@ import sqlite3
 import threading
 import urllib.parse
 import urllib.request
+import urllib.error
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from benchmarks import BenchmarkManager, MODELS
@@ -29,6 +33,7 @@ import sharing_views
 import model_views
 import harness_views
 import multimodal_profiles
+import image_edit_views
 
 PROFILE_PATH = "/app/data/multimodal/active_profile.json"
 
@@ -44,6 +49,25 @@ def profile_recommendations():
                                          os.environ.get("AI_MULTIMODAL_ENABLED") == "1", checkpoints,
                                          active_mode())
     return hardware, rows
+
+
+def image_edit_job(ident):
+    try:
+        if uuid.UUID(ident).version != 4:
+            return None
+    except (ValueError, TypeError):
+        return None
+    path = Path("/app/data/multimodal/jobs.sqlite3")
+    if not path.is_file():
+        return None
+    db = sqlite3.connect(path)
+    try:
+        db.row_factory = sqlite3.Row
+        row = db.execute("SELECT * FROM jobs WHERE id=? AND owner='switcher-admin' AND kind='image_edit'",
+                         (ident,)).fetchone()
+    finally:
+        db.close()
+    return dict(row) if row else None
 
 
 def usage_window(query, prefix=""):
@@ -484,7 +508,7 @@ class Handler(BaseHTTPRequestHandler):
         home_style += ".api-connection{display:grid;grid-template-columns:minmax(0,12rem) minmax(0,1fr);gap:1rem;align-items:start}.api-connection label{min-width:0;margin:0}.api-connection input[type=text]{width:100%;max-width:none}.api-port{display:block;color:#e8ba78;font-size:.78rem;font-weight:700}@media(max-width:680px){.api-connection{grid-template-columns:1fr}}"
         page = f"""<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>AI Model Switcher</title><style>{benchmark_views.STYLE}{home_style}{sharing_views.USAGE_STYLE}</style>
-<main><nav aria-label="Main navigation"><a href="/">AI Model Switcher</a><a href="/models">Find models</a><a href="/benchmarks">Benchmarks</a><a href="/profiles">Task profiles</a><a href="/sharing">Client sharing</a><a href="/harnesses">Coding harnesses</a></nav>
+<main><nav aria-label="Main navigation"><a href="/">AI Model Switcher</a><a href="/models">Find models</a><a href="/benchmarks">Benchmarks</a><a href="/profiles">Task profiles</a><a href="/image-edit">Image editor</a><a href="/sharing">Client sharing</a><a href="/harnesses">Coding harnesses</a></nav>
 <header class="hero"><div class="hero-copy"><div class="eyebrow">Local AI / Control desk</div><h1>AI Model Switcher</h1><p>Manage local workloads and model context from one place.</p><div class="active-line"><span class="active-caption">Active workload</span><span class="active-badge {'is-ready' if snapshot['state'] == 'ready' else 'is-failed' if snapshot['state'] == 'failed' else ''}" data-workload-badge>{h(badge_label)}</span><strong data-workload-label>{h(mode)}</strong></div><p class="active-detail" role="status" data-workload-detail>{h(snapshot['detail'])}</p><div class="api-connection"><label>Stable API model ID<input type="text" readonly value="local-llm-api" data-copy-field aria-label="Copyable stable API model ID"></label><label>OpenAI API base URL<input type="text" class="api-base" readonly value="{h(PUBLIC_API_URL)}" data-copy-field aria-label="Copyable OpenAI API base URL">{api_port_note}</label></div><p class="api-note">Use <code>local-llm-api</code> as the model in your harness to reach the currently loaded language model. Wait for “Ready to use” before sending requests.</p></div></header>
 <script src="/assets/operation_poll.js?v=workload-status-1" defer></script>
 {'<p class="message" role="status" data-operation-monitor="/operations/status?scope=home">Checking operation status…</p>' if context_status['busy'] or webui_status['checking'] or webui_status['busy'] else ''}
@@ -501,7 +525,7 @@ class Handler(BaseHTTPRequestHandler):
 <h2>Service status</h2><div class="services">{status_cards}</div><p><a href="/">Refresh status</a></p>
 {gpu_card}
 <p class="note">If a service fails, check ai-control.sh huihui-logs or media-logs. If Open WebUI still shows local-coder after switching, set its connection URL to http://nginx:8080/v1 in Admin → Settings → Connections.</p>
-<div class="home-footer"><a href="/models">Find models</a><a href="/benchmarks">Benchmarks and results</a><a href="/profiles">Task profiles</a><a href="/sharing">Client sharing and rate limits</a><a href="/harnesses">Coding harnesses</a><a href="{h(WEB_URL)}">Open WebUI</a>{f'<a href="{h(COMFY_URL)}">ComfyUI</a>' if available_builtin('media') else ''}</div></main></html>"""
+<div class="home-footer"><a href="/models">Find models</a><a href="/benchmarks">Benchmarks and results</a><a href="/profiles">Task profiles</a><a href="/image-edit">Image editor</a><a href="/sharing">Client sharing and rate limits</a><a href="/harnesses">Coding harnesses</a><a href="{h(WEB_URL)}">Open WebUI</a>{f'<a href="{h(COMFY_URL)}">ComfyUI</a>' if available_builtin('media') else ''}</div></main></html>"""
         data = page.encode()
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -514,6 +538,42 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = urllib.parse.urlsplit(self.path)
+        if path.path == "/image-edit":
+            job_id = urllib.parse.parse_qs(path.query).get("job", [None])[0]
+            if job_id and not image_edit_job(job_id):
+                self.send_error(404, "Image edit job not found")
+                return
+            self._send_html(image_edit_views.page(CSRF, job_id))
+            return
+        for prefix, binary in (("/image-edit/status/", False), ("/image-edit/result/", True)):
+            if path.path.startswith(prefix):
+                job = image_edit_job(path.path[len(prefix):])
+                if not job:
+                    self.send_error(404, "Image edit job not found")
+                    return
+                if binary:
+                    if job["status"] != "completed" or job["result_name"] != job["id"] + ".result":
+                        self.send_error(404, "Edited image is not ready")
+                        return
+                    data = (Path("/app/data/multimodal/artifacts") / job["result_name"]).read_bytes()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "image/png")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("X-Content-Type-Options", "nosniff")
+                    self.end_headers()
+                    self.wfile.write(data)
+                else:
+                    data = json.dumps({"id": job["id"], "kind": job["kind"], "status": job["status"],
+                                       "stage": job["stage"], "error": job["error"],
+                                       "result": json.loads(job["result_json"]) if job["result_json"] else None}).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
+                    self.wfile.write(data)
+                return
         if path.path == "/profiles":
             try:
                 hardware, rows = profile_recommendations()
@@ -536,6 +596,20 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 with open("/app/operation_poll.js", "rb") as script:
                     data = script.read()
+            except OSError:
+                self.send_error(404)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/javascript; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "public, max-age=3600")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(data)
+            return
+        if path.path == "/assets/image_edit_poll.js":
+            try:
+                data = Path("/app/image_edit_poll.js").read_bytes()
             except OSError:
                 self.send_error(404)
                 return
@@ -819,7 +893,71 @@ class Handler(BaseHTTPRequestHandler):
         WEBUI_UPDATES.check_async()
         self._page()
 
+    def _submit_image_edit(self):
+        if self.headers.get("Origin") != ORIGIN or self.headers.get("Host") != urllib.parse.urlsplit(ORIGIN).netloc:
+            self.send_error(403, "Invalid origin")
+            return
+        content_type = self.headers.get("Content-Type", "")
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            length = 0
+        if not 1 <= length <= 24 * 1024 * 1024 or not content_type.startswith("multipart/form-data;"):
+            self.send_error(413, "Upload a JPEG, PNG, or WebP image up to 16 MiB")
+            return
+        raw = self.rfile.read(length)
+        document = BytesParser(policy=email_policy).parsebytes(
+            b"MIME-Version: 1.0\r\nContent-Type: " + content_type.encode("ascii", "ignore") + b"\r\n\r\n" + raw)
+        if not document.is_multipart():
+            self.send_error(400, "Invalid upload form")
+            return
+        fields = {}
+        for part in document.iter_parts():
+            name = part.get_param("name", header="content-disposition")
+            if name not in ("token", "prompt", "image") or name in fields:
+                self.send_error(400, "Invalid upload form fields")
+                return
+            fields[name] = part.get_payload(decode=True)
+        if fields.get("token") != CSRF.encode():
+            self.send_error(403, "Invalid request")
+            return
+        image_data = fields.get("image", b"")
+        try:
+            prompt = fields.get("prompt", b"").decode("utf-8")
+        except UnicodeDecodeError:
+            self.send_error(400, "Instruction must be UTF-8 text")
+            return
+        if not 1 <= len(image_data) <= 16 * 1024 * 1024 or not 1 <= len(prompt) <= 1000:
+            self.send_error(400, "Choose an image up to 16 MiB and a short instruction")
+            return
+        payload = json.dumps({"data": base64.b64encode(image_data).decode(), "prompt": prompt}).encode()
+        request = urllib.request.Request("http://multimodal:8003/v1/images/edits", data=payload,
+                                         headers={"Content-Type": "application/json",
+                                                  "X-Internal-Token": os.environ["BENCHMARK_API_KEY"],
+                                                  "X-AI-Client-ID": "switcher-admin"})
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                ident = json.load(response)["id"]
+        except urllib.error.HTTPError as exc:
+            try:
+                detail = json.load(exc).get("error", {}).get("message", "Image edit was rejected")
+            except (ValueError, TypeError):
+                detail = "Image edit was rejected"
+            self.send_error(exc.code, detail)
+            return
+        except (OSError, KeyError, ValueError):
+            self.send_error(502, "Image-edit worker is unavailable")
+            return
+        self.send_response(303)
+        self.send_header("Location", "/image-edit?job=" + ident)
+        self.send_header("Content-Length", "0")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+
     def do_POST(self):
+        if self.path == "/image-edit/submit":
+            self._submit_image_edit()
+            return
         if self.path in ("/multimodal/acquire", "/multimodal/release"):
             if self.headers.get("Authorization") != "Bearer " + os.environ["BENCHMARK_API_KEY"]:
                 self.send_error(403)
@@ -886,6 +1024,11 @@ class Handler(BaseHTTPRequestHandler):
                     if len(checkpoint) != 1 or checkpoint[0] not in selected["checkpoints"]:
                         raise ValueError("Select an installed image checkpoint")
                     selected["image_checkpoint"] = checkpoint[0]
+                    if selected["image_edit_checkpoints"]:
+                        edit_checkpoint = fields.get("edit_checkpoint", [])
+                        if len(edit_checkpoint) != 1 or edit_checkpoint[0] not in selected["image_edit_checkpoints"]:
+                            raise ValueError("Select an installed inpainting checkpoint")
+                        selected["image_edit_checkpoint"] = edit_checkpoint[0]
                 previous = active_mode()
                 old_profile = multimodal_profiles.load(PROFILE_PATH)
                 if previous != selected["text_mode"]:

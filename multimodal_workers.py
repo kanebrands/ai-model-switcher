@@ -119,6 +119,11 @@ def image(job, update):
     if not installed.is_file():
         raise ValueError("Checkpoint is not installed in ComfyUI")
     workflow = sdxl_workflow(prompt, checkpoint, width, height, steps)
+    result, data, mime = render_workflow(job, workflow, update)
+    return {**result, "checkpoint": checkpoint}, data, mime
+
+
+def render_workflow(job, workflow, update, output_node="10"):
     reply = comfy_request("/prompt", {"prompt": workflow, "client_id": job["id"]})
     ref = reply.get("prompt_id")
     if not ref:
@@ -131,7 +136,7 @@ def image(job, update):
             if history.get("status", {}).get("status_str") == "error":
                 raise RuntimeError("ComfyUI workflow failed")
             outputs = history.get("outputs", {})
-            images = outputs.get("10", {}).get("images", [])
+            images = outputs.get(output_node, {}).get("images", [])
             if images:
                 item = images[0]
                 from urllib.parse import urlencode
@@ -141,6 +146,16 @@ def image(job, update):
                     data = response.read(32 * 1024 * 1024 + 1)
                     if len(data) > 32 * 1024 * 1024:
                         raise ValueError("ComfyUI result exceeds 32 MiB")
-                    return {"prompt_id": ref, "checkpoint": checkpoint}, data, response.headers.get_content_type()
+                    return {"prompt_id": ref}, data, response.headers.get_content_type()
         time.sleep(3)
     raise TimeoutError("ComfyUI image job timed out")
+
+
+def prepare_image_edit(job, payload, update):
+    from image_edit import prepare
+    return prepare(job, payload, update)
+
+
+def image_edit(job, prepared, update):
+    from image_edit import render
+    return render(job, prepared, update, render_workflow)
