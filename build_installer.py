@@ -99,6 +99,7 @@ for target, marker, file in (
     ("gpu_control/multimodal_service.py", "MULTIMODAL_SERVICE", "multimodal_service.py"),
     ("gpu_control/multimodal_profiles.py", "MULTIMODAL_PROFILES", "multimodal_profiles.py"),
     ("gpu_control/image_edit.py", "IMAGE_EDIT_WORKER", "image_edit.py"),
+    ("gpu_control/comfy_private_nodes.py", "COMFY_PRIVATE_NODES", "comfy_private_nodes.py"),
     ("gpu_control/image_edit_views.py", "IMAGE_EDIT_VIEWS", "image_edit_views.py"),
     ("gpu_control/image_edit_poll.js", "IMAGE_EDIT_POLL", "image_edit_poll.js"),
 ):
@@ -127,7 +128,7 @@ fi
 if [[ -d "$INSTALL_DIR/gpu_control/assets" && ! -w "$INSTALL_DIR/gpu_control/assets" ]]; then
   sudo chown "$(id -u):$(id -g)" "$INSTALL_DIR/gpu_control/assets"
 fi
-for generated in docker-compose.yml multimodal/Dockerfile gpu_control/server.py gpu_control/benchmarks.py gpu_control/benchmark_views.py gpu_control/operation_poll.js gpu_control/harness_views.py gpu_control/model_catalog.py gpu_control/model_artifacts.py gpu_control/hybrid_memory.py gpu_control/model_views.py gpu_control/catalog_discovery.py gpu_control/engine_updates.py gpu_control/webui_updates.py gpu_control/sharing.py gpu_control/sharing_views.py gpu_control/fairness_gateway.py gpu_control/gpu_metrics.py gpu_control/parallel_tuning.py gpu_control/install_profile.py gpu_control/install_models.sh gpu_control/context_tuning.py gpu_control/update-engine.sh gpu_control/update-webui.sh gpu_control/tune-parallel.sh gpu_control/tune-context.sh gpu_control/media_catalog.py gpu_control/multimodal_jobs.py gpu_control/multimodal_workers.py gpu_control/multimodal_service.py gpu_control/multimodal_profiles.py gpu_control/image_edit.py gpu_control/image_edit_views.py gpu_control/image_edit_poll.js gpu_control/assets/gpu-workstation.webp ai-control.sh start-selected.sh; do
+for generated in docker-compose.yml multimodal/Dockerfile gpu_control/server.py gpu_control/benchmarks.py gpu_control/benchmark_views.py gpu_control/operation_poll.js gpu_control/harness_views.py gpu_control/model_catalog.py gpu_control/model_artifacts.py gpu_control/hybrid_memory.py gpu_control/model_views.py gpu_control/catalog_discovery.py gpu_control/engine_updates.py gpu_control/webui_updates.py gpu_control/sharing.py gpu_control/sharing_views.py gpu_control/fairness_gateway.py gpu_control/gpu_metrics.py gpu_control/parallel_tuning.py gpu_control/install_profile.py gpu_control/install_models.sh gpu_control/context_tuning.py gpu_control/update-engine.sh gpu_control/update-webui.sh gpu_control/tune-parallel.sh gpu_control/tune-context.sh gpu_control/media_catalog.py gpu_control/multimodal_jobs.py gpu_control/multimodal_workers.py gpu_control/multimodal_service.py gpu_control/multimodal_profiles.py gpu_control/image_edit.py gpu_control/comfy_private_nodes.py gpu_control/image_edit_views.py gpu_control/image_edit_poll.js gpu_control/assets/gpu-workstation.webp ai-control.sh start-selected.sh; do
   if [[ -e "$INSTALL_DIR/$generated" && ! -w "$INSTALL_DIR/$generated" ]]; then
     sudo chown "$(id -u):$(id -g)" "$INSTALL_DIR/$generated"
   fi

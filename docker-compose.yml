@@ -388,6 +388,7 @@ services:
       - ${AI_MEDIA_DIR:?set AI_MEDIA_DIR in .env}/output:/opt/ComfyUI/output
       - ${AI_MEDIA_DIR:?set AI_MEDIA_DIR in .env}/user:/opt/ComfyUI/user
       - ${AI_MEDIA_DIR:?set AI_MEDIA_DIR in .env}/temp:/opt/ComfyUI/temp
+      - ./gpu_control/comfy_private_nodes.py:/opt/ComfyUI/custom_nodes/ai_switcher_private.py:ro
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8188/system_stats', timeout=5).close()"]
       interval: 15s

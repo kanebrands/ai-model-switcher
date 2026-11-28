@@ -4,6 +4,8 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import threading
+import time
 import uuid
 
 
@@ -142,3 +144,92 @@ class JobStore:
             rows = db.execute("SELECT id FROM jobs WHERE owner=? ORDER BY rowid DESC LIMIT ?",
                               (owner, min(max(int(limit), 1), 100))).fetchall()
         return [self.get(row["id"], owner) for row in rows]
+
+
+class PrivateJobStore:
+    """Ephemeral jobs: no database rows, upload files, result files, or history list."""
+
+    def __init__(self, ttl_seconds=900, max_jobs=4):
+        self.ttl_seconds = ttl_seconds
+        self.max_jobs = max_jobs
+        self.lock = threading.RLock()
+        self.jobs = {}
+
+    def _purge(self):
+        cutoff = time.monotonic() - self.ttl_seconds
+        for ident, row in list(self.jobs.items()):
+            if row["status"] in ("completed", "failed") and row["finished_mono"] < cutoff:
+                del self.jobs[ident]
+
+    def submit(self, owner, kind, request, payload=b""):
+        if kind not in KINDS or not owner or not isinstance(request, dict) or not isinstance(payload, bytes):
+            raise ValueError("Invalid private job")
+        ident = str(uuid.uuid4())
+        now = utc_now()
+        with self.lock:
+            self._purge()
+            if len(self.jobs) >= self.max_jobs:
+                raise ValueError("Private job capacity reached; retrieve or discard an earlier result")
+            self.jobs[ident] = {"id": ident, "owner": owner, "kind": kind, "status": "queued",
+                                "created_at": now, "updated_at": now, "started_at": None,
+                                "completed_at": None, "attempts": 0, "stage": "waiting",
+                                "request": dict(request), "payload": payload, "result": None,
+                                "artifact_data": None, "result_name": None, "result_type": None,
+                                "error": None, "backend_ref": None, "finished_mono": None}
+            return self.get(ident, owner)
+
+    def get(self, ident, owner=None):
+        with self.lock:
+            self._purge()
+            row = self.jobs.get(ident)
+            if row is None or owner is not None and row["owner"] != owner:
+                return None
+            return dict(row)
+
+    def claim(self, kinds):
+        with self.lock:
+            self._purge()
+            row = next((row for row in self.jobs.values()
+                        if row["status"] == "queued" and row["kind"] in kinds), None)
+            if row is None:
+                return None
+            row.update(status="running", stage="starting", started_at=utc_now(),
+                       updated_at=utc_now(), attempts=row["attempts"] + 1)
+            return dict(row)
+
+    def update(self, ident, **values):
+        allowed = {"stage", "backend_ref", "status", "error"}
+        if not values or set(values) - allowed:
+            raise ValueError("Invalid private job update")
+        with self.lock:
+            row = self.jobs.get(ident)
+            if row is not None:
+                row.update(values, updated_at=utc_now())
+
+    def complete(self, ident, result=None, artifact=None, content_type=None):
+        with self.lock:
+            row = self.jobs[ident]
+            row.update(status="completed", stage="ready", completed_at=utc_now(),
+                       updated_at=utc_now(), request={}, payload=b"", result=result,
+                       artifact_data=artifact, result_name=ident + ".result" if artifact is not None else None,
+                       result_type=content_type, finished_mono=time.monotonic())
+
+    def fail(self, ident, reason):
+        with self.lock:
+            row = self.jobs[ident]
+            row.update(status="failed", stage="failed", completed_at=utc_now(), updated_at=utc_now(),
+                       request={}, payload=b"", error=str(reason)[:500], finished_mono=time.monotonic())
+
+    def input(self, job):
+        return job["payload"]
+
+    def artifact(self, job):
+        return job["artifact_data"]
+
+    def delete(self, ident, owner):
+        with self.lock:
+            row = self.jobs.get(ident)
+            if row is None or row["owner"] != owner or row["status"] not in ("completed", "failed"):
+                return False
+            del self.jobs[ident]
+            return True

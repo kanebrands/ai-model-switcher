@@ -6,7 +6,7 @@ from unittest.mock import patch
 import os
 
 from multimodal_jobs import JobStore, CPU_KINDS, GPU_KINDS
-from multimodal_profiles import recommend, save, load
+from multimodal_profiles import recommend, save, load, load_library, save_library, profile_rows, text_fit
 from multimodal_workers import wan21_workflow, video, render_workflow
 with patch.dict(os.environ, {"BENCHMARK_API_KEY": "multimodal-test-key"}):
     from fairness_gateway import is_media_route
@@ -58,6 +58,30 @@ class MultimodalTests(unittest.TestCase):
             target = Path(folder) / "active.json"
             save(target, creative)
             self.assertEqual(load(target)["id"], "creative")
+
+    def test_profile_library_keeps_task_specific_model_choices(self):
+        rows = recommend({"ram_gib": 128, "vram_mib": 24576}, ["cpu-4b", "hf-coder"],
+                         True, True, ["studio-xl.safetensors", "private-inpaint.safetensors"],
+                         "cpu-4b", ["wan21-1b"])
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "profiles.json"
+            library = load_library(path)
+            library["saved"]["creative"] = {"text_mode": "hf-coder", "image_checkpoint": "studio-xl.safetensors",
+                                              "image_edit_checkpoint": "private-inpaint.safetensors",
+                                              "prefer_ablit": True}
+            library["custom"]["custom-test"] = {"base": "documents", "name": "Long documents",
+                                                  "selection": {"text_mode": "hf-coder", "asr_model": "small"}}
+            save_library(path, library)
+            selected = profile_rows(rows, load_library(path))
+            creative = next(row for row in selected if row["id"] == "creative")
+            custom = next(row for row in selected if row["id"] == "custom-test")
+            self.assertEqual(creative["image_edit_checkpoint"], "private-inpaint.safetensors")
+            self.assertTrue(creative["prefer_ablit"])
+            self.assertEqual(custom["asr_model"], "small")
+            self.assertEqual(custom["base"], "documents")
+        self.assertGreater(text_fit({"name": "coder abliterated", "features": "coding",
+                                     "ablit": True, "context_tokens": 65536}, "code", True),
+                           text_fit({"name": "general", "features": "chat"}, "code", True))
 
     def test_gateway_only_routes_known_task_paths(self):
         self.assertTrue(is_media_route("/v1/documents/parse", "POST"))

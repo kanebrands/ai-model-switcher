@@ -30,7 +30,8 @@ MEDIA_POST_ROUTES = {"/v1/documents/parse", "/v1/ocr", "/v1/audio/transcriptions
 def is_media_route(path, method):
     route = path.split("?", 1)[0]
     return (method == "POST" and route in MEDIA_POST_ROUTES or
-            method == "GET" and (route == "/v1/jobs" or route.startswith("/v1/jobs/")))
+            method == "GET" and (route == "/v1/jobs" or route.startswith("/v1/jobs/")) or
+            method == "DELETE" and route.startswith("/v1/jobs/"))
 
 
 def resolve_model_alias(raw, content_type, model_id):
@@ -229,6 +230,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
         self.forward()
 
     def do_POST(self):
+        self.forward()
+
+    def do_DELETE(self):
         self.forward()
 
     def do_HEAD(self):

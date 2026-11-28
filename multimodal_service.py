@@ -10,12 +10,13 @@ import urllib.request
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from multimodal_jobs import JobStore, CPU_KINDS, GPU_KINDS
+from multimodal_jobs import JobStore, PrivateJobStore, CPU_KINDS, GPU_KINDS
 import multimodal_workers as workers
 
 
 ROOT = os.environ.get("MULTIMODAL_DATA", "/app/data/multimodal")
 STORE = JobStore(ROOT + "/jobs.sqlite3", ROOT + "/artifacts")
+PRIVATE_STORE = PrivateJobStore()
 TOKEN = os.environ["MULTIMODAL_INTERNAL_KEY"]
 CONTROLLER = os.environ.get("MULTIMODAL_CONTROLLER", "http://gpu-control:8001")
 ROUTES = {"/v1/documents/parse": "pdf", "/v1/ocr": "ocr",
@@ -35,32 +36,34 @@ def controller(action, ident):
 
 def worker(kinds):
     while True:
-        job = STORE.claim(kinds)
+        private_job = PRIVATE_STORE.claim(kinds)
+        store = PRIVATE_STORE if private_job else STORE
+        job = private_job or STORE.claim(kinds)
         if job is None:
             time.sleep(1)
             continue
         leased = False
         try:
-            payload = STORE.input(job)
+            payload = store.input(job)
             kind = job["kind"]
             if kind == "pdf":
-                STORE.complete(job["id"], workers.pdf(job, payload))
+                store.complete(job["id"], workers.pdf(job, payload))
             elif kind == "ocr":
-                STORE.complete(job["id"], workers.ocr(job, payload))
+                store.complete(job["id"], workers.ocr(job, payload))
             elif kind == "transcription":
-                STORE.complete(job["id"], workers.transcription(job, payload))
+                store.complete(job["id"], workers.transcription(job, payload))
             elif kind == "speech":
                 result, artifact, mime = workers.speech(job)
-                STORE.complete(job["id"], result, artifact, mime)
+                store.complete(job["id"], result, artifact, mime)
             elif kind in ("image", "image_edit", "video"):
                 prepared = None
                 if kind == "image_edit":
-                    STORE.update(job["id"], stage="locating object and building mask")
-                    prepared = workers.prepare_image_edit(job, payload, STORE.update)
-                STORE.update(job["id"], stage="waiting for GPU")
+                    store.update(job["id"], stage="locating object and building mask")
+                    prepared = workers.prepare_image_edit(job, payload, store.update)
+                store.update(job["id"], stage="waiting for GPU")
                 controller("acquire", job["id"])
                 leased = True
-                STORE.update(job["id"], stage="loading ComfyUI")
+                store.update(job["id"], stage="loading ComfyUI")
                 ready_by = time.monotonic() + 300
                 while True:
                     try:
@@ -70,10 +73,10 @@ def worker(kinds):
                         if time.monotonic() >= ready_by:
                             raise TimeoutError("ComfyUI did not become ready within five minutes")
                         time.sleep(5)
-                result, artifact, mime = (workers.image_edit(job, prepared, STORE.update)
-                                          if kind == "image_edit" else workers.video(job, STORE.update)
-                                          if kind == "video" else workers.image(job, STORE.update))
-                STORE.update(job["id"], stage="restoring language model")
+                result, artifact, mime = (workers.image_edit(job, prepared, store.update)
+                                          if kind == "image_edit" else workers.video(job, store.update)
+                                          if kind == "video" else workers.image(job, store.update))
+                store.update(job["id"], stage="restoring language model")
                 release = controller("release", job["id"])
                 leased = False
                 restored = release.get("restored")
@@ -87,15 +90,15 @@ def worker(kinds):
                         if time.monotonic() >= ready_by:
                             raise TimeoutError("Previous language model did not become ready within five minutes")
                         time.sleep(5)
-                STORE.complete(job["id"], result, artifact, mime)
+                store.complete(job["id"], result, artifact, mime)
         except Exception as exc:
-            STORE.fail(job["id"], str(exc))
+            store.fail(job["id"], str(exc))
         finally:
             if leased:
                 try:
                     controller("release", job["id"])
                 except Exception as exc:
-                    STORE.update(job["id"], stage="completed; previous model restore failed: " + str(exc)[:160])
+                    store.update(job["id"], stage="completed; previous model restore failed: " + str(exc)[:160])
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -134,12 +137,17 @@ class Handler(BaseHTTPRequestHandler):
             request = json.loads(self.rfile.read(int(length)))
             if not isinstance(request, dict):
                 raise ValueError("JSON object required")
+            private = request.pop("private", False)
+            if type(private) is not bool:
+                raise ValueError("private must be true or false")
+            if private:
+                request["_private"] = True
             profile_path = Path(ROOT) / "active_profile.json"
             profile = json.loads(profile_path.read_text()) if profile_path.is_file() else {}
             if kind == "transcription":
                 request.setdefault("model", profile.get("asr_model", "tiny"))
             if kind == "image":
-                if not profile.get("image"):
+                if not profile.get("image_checkpoint"):
                     raise ValueError("Load a Creative studio profile before requesting an image")
                 request.setdefault("checkpoint", profile.get("image_checkpoint"))
                 request.setdefault("width", 1024)
@@ -178,11 +186,11 @@ class Handler(BaseHTTPRequestHandler):
                 payload = b""
                 if data is not None:
                     raise ValueError("This task does not accept uploaded data")
-            job = STORE.submit(owner, kind, request, payload)
+            job = (PRIVATE_STORE if private else STORE).submit(owner, kind, request, payload)
         except (ValueError, binascii.Error, UnicodeDecodeError) as exc:
             self.reply(400, {"error": {"message": str(exc)}})
             return
-        self.reply(202, {"id": job["id"], "status": "queued", "kind": kind,
+        self.reply(202, {"id": job["id"], "status": "queued", "kind": kind, "private": private,
                          "status_url": "/v1/jobs/" + job["id"]})
 
     def do_GET(self):
@@ -198,7 +206,7 @@ class Handler(BaseHTTPRequestHandler):
             self.reply(404, {"error": {"message": "Unknown task route"}})
             return
         try:
-            job = STORE.get(parts[2], owner)
+            job = PRIVATE_STORE.get(parts[2], owner) or STORE.get(parts[2], owner)
         except ValueError:
             job = None
         if job is None:
@@ -210,7 +218,7 @@ class Handler(BaseHTTPRequestHandler):
         if parts[3] != "result" or job["status"] != "completed" or not job["result_name"]:
             self.reply(404, {"error": {"message": "Result not available"}})
             return
-        data = STORE.artifact(job)
+        data = (PRIVATE_STORE if "artifact_data" in job else STORE).artifact(job)
         self.send_response(200)
         self.send_header("Content-Type", job["result_type"] or "application/octet-stream")
         self.send_header("Content-Length", str(len(data)))
@@ -218,6 +226,16 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         self.wfile.write(data)
+
+    def do_DELETE(self):
+        owner = self.identity()
+        if owner is None:
+            return
+        parts = self.path.strip("/").split("/")
+        if len(parts) != 3 or parts[:2] != ["v1", "jobs"] or not PRIVATE_STORE.delete(parts[2], owner):
+            self.reply(404, {"error": {"message": "Private job not found or still running"}})
+            return
+        self.reply(200, {"deleted": True})
 
     @staticmethod
     def public(job):

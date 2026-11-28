@@ -1,5 +1,6 @@
 """Bounded document, audio, and ComfyUI work for the persistent job service."""
 import io
+import base64
 import json
 import os
 from pathlib import Path
@@ -119,13 +120,18 @@ def image(job, update):
     if not installed.is_file():
         raise ValueError("Checkpoint is not installed in ComfyUI")
     workflow = sdxl_workflow(prompt, checkpoint, width, height, steps)
-    result, data, mime = render_workflow(job, workflow, update)
+    private = bool(request.get("_private"))
+    if private:
+        workflow["10"] = {"class_type": "AISwitcherPrivateImageResult", "inputs": {"images": ["9", 0]}}
+    result, data, mime = render_workflow(job, workflow, update,
+                                         private_key="private_images" if private else None)
     return {**result, "checkpoint": checkpoint}, data, mime
 
 
-def wan21_workflow(prompt, width, height, frames, fps, steps):
+def wan21_workflow(prompt, width, height, frames, fps, steps,
+                   model_name="wan2.1_t2v_1.3B_fp16.safetensors"):
     return {
-        "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "wan2.1_t2v_1.3B_fp16.safetensors", "weight_dtype": "default"}},
+        "1": {"class_type": "UNETLoader", "inputs": {"unet_name": model_name, "weight_dtype": "default"}},
         "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": "umt5_xxl_fp8_e4m3fn_scaled.safetensors", "type": "wan", "device": "default"}},
         "3": {"class_type": "VAELoader", "inputs": {"vae_name": "wan_2.1_vae.safetensors"}},
         "4": {"class_type": "CLIPTextEncode", "inputs": {"text": prompt, "clip": ["2", 0]}},
@@ -146,8 +152,12 @@ def video(job, update):
     prompt = request.get("prompt")
     if not isinstance(prompt, str) or not 1 <= len(prompt) <= 4000:
         raise ValueError("Video prompt must have 1–4000 characters")
-    if request.get("model") != "wan21-1b":
-        raise ValueError("This video route supports the Wan 2.1 T2V 1.3B bundle")
+    model_name = request.get("model")
+    if model_name == "wan21-1b":
+        model_name = "wan2.1_t2v_1.3B_fp16.safetensors"
+    if (not isinstance(model_name, str) or Path(model_name).name != model_name or
+            not model_name.lower().startswith("wan2.1_t2v_") or not model_name.endswith(".safetensors")):
+        raise ValueError("Choose an installed Wan 2.1 text-to-video model")
     width, height, frames, fps, steps = (request.get(key) for key in
                                         ("width", "height", "frames", "fps", "steps"))
     if (any(type(value) is not int for value in (width, height, frames, fps, steps)) or
@@ -156,48 +166,70 @@ def video(job, update):
             not 1 <= steps <= 50):
         raise ValueError("Choose 512x512 or 832x480, 17/33/49/81 frames, 8/16/24 fps, and 1–50 steps")
     model_dir = Path(os.environ.get("COMFY_MODEL_DIR", "/app/media_models"))
-    files = ("diffusion_models/wan2.1_t2v_1.3B_fp16.safetensors",
+    files = ("diffusion_models/" + model_name,
              "text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors", "vae/wan_2.1_vae.safetensors")
     if not all((model_dir / name).is_file() for name in files):
         raise ValueError("Install the complete Wan 2.1 T2V 1.3B bundle in ComfyUI")
-    result, data, mime = render_workflow(job, wan21_workflow(prompt, width, height, frames, fps, steps),
-                                         update, output_extension=".webm", timeout=3600, size_limit=128 * 1024 * 1024)
-    return {**result, "model": "wan21-1b", "frames": frames, "fps": fps,
+    workflow = wan21_workflow(prompt, width, height, frames, fps, steps, model_name)
+    private = bool(request.get("_private"))
+    if private:
+        workflow["10"] = {"class_type": "AISwitcherPrivateVideoResult",
+                          "inputs": {"images": ["9", 0], "fps": fps}}
+    result, data, mime = render_workflow(job, workflow, update, output_extension=".webm",
+                                         timeout=3600, size_limit=128 * 1024 * 1024,
+                                         private_key="private_videos" if private else None)
+    return {**result, "model": model_name, "frames": frames, "fps": fps,
             "width": width, "height": height}, data, mime
 
 
 def render_workflow(job, workflow, update, output_node="10", output_extension=None,
-                    timeout=900, size_limit=32 * 1024 * 1024):
+                    timeout=900, size_limit=32 * 1024 * 1024, private_key=None):
     reply = comfy_request("/prompt", {"prompt": workflow, "client_id": job["id"]})
     ref = reply.get("prompt_id")
     if not ref:
         raise RuntimeError("ComfyUI rejected the workflow")
     update(job["id"], backend_ref=ref, stage="rendering in ComfyUI")
     deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        history = comfy_request("/history/" + ref).get(ref)
-        if history:
-            if history.get("status", {}).get("status_str") == "error":
-                raise RuntimeError("ComfyUI workflow failed")
-            outputs = history.get("outputs", {})
-            entries = outputs.get(output_node, {})
-            candidates = [item for value in entries.values() if isinstance(value, list)
-                          for item in value if isinstance(item, dict) and "filename" in item]
-            matches = [item for item in candidates if
-                       output_extension is None or item["filename"].lower().endswith(output_extension)]
-            if matches:
-                item = matches[0]
-                from urllib.parse import urlencode
-                url = os.environ.get("COMFY_INTERNAL_URL", "http://comfyui:8188") + "/view?" + urlencode({
-                    "filename": item["filename"], "subfolder": item.get("subfolder", ""), "type": item.get("type", "output")})
-                with urllib.request.urlopen(url, timeout=60) as response:
-                    data = response.read(size_limit + 1)
+    try:
+        while time.monotonic() < deadline:
+            history = comfy_request("/history/" + ref).get(ref)
+            if history:
+                if history.get("status", {}).get("status_str") == "error":
+                    raise RuntimeError("ComfyUI workflow failed")
+                outputs = history.get("outputs", {})
+                entries = outputs.get(output_node, {})
+                if private_key and entries.get(private_key):
+                    data = base64.b64decode(entries[private_key][0], validate=True)
                     if len(data) > size_limit:
-                        raise ValueError("ComfyUI result exceeds the job size limit")
-                    mime = "video/webm" if output_extension == ".webm" else response.headers.get_content_type()
-                    return {"prompt_id": ref}, data, mime
-        time.sleep(3)
-    raise TimeoutError("ComfyUI job timed out")
+                        raise ValueError("Private ComfyUI result exceeds the job size limit")
+                    return {"prompt_id": ref}, data, "video/webm" if output_extension == ".webm" else "image/png"
+                candidates = [item for value in entries.values() if isinstance(value, list)
+                              for item in value if isinstance(item, dict) and "filename" in item]
+                matches = [item for item in candidates if
+                           output_extension is None or item["filename"].lower().endswith(output_extension)]
+                if matches and not private_key:
+                    item = matches[0]
+                    from urllib.parse import urlencode
+                    url = os.environ.get("COMFY_INTERNAL_URL", "http://comfyui:8188") + "/view?" + urlencode({
+                        "filename": item["filename"], "subfolder": item.get("subfolder", ""), "type": item.get("type", "output")})
+                    with urllib.request.urlopen(url, timeout=60) as response:
+                        data = response.read(size_limit + 1)
+                        if len(data) > size_limit:
+                            raise ValueError("ComfyUI result exceeds the job size limit")
+                        mime = "video/webm" if output_extension == ".webm" else response.headers.get_content_type()
+                        return {"prompt_id": ref}, data, mime
+            time.sleep(3)
+        raise TimeoutError("ComfyUI job timed out")
+    finally:
+        if private_key:
+            try:
+                request = urllib.request.Request(os.environ.get("COMFY_INTERNAL_URL", "http://comfyui:8188")
+                                                 + "/history", data=json.dumps({"delete": [ref]}).encode(),
+                                                 headers={"Content-Type": "application/json"})
+                with urllib.request.urlopen(request, timeout=10):
+                    pass
+            except Exception:
+                pass
 
 
 def prepare_image_edit(job, payload, update):

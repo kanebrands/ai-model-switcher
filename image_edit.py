@@ -1,5 +1,6 @@
 """Grounded object removal: detect, segment, inpaint, and composite."""
 import gc
+import base64
 from io import BytesIO
 import os
 from pathlib import Path
@@ -164,6 +165,20 @@ def workflow(checkpoint, image_name, mask_name, target, steps):
     }
 
 
+def private_workflow(checkpoint, crop, mask, target, steps):
+    def encoded(image):
+        buffer = BytesIO()
+        image.save(buffer, format="PNG")
+        return base64.b64encode(buffer.getvalue()).decode("ascii")
+    graph = workflow(checkpoint, "", "", target, steps)
+    graph["5"] = {"class_type": "AISwitcherPrivateImageAndMask",
+                  "inputs": {"image_base64": encoded(crop), "mask_base64": encoded(mask)}}
+    del graph["6"]
+    graph["7"]["inputs"]["mask"] = ["5", 1]
+    graph["12"] = {"class_type": "AISwitcherPrivateImageResult", "inputs": {"images": ["11", 0]}}
+    return graph
+
+
 def render(job, prepared, update, render_workflow):
     from PIL import Image, ImageFilter
     request = job["request"]
@@ -178,15 +193,22 @@ def render(job, prepared, update, render_workflow):
         raise ValueError("A compatible inpainting checkpoint is required")
     input_dir = Path(os.environ.get("COMFY_INPUT_DIR", "/app/media_input"))
     crop_box, crop, mask = crop_for_edit(prepared["image"], prepared["mask"])
-    input_name = job["id"] + "-source.png"
-    mask_name = job["id"] + "-mask.png"
-    paths = [input_dir / input_name, input_dir / mask_name]
+    if request.get("_private"):
+        result, raw, mime = render_workflow(job, private_workflow(checkpoint, crop, mask,
+                                                                  prepared["target"], steps), update,
+                                            output_node="12", private_key="private_images")
+        paths = []
+    else:
+        input_name = job["id"] + "-source.png"
+        mask_name = job["id"] + "-mask.png"
+        paths = [input_dir / input_name, input_dir / mask_name]
     try:
-        for picture, path in zip((crop, mask), paths):
-            picture.save(path, format="PNG")
-            path.chmod(0o644)
-        result, raw, mime = render_workflow(job, workflow(checkpoint, input_name, mask_name,
-                                                          prepared["target"], steps), update, output_node="12")
+        if not request.get("_private"):
+            for picture, path in zip((crop, mask), paths):
+                picture.save(path, format="PNG")
+                path.chmod(0o644)
+            result, raw, mime = render_workflow(job, workflow(checkpoint, input_name, mask_name,
+                                                              prepared["target"], steps), update, output_node="12")
         with Image.open(BytesIO(raw)) as generated:
             edited_crop = generated.convert("RGB").resize((crop_box[2] - crop_box[0],
                                                              crop_box[3] - crop_box[1]), Image.Resampling.LANCZOS)

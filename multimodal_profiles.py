@@ -2,6 +2,7 @@
 import html
 import json
 from pathlib import Path
+import uuid
 
 from benchmark_views import shell
 
@@ -9,6 +10,7 @@ from benchmark_views import shell
 RECIPES = (
     ("general", "General assistant", "Chat and document analysis", "base"),
     ("documents", "Document desk", "PDF extraction, OCR, and spoken transcription", "small"),
+    ("code", "Code desk", "Code generation and repository work", "tiny"),
     ("creative", "Creative studio", "Text assistance and queued ComfyUI images", "base"),
     ("video", "Video studio", "Text-to-video clips through ComfyUI", "base"),
     ("audio", "Audio desk", "Speech transcription and speech generation", "small"),
@@ -16,7 +18,7 @@ RECIPES = (
 
 
 def recommend(hardware, modes, media_ready, worker_enabled, checkpoints=(), current=None,
-              video_bundles=()):
+              video_bundles=(), image_checkpoints=None):
     """Rank installed text workloads using detected RAM/VRAM; no model download."""
     vram = (hardware.get("vram_mib") or 0) / 1024
     ram = hardware.get("ram_gib") or 0
@@ -30,30 +32,89 @@ def recommend(hardware, modes, media_ready, worker_enabled, checkpoints=(), curr
     if chosen is None:
         return []
     edit_choices = [name for name in checkpoints if "inpaint" in name.lower()]
-    video_choices = [bundle for bundle in video_bundles if bundle == "wan21-1b"]
+    image_checkpoints = list(image_checkpoints if image_checkpoints is not None else
+                             (name for name in checkpoints if "inpaint" not in name.lower()))
+    video_choices = list(video_bundles)
     rows = []
     for ident, label, use, asr in RECIPES:
         video = bool(worker_enabled and media_ready and video_choices and ident == "video")
-        image = bool(worker_enabled and media_ready and checkpoints and ident == "creative")
+        image = bool(worker_enabled and media_ready and (image_checkpoints or edit_choices)
+                     and ident == "creative")
         available = bool(worker_enabled and (ident not in ("creative", "video") or
                                              (image if ident == "creative" else video)))
         rows.append({"id": ident, "name": label, "use": use, "text_mode": chosen,
                      "text_modes": sorted(modes),
                      "asr_model": asr if ident in ("documents", "audio") else "tiny",
+                     "asr_models": ["tiny", "base", "small"] if ident in ("documents", "audio") else [],
+                     "prefer_ablit": False,
                      "pdf": worker_enabled, "ocr": worker_enabled, "audio": worker_enabled,
                      "image": image, "video": video,
                      "video_model": video_choices[0] if video else None,
                      "video_models": video_choices if ident == "video" else [],
-                     "image_checkpoint": checkpoints[0] if checkpoints and ident == "creative" else None,
+                     "image_checkpoint": image_checkpoints[0] if image_checkpoints and ident == "creative" else None,
                      "image_edit_checkpoint": edit_choices[0] if edit_choices and ident == "creative" else None,
                      "image_edit_checkpoints": edit_choices if ident == "creative" else [],
-                     "checkpoints": list(checkpoints) if ident == "creative" else [],
+                     "checkpoints": list(image_checkpoints) if ident == "creative" else [],
                      "available": available,
                      "reason": ("Ready to configure" if available else
                                 "Enable multimodal workers in the installer" if not worker_enabled else
                                 "Install ComfyUI and an image checkpoint" if ident == "creative" else
                                 "Install ComfyUI and the Wan 2.1 T2V 1.3B bundle from Find models")})
     return rows
+
+
+def load_library(path):
+    target = Path(path)
+    if not target.is_file():
+        return {"saved": {}, "custom": {}}
+    data = json.loads(target.read_text())
+    return {"saved": data.get("saved", {}), "custom": data.get("custom", {})}
+
+
+def save_library(path, library):
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_suffix(".tmp")
+    temporary.write_text(json.dumps(library, sort_keys=True))
+    temporary.replace(target)
+
+
+def profile_rows(rows, library):
+    from copy import deepcopy
+    rows = [deepcopy(row) for row in rows]
+    base = {row["id"]: row for row in rows}
+    for row in rows:
+        row["base"] = row["id"]
+        row["custom"] = False
+        selected = library.get("saved", {}).get(row["id"], {})
+        apply_choices(row, selected)
+    for ident, saved in library.get("custom", {}).items():
+        template = base.get(saved.get("base"))
+        if template is None or not ident.startswith("custom-"):
+            continue
+        row = deepcopy(template)
+        row.update(id=ident, name=saved.get("name", "Custom profile"), custom=True)
+        apply_choices(row, saved.get("selection", {}))
+        rows.append(row)
+    return rows
+
+
+def apply_choices(row, saved):
+    for key, choices in (("text_mode", "text_modes"), ("image_checkpoint", "checkpoints"),
+                         ("image_edit_checkpoint", "image_edit_checkpoints"),
+                         ("video_model", "video_models"), ("asr_model", "asr_models")):
+        if saved.get(key) in row.get(choices, []):
+            row[key] = saved[key]
+    row["prefer_ablit"] = saved.get("prefer_ablit") is True
+
+
+def selected_choices(row):
+    return {key: row[key] for key in ("text_mode", "image_checkpoint", "image_edit_checkpoint",
+                                     "video_model", "asr_model", "prefer_ablit")}
+
+
+def new_custom_id():
+    return "custom-" + uuid.uuid4().hex
 
 
 def save(path, profile):
@@ -69,33 +130,100 @@ def load(path):
     return json.loads(target.read_text()) if target.is_file() else None
 
 
-def page(rows, active, hardware, csrf, jobs=()):
+def text_fit(info, role, prefer_ablit=False):
+    name = (info.get("name") or "").lower()
+    features = (info.get("features") or "").lower()
+    context = int(info.get("context_tokens") or 0)
+    ablit = bool(info.get("ablit"))
+    score = (2 if context >= 32768 and role in ("documents", "code") else 0)
+    score += 3 if role == "code" and ("coder" in name or "coding" in features) else 0
+    score += 2 if role == "documents" and ("document" in features or "reasoning" in features) else 0
+    score += 2 if role in ("creative", "video") and ablit else 0
+    score += 3 if prefer_ablit and ablit else 0
+    score += 1 if role == "audio" and ("4b" in name or "tiny" in name) else 0
+    return score
+
+
+def _comparison(esc, title, choices, details, selected, role, prefer_ablit=False):
+    if not choices:
+        return ""
+    ranked = sorted(choices, key=lambda key: (-text_fit(details.get(key, {}), role, prefer_ablit), key)
+                    if title == "Language models" else (-details.get(key, {}).get("rank", 0), key))
+    rows = []
+    for index, key in enumerate(ranked):
+        info = details.get(key, {})
+        label = info.get("name") or key
+        note = "Suggested · " if index == 0 else ""
+        note += "Selected · " if key == selected else ""
+        rows.append(f'<tr><td><strong>{esc(label)}</strong><br><small>{esc(key)}</small></td>'
+                    f'<td>{esc(note + info.get("description", "Installed model"))}</td>'
+                    f'<td>{esc(info.get("pros", "Installed and selectable"))}</td>'
+                    f'<td>{esc(info.get("cons", "Performance depends on this system"))}</td></tr>')
+    return (f'<details><summary>{esc(title)}: descriptions and tradeoffs</summary>'
+            '<div class="table-wrap"><table><thead><tr><th>Model</th><th>Use</th><th>Pros</th><th>Cons</th>'
+            '</tr></thead><tbody>' + "".join(rows) + '</tbody></table></div></details>')
+
+
+def page(rows, active, hardware, csrf, jobs=(), model_info=None):
     esc = lambda value: html.escape(str(value), quote=True)
+    model_info = model_info or {}
     cards = []
     for row in rows:
         state = "Available" if row["available"] else "Unavailable"
         checkpoint_choice = (f'<label>Image checkpoint <select name="checkpoint">'
-                             + "".join(f'<option value="{esc(name)}">{esc(name)}</option>' for name in row["checkpoints"])
-                             + '</select></label>' if row["image"] else "")
+                             + "".join(f'<option value="{esc(name)}"{" selected" if name == row["image_checkpoint"] else ""}>{esc(name)}</option>'
+                                       for name in row["checkpoints"])
+                             + '</select></label>' if row["checkpoints"] else "")
         edit_checkpoint_choice = (f'<label>Inpainting checkpoint <select name="edit_checkpoint">'
-                                  + "".join(f'<option value="{esc(name)}">{esc(name)}</option>' for name in row["image_edit_checkpoints"])
+                                  + "".join(f'<option value="{esc(name)}"{" selected" if name == row["image_edit_checkpoint"] else ""}>{esc(name)}</option>'
+                                            for name in row["image_edit_checkpoints"])
                                   + '</select></label>' if row["image"] and row["image_edit_checkpoints"] else "")
         video_choice = (f'<label>Video model <select name="video_model">'
-                        + "".join(f'<option value="{esc(name)}">{esc(name)}</option>' for name in row["video_models"])
+                        + "".join(f'<option value="{esc(name)}"{" selected" if name == row["video_model"] else ""}>{esc(name)}</option>'
+                                  for name in row["video_models"])
                         + '</select></label>' if row["video"] else "")
         text_choice = (f'<label>Language model <select name="text_mode">' +
                        "".join(f'<option value="{esc(mode)}"{" selected" if mode == row["text_mode"] else ""}>'
-                               f'{esc(mode)}</option>' for mode in row["text_modes"]) + '</select></label>')
+                               f'{esc(model_info.get("text", {}).get(mode, {}).get("name", mode))}</option>'
+                               for mode in row["text_modes"]) + '</select></label>')
+        asr_choice = (f'<label>Transcription model <select name="asr_model">' +
+                      "".join(f'<option value="{esc(mode)}"{" selected" if mode == row["asr_model"] else ""}>'
+                              f'Whisper {esc(mode)}</option>' for mode in row["asr_models"]) +
+                      '</select></label>') if row["asr_models"] else ""
+        preference = ('<label><input type="checkbox" name="prefer_ablit" value="on"'
+                      + (' checked' if row["prefer_ablit"] else '') +
+                      '> Prefer abliterated or uncensored models in suggestions; this does not change model behavior.</label>')
+        custom_name = '<label>Copy name <input name="copy_name" maxlength="60" placeholder="My workflow"></label>'
+        buttons = ('<button name="action" value="save" type="submit">Save choices</button> '
+                   '<button name="action" value="load" type="submit">Load profile</button> '
+                   '<button name="action" value="copy" type="submit">Save as copy</button>'
+                   + (' <button name="action" value="delete" type="submit">Delete this copy</button>'
+                      if row["custom"] else ''))
         button = (f'<form method="post" action="/profiles/apply"><input type="hidden" name="token" value="{esc(csrf)}">'
-                  f'<input type="hidden" name="profile" value="{esc(row["id"])}">{text_choice}{checkpoint_choice}{edit_checkpoint_choice}{video_choice}<button type="submit"'
-                  f'{"" if row["available"] else " disabled"}>Load profile</button></form>')
+                  f'<input type="hidden" name="profile" value="{esc(row["id"])}">{text_choice}{checkpoint_choice}{edit_checkpoint_choice}{video_choice}{asr_choice}{preference}{custom_name}'
+                  + buttons + '</form>')
+        comparisons = _comparison(esc, "Language models", row["text_modes"], model_info.get("text", {}),
+                                  row["text_mode"], row["base"], row["prefer_ablit"])
+        if row["image"]:
+            comparisons += _comparison(esc, "Image generation", row["checkpoints"],
+                                       model_info.get("image", {}), row["image_checkpoint"], row["base"])
+            comparisons += _comparison(esc, "Image editing", row["image_edit_checkpoints"],
+                                       model_info.get("image_edit", {}), row["image_edit_checkpoint"], row["base"])
+        if row["video"]:
+            comparisons += _comparison(esc, "Video generation", row["video_models"],
+                                       model_info.get("video", {}), row["video_model"], row["base"])
+        if row["asr_models"]:
+            comparisons += _comparison(esc, "Transcription", row["asr_models"],
+                                       model_info.get("asr", {}), row["asr_model"], row["base"])
         cards.append(f'<section class="card"><div class="eyebrow">{esc(state)}</div><h2>{esc(row["name"])}</h2>'
                      f'<p>{esc(row["use"])}</p><p>Language model: {esc(row["text_mode"])} via '
                      '<code>local-llm-api</code>. PDF/OCR and audio run as queued CPU work. '
-                     f'Image generation: {"queued on ComfyUI" if row["image"] else "not configured"}. '
+                     f'Image generation: {"queued on ComfyUI" if row["image_checkpoint"] else "not configured"}. '
                      f'Object removal: {"available" if row["image_edit_checkpoint"] else "install an inpainting checkpoint"}. '
                      f'Video: {esc(row["video_model"] or "not configured")}. '
-                     f'ASR size: {esc(row["asr_model"])}.</p><p>{esc(row["reason"])}</p>{button}</section>')
+                     f'ASR size: {esc(row["asr_model"])}.</p><p>{esc(row["reason"])}</p>{button}'
+                     f'{comparisons}<p><a href="/models">Download or uninstall models</a> · '
+                     '<a href="/benchmarks">Compare benchmarks</a></p></section>')
     current = (f'Active profile: {esc(active["name"])}; language model: {esc(active["text_mode"])}.'
                if active else 'No multimodal profile is active.')
     body = ('<section class="card"><div class="eyebrow">MULTIMODAL PROFILES</div><h1>Task profiles</h1>'

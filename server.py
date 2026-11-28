@@ -36,6 +36,61 @@ import multimodal_profiles
 import image_edit_views
 
 PROFILE_PATH = "/app/data/multimodal/active_profile.json"
+PROFILE_LIBRARY_PATH = "/app/data/multimodal/profile_library.json"
+
+
+def profile_model_info(modes=()):
+    installed = {"hf-" + item["candidate_id"]: item for item in MODEL_MANAGER.installed()}
+    text = {}
+    for mode in modes:
+        item = installed.get(mode)
+        catalog = BY_ID.get(item["candidate_id"], {}) if item else {}
+        name = model_display_name(item) if item else MODELS[mode][0]
+        ablit = bool(catalog.get("ablit") or any(word in name.lower()
+                     for word in ("abliterat", "ablit", "uncensored", "nsfw")))
+        features = catalog.get("features") or "Installed language model; specialization unverified"
+        coder = "coder" in name.lower() or "coding" in features.lower()
+        text[mode] = {"name": name, "features": features,
+                      "description": features + ("; altered alignment" if ablit else ""),
+                      "pros": ("Code-focused option" if coder else "Available for local text tasks") +
+                              ("; fewer prompt refusals may be possible" if ablit else ""),
+                      "cons": ("Alignment changes may affect accuracy and tool use" if ablit else
+                               "Task quality should be checked with local benchmarks"),
+                      "context_tokens": item.get("context_tokens") if item else None,
+                      "ablit": ablit}
+    media = Path("/app/media_models") / "checkpoints"
+    image = {}
+    edit = {}
+    for path in media.glob("*.safetensors"):
+        match = next((bundle for bundle in MEDIA_BY_ID.values() if any(
+            destination == "checkpoints/" + path.name for _, _, destination in bundle["files"])), None)
+        name = match["name"] if match else path.stem
+        if "inpaint" in path.name.lower():
+            edit[path.name] = {"name": name, "description": "Installed mask-based inpainting checkpoint",
+                               "pros": "Can fill a selected object mask",
+                               "cons": "Compatibility and result quality require a test edit",
+                               "rank": 1}
+        else:
+            image[path.name] = {"name": name,
+                                "description": match["use"] if match else "Installed checkpoint; architecture unverified",
+                                "pros": "Installed and selectable; no download required",
+                                "cons": "Built-in generation currently expects SDXL-style checkpoints",
+                                "rank": match.get("priority", 0) if match else 0}
+    video = {}
+    for path in (Path("/app/media_models") / "diffusion_models").glob("wan2.1_t2v_*.safetensors"):
+        known = "1.3b" in path.name.lower()
+        video[path.name] = {"name": path.stem.replace("_", " "),
+                            "description": "Wan 2.1 text-to-video" + ("; custom variant" if not known else ""),
+                            "pros": "Installed and selectable; alternate prompt alignment if provided by its publisher",
+                            "cons": "Short silent clips; custom variants require a trial render",
+                            "rank": 2 if known else 1}
+    asr = {"tiny": {"name": "Whisper tiny", "description": "Speech transcription",
+                     "pros": "Fastest and smallest", "cons": "Lowest expected accuracy of the three", "rank": 1},
+           "base": {"name": "Whisper base", "description": "Speech transcription",
+                     "pros": "Balanced size and accuracy", "cons": "Slower than tiny", "rank": 3},
+           "small": {"name": "Whisper small", "description": "Speech transcription",
+                      "pros": "More capacity for difficult speech", "cons": "Slowest and largest of the three", "rank": 2}}
+    return {"text": text, "image": image, "image_edit": edit, "video": video, "asr": asr}
 
 
 def profile_recommendations():
@@ -43,15 +98,25 @@ def profile_recommendations():
     available = {mode for mode, (_, container) in MODELS.items()
                  if mode != "media" and workload_state(container) != "not created"}
     checkpoints = sorted(path.name for path in (Path("/app/media_models") / "checkpoints").glob("*.safetensors"))
+    image_checkpoints = [name for name in checkpoints if "inpaint" not in name.lower() and
+                         ("xl" in name.lower() or "sdxl" in name.lower())]
     media_ready = (hardware.get("gpu_provider") == "nvidia" and
                    workload_state(MEDIA) != "not created")
-    video_bundle = MEDIA_BY_ID["wan21-1b"]
-    video_bundles = ([video_bundle["id"]] if media_ready and all(
-        (Path("/app/media_models") / destination).is_file()
-        for _, _, destination in video_bundle["files"]) else [])
+    media_models = Path("/app/media_models")
+    video_companions = ("text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+                        "vae/wan_2.1_vae.safetensors")
+    video_bundles = (sorted(path.name for path in (media_models / "diffusion_models").glob(
+        "wan2.1_t2v_*.safetensors")) if media_ready and all(
+            (media_models / name).is_file() for name in video_companions) else [])
     rows = multimodal_profiles.recommend(hardware, available, media_ready,
                                          os.environ.get("AI_MULTIMODAL_ENABLED") == "1", checkpoints,
-                                         active_mode(), video_bundles)
+                                         active_mode(), video_bundles, image_checkpoints)
+    info = profile_model_info(available)
+    for row in rows:
+        if row["text_modes"]:
+            row["text_mode"] = max(row["text_modes"], key=lambda mode:
+                multimodal_profiles.text_fit(info["text"].get(mode, {}), row["id"]))
+    rows = multimodal_profiles.profile_rows(rows, multimodal_profiles.load_library(PROFILE_LIBRARY_PATH))
     return hardware, rows
 
 
@@ -549,6 +614,11 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._send_html(image_edit_views.page(CSRF, job_id))
             return
+        for prefix, suffix in (("/image-edit/private/status/", ""),
+                               ("/image-edit/private/result/", "/result")):
+            if path.path.startswith(prefix):
+                self._private_edit_proxy(path.path[len(prefix):], suffix)
+                return
         for prefix, binary in (("/image-edit/status/", False), ("/image-edit/result/", True)):
             if path.path.startswith(prefix):
                 job = image_edit_job(path.path[len(prefix):])
@@ -594,7 +664,9 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self.send_error(503, "Could not read profile recommendations: " + str(exc))
                 return
-            self._send_html(multimodal_profiles.page(rows, active, hardware, CSRF, jobs))
+            self._send_html(multimodal_profiles.page(rows, active, hardware, CSRF, jobs,
+                                                     profile_model_info({mode for row in rows
+                                                                         for mode in row["text_modes"]})))
             return
         if path.path == "/assets/operation_poll.js":
             try:
@@ -918,7 +990,7 @@ class Handler(BaseHTTPRequestHandler):
         fields = {}
         for part in document.iter_parts():
             name = part.get_param("name", header="content-disposition")
-            if name not in ("token", "prompt", "image") or name in fields:
+            if name not in ("token", "prompt", "image", "private") or name in fields:
                 self.send_error(400, "Invalid upload form fields")
                 return
             fields[name] = part.get_payload(decode=True)
@@ -934,7 +1006,12 @@ class Handler(BaseHTTPRequestHandler):
         if not 1 <= len(image_data) <= 16 * 1024 * 1024 or not 1 <= len(prompt) <= 1000:
             self.send_error(400, "Choose an image up to 16 MiB and a short instruction")
             return
-        payload = json.dumps({"data": base64.b64encode(image_data).decode(), "prompt": prompt}).encode()
+        if fields.get("private") not in (None, b"on"):
+            self.send_error(400, "Invalid privacy setting")
+            return
+        private = fields.get("private") == b"on"
+        payload = json.dumps({"data": base64.b64encode(image_data).decode(), "prompt": prompt,
+                              "private": private}).encode()
         request = urllib.request.Request("http://multimodal:8003/v1/images/edits", data=payload,
                                          headers={"Content-Type": "application/json",
                                                   "X-Internal-Token": os.environ["BENCHMARK_API_KEY"],
@@ -952,11 +1029,60 @@ class Handler(BaseHTTPRequestHandler):
         except (OSError, KeyError, ValueError):
             self.send_error(502, "Image-edit worker is unavailable")
             return
+        if private:
+            data = json.dumps({"id": ident, "status": "queued", "private": True}).encode()
+            self.send_response(202)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.end_headers()
+            self.wfile.write(data)
+            return
         self.send_response(303)
         self.send_header("Location", "/image-edit?job=" + ident)
         self.send_header("Content-Length", "0")
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
+
+    def _private_edit_proxy(self, ident, suffix="", method="GET"):
+        try:
+            if uuid.UUID(ident).version != 4:
+                raise ValueError("Invalid job ID")
+        except (TypeError, ValueError):
+            self.send_error(404, "Private job not found")
+            return
+        request = urllib.request.Request("http://multimodal:8003/v1/jobs/" + ident + suffix,
+                                         method=method, headers={
+                                             "X-Internal-Token": os.environ["BENCHMARK_API_KEY"],
+                                             "X-AI-Client-ID": "switcher-admin"})
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                data = response.read(128 * 1024 * 1024 + 1)
+                if len(data) > 128 * 1024 * 1024:
+                    raise ValueError("Private result exceeds 128 MiB")
+                status = response.status
+                content_type = response.headers.get_content_type()
+        except (urllib.error.HTTPError, OSError, ValueError):
+            self.send_error(404, "Private job is unavailable or expired")
+            return
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_DELETE(self):
+        prefix = "/image-edit/private/"
+        if not self.path.startswith(prefix) or self.headers.get("Origin") != ORIGIN or \
+                self.headers.get("Host") != urllib.parse.urlsplit(ORIGIN).netloc or \
+                self.headers.get("X-CSRF-Token") != CSRF:
+            self.send_error(403, "Invalid request")
+            return
+        self._private_edit_proxy(self.path[len(prefix):], method="DELETE")
 
     def do_POST(self):
         if self.path == "/image-edit/submit":
@@ -1015,19 +1141,41 @@ class Handler(BaseHTTPRequestHandler):
                 return
             try:
                 _, rows = profile_recommendations()
-                selected = next((row for row in rows if row["id"] == ident[0] and row["available"]), None)
+                selected = next((row for row in rows if row["id"] == ident[0]), None)
                 if selected is None:
-                    raise ValueError("This profile is unavailable on the detected system")
+                    raise ValueError("Profile not found")
                 selected = dict(selected)
+                action = fields.get("action", ["load"])
+                if len(action) != 1 or action[0] not in ("save", "load", "copy", "delete"):
+                    raise ValueError("Unknown profile action")
+                action = action[0]
+                library = multimodal_profiles.load_library(PROFILE_LIBRARY_PATH)
+                if action == "delete":
+                    if not selected["custom"] or (multimodal_profiles.load(PROFILE_PATH) or {}).get("id") == selected["id"]:
+                        raise ValueError("Switch to another profile before deleting this copy")
+                    library["custom"].pop(selected["id"], None)
+                    multimodal_profiles.save_library(PROFILE_LIBRARY_PATH, library)
+                    self.send_response(303)
+                    self.send_header("Location", "/profiles")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
                 text_modes = fields.get("text_mode", [])
                 if len(text_modes) != 1 or text_modes[0] not in selected["text_modes"]:
                     raise ValueError("Select an installed language model")
                 selected["text_mode"] = text_modes[0]
+                selected["prefer_ablit"] = fields.get("prefer_ablit") == ["on"]
+                if selected["asr_models"]:
+                    asr = fields.get("asr_model", [])
+                    if len(asr) != 1 or asr[0] not in selected["asr_models"]:
+                        raise ValueError("Select a supported transcription model")
+                    selected["asr_model"] = asr[0]
                 if selected["image"]:
                     checkpoint = fields.get("checkpoint", [])
-                    if len(checkpoint) != 1 or checkpoint[0] not in selected["checkpoints"]:
-                        raise ValueError("Select an installed image checkpoint")
-                    selected["image_checkpoint"] = checkpoint[0]
+                    if selected["checkpoints"]:
+                        if len(checkpoint) != 1 or checkpoint[0] not in selected["checkpoints"]:
+                            raise ValueError("Select an installed image checkpoint")
+                        selected["image_checkpoint"] = checkpoint[0]
                     if selected["image_edit_checkpoints"]:
                         edit_checkpoint = fields.get("edit_checkpoint", [])
                         if len(edit_checkpoint) != 1 or edit_checkpoint[0] not in selected["image_edit_checkpoints"]:
@@ -1038,18 +1186,40 @@ class Handler(BaseHTTPRequestHandler):
                     if len(video_model) != 1 or video_model[0] not in selected["video_models"]:
                         raise ValueError("Select an installed video model")
                     selected["video_model"] = video_model[0]
-                previous = active_mode()
-                old_profile = multimodal_profiles.load(PROFILE_PATH)
-                if previous != selected["text_mode"]:
-                    switch(selected["text_mode"])
-                try:
-                    multimodal_profiles.save(PROFILE_PATH, selected)
-                except Exception:
-                    if previous and previous != selected["text_mode"]:
-                        switch(previous)
-                    if old_profile:
-                        multimodal_profiles.save(PROFILE_PATH, old_profile)
-                    raise
+                if action == "copy":
+                    name = fields.get("copy_name", [""])
+                    if len(name) != 1 or not 2 <= len(name[0].strip()) <= 60:
+                        raise ValueError("Enter a copy name of 2–60 characters")
+                    copy_id = multimodal_profiles.new_custom_id()
+                    library["custom"][copy_id] = {"base": selected["base"], "name": name[0].strip(),
+                                                  "selection": multimodal_profiles.selected_choices(selected)}
+                    multimodal_profiles.save_library(PROFILE_LIBRARY_PATH, library)
+                elif action == "save":
+                    if selected["custom"]:
+                        library["custom"][selected["id"]]["selection"] = multimodal_profiles.selected_choices(selected)
+                    else:
+                        library["saved"][selected["id"]] = multimodal_profiles.selected_choices(selected)
+                    multimodal_profiles.save_library(PROFILE_LIBRARY_PATH, library)
+                else:
+                    if not selected["available"]:
+                        raise ValueError("Install the required model files before loading this profile")
+                    previous = active_mode()
+                    old_profile = multimodal_profiles.load(PROFILE_PATH)
+                    if previous != selected["text_mode"]:
+                        switch(selected["text_mode"])
+                    try:
+                        multimodal_profiles.save(PROFILE_PATH, selected)
+                        if selected["custom"]:
+                            library["custom"][selected["id"]]["selection"] = multimodal_profiles.selected_choices(selected)
+                        else:
+                            library["saved"][selected["id"]] = multimodal_profiles.selected_choices(selected)
+                        multimodal_profiles.save_library(PROFILE_LIBRARY_PATH, library)
+                    except Exception:
+                        if previous and previous != selected["text_mode"]:
+                            switch(previous)
+                        if old_profile:
+                            multimodal_profiles.save(PROFILE_PATH, old_profile)
+                        raise
             except ValueError as exc:
                 self.send_error(400, str(exc))
                 return
