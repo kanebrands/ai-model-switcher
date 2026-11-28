@@ -38,6 +38,10 @@ IFS=, read -ra models <<< "$selected"
 sudo docker ps -q --filter label=local-ai.model-manager=1 | xargs -r sudo docker stop
 compose "${all_profiles[@]}" stop "${all_services[@]}"
 compose up -d
+if grep -qx 'AI_MULTIMODAL_ENABLED=1' .env; then
+  compose --profile multimodal build multimodal
+  compose --profile multimodal up -d --no-deps multimodal
+fi
 for model in "${models[@]}"; do
   service_for "$model"
   if [[ $model == media ]]; then

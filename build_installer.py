@@ -63,6 +63,11 @@ PY_TLS_GATEWAY
 assert source.count("NGINX\nfi\n") == 1
 source = source.replace("NGINX\nfi\n", "NGINX\nfi\n" + nginx_upgrade, 1)
 source = replace_block(source, "comfyui/Dockerfile", "COMFY_DOCKERFILE", (root / "comfyui.Dockerfile").read_text(), wrapper=True)
+source = source.replace("COMFY_DOCKERFILE\nfi\n", "COMFY_DOCKERFILE\nfi\n" +
+    "mkdir -p \"$INSTALL_DIR/multimodal\"\n" +
+    "if [[ ! -w \"$INSTALL_DIR/multimodal\" ]]; then sudo chown \"$(id -u):$(id -g)\" \"$INSTALL_DIR/multimodal\"; fi\n" +
+    "cat > \"$INSTALL_DIR/multimodal/Dockerfile\" <<'MULTIMODAL_DOCKERFILE'\n" +
+    (root / "multimodal.Dockerfile").read_text().rstrip() + "\nMULTIMODAL_DOCKERFILE\n", 1)
 source = replace_block(source, "gpu_control/server.py", "GPU_CONTROLLER", (root / "server.py").read_text())
 source = replace_block(source, "media-models.sh", "MEDIA_MODELS", (root / "media-models.sh").read_text())
 source = replace_block(source, "ai-control.sh", "CONTROL", (root / "ai-control.sh").read_text())
@@ -89,6 +94,10 @@ for target, marker, file in (
     ("gpu_control/install_profile.py", "INSTALL_PROFILE", "install_profile.py"),
     ("gpu_control/context_tuning.py", "CONTEXT_TUNING", "context_tuning.py"),
     ("gpu_control/media_catalog.py", "MEDIA_CATALOG", "media_catalog.py"),
+    ("gpu_control/multimodal_jobs.py", "MULTIMODAL_JOBS", "multimodal_jobs.py"),
+    ("gpu_control/multimodal_workers.py", "MULTIMODAL_WORKERS", "multimodal_workers.py"),
+    ("gpu_control/multimodal_service.py", "MULTIMODAL_SERVICE", "multimodal_service.py"),
+    ("gpu_control/multimodal_profiles.py", "MULTIMODAL_PROFILES", "multimodal_profiles.py"),
 ):
     modules += f"\ncat > \"$INSTALL_DIR/{target}\" <<'{marker}'\n{(root / file).read_text().rstrip()}\n{marker}\n"
 modules += f"\ncat > \"$INSTALL_DIR/gpu_control/update-engine.sh\" <<'ENGINE_UPDATE_SCRIPT'\n{(root / 'update-engine.sh').read_text().rstrip()}\nENGINE_UPDATE_SCRIPT\n"
@@ -115,7 +124,7 @@ fi
 if [[ -d "$INSTALL_DIR/gpu_control/assets" && ! -w "$INSTALL_DIR/gpu_control/assets" ]]; then
   sudo chown "$(id -u):$(id -g)" "$INSTALL_DIR/gpu_control/assets"
 fi
-for generated in docker-compose.yml gpu_control/server.py gpu_control/benchmarks.py gpu_control/benchmark_views.py gpu_control/operation_poll.js gpu_control/harness_views.py gpu_control/model_catalog.py gpu_control/model_artifacts.py gpu_control/hybrid_memory.py gpu_control/model_views.py gpu_control/catalog_discovery.py gpu_control/engine_updates.py gpu_control/webui_updates.py gpu_control/sharing.py gpu_control/sharing_views.py gpu_control/fairness_gateway.py gpu_control/gpu_metrics.py gpu_control/parallel_tuning.py gpu_control/install_profile.py gpu_control/install_models.sh gpu_control/context_tuning.py gpu_control/update-engine.sh gpu_control/update-webui.sh gpu_control/tune-parallel.sh gpu_control/tune-context.sh gpu_control/media_catalog.py gpu_control/assets/gpu-workstation.webp ai-control.sh start-selected.sh; do
+for generated in docker-compose.yml multimodal/Dockerfile gpu_control/server.py gpu_control/benchmarks.py gpu_control/benchmark_views.py gpu_control/operation_poll.js gpu_control/harness_views.py gpu_control/model_catalog.py gpu_control/model_artifacts.py gpu_control/hybrid_memory.py gpu_control/model_views.py gpu_control/catalog_discovery.py gpu_control/engine_updates.py gpu_control/webui_updates.py gpu_control/sharing.py gpu_control/sharing_views.py gpu_control/fairness_gateway.py gpu_control/gpu_metrics.py gpu_control/parallel_tuning.py gpu_control/install_profile.py gpu_control/install_models.sh gpu_control/context_tuning.py gpu_control/update-engine.sh gpu_control/update-webui.sh gpu_control/tune-parallel.sh gpu_control/tune-context.sh gpu_control/media_catalog.py gpu_control/multimodal_jobs.py gpu_control/multimodal_workers.py gpu_control/multimodal_service.py gpu_control/multimodal_profiles.py gpu_control/assets/gpu-workstation.webp ai-control.sh start-selected.sh; do
   if [[ -e "$INSTALL_DIR/$generated" && ! -w "$INSTALL_DIR/$generated" ]]; then
     sudo chown "$(id -u):$(id -g)" "$INSTALL_DIR/$generated"
   fi

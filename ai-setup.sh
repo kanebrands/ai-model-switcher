@@ -63,7 +63,7 @@ fi
 if [[ -d "$INSTALL_DIR/gpu_control/assets" && ! -w "$INSTALL_DIR/gpu_control/assets" ]]; then
   sudo chown "$(id -u):$(id -g)" "$INSTALL_DIR/gpu_control/assets"
 fi
-for generated in docker-compose.yml gpu_control/server.py gpu_control/benchmarks.py gpu_control/benchmark_views.py gpu_control/operation_poll.js gpu_control/harness_views.py gpu_control/model_catalog.py gpu_control/model_artifacts.py gpu_control/hybrid_memory.py gpu_control/model_views.py gpu_control/catalog_discovery.py gpu_control/engine_updates.py gpu_control/webui_updates.py gpu_control/sharing.py gpu_control/sharing_views.py gpu_control/fairness_gateway.py gpu_control/gpu_metrics.py gpu_control/parallel_tuning.py gpu_control/install_profile.py gpu_control/install_models.sh gpu_control/context_tuning.py gpu_control/update-engine.sh gpu_control/update-webui.sh gpu_control/tune-parallel.sh gpu_control/tune-context.sh gpu_control/media_catalog.py gpu_control/assets/gpu-workstation.webp ai-control.sh start-selected.sh; do
+for generated in docker-compose.yml multimodal/Dockerfile gpu_control/server.py gpu_control/benchmarks.py gpu_control/benchmark_views.py gpu_control/operation_poll.js gpu_control/harness_views.py gpu_control/model_catalog.py gpu_control/model_artifacts.py gpu_control/hybrid_memory.py gpu_control/model_views.py gpu_control/catalog_discovery.py gpu_control/engine_updates.py gpu_control/webui_updates.py gpu_control/sharing.py gpu_control/sharing_views.py gpu_control/fairness_gateway.py gpu_control/gpu_metrics.py gpu_control/parallel_tuning.py gpu_control/install_profile.py gpu_control/install_models.sh gpu_control/context_tuning.py gpu_control/update-engine.sh gpu_control/update-webui.sh gpu_control/tune-parallel.sh gpu_control/tune-context.sh gpu_control/media_catalog.py gpu_control/multimodal_jobs.py gpu_control/multimodal_workers.py gpu_control/multimodal_service.py gpu_control/multimodal_profiles.py gpu_control/assets/gpu-workstation.webp ai-control.sh start-selected.sh; do
   if [[ -e "$INSTALL_DIR/$generated" && ! -w "$INSTALL_DIR/$generated" ]]; then
     sudo chown "$(id -u):$(id -g)" "$INSTALL_DIR/$generated"
   fi
@@ -599,6 +599,32 @@ services:
     read_only: true
     depends_on: [gpu-control]
     networks: [ai_internal, control_internal]
+  multimodal:
+    profiles: [multimodal]
+    build:
+      context: ./multimodal
+    image: local-ai/multimodal:1
+    restart: unless-stopped
+    environment:
+      MULTIMODAL_INTERNAL_KEY: ${AI_API_KEY:?set AI_API_KEY in .env}
+      MULTIMODAL_DATA: /app/data/multimodal
+      COMFY_MODEL_DIR: /app/media_models
+      ASR_MODEL_DIR: /app/data/multimodal/asr-models
+      HF_HOME: /app/data/multimodal/hf-cache
+      XDG_CACHE_HOME: /app/data/multimodal/cache
+      HOME: /tmp
+      HF_HUB_DISABLE_XET: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+    volumes:
+      - ./gpu_control/multimodal_service.py:/app/multimodal_service.py:ro
+      - ./gpu_control/multimodal_jobs.py:/app/multimodal_jobs.py:ro
+      - ./gpu_control/multimodal_workers.py:/app/multimodal_workers.py:ro
+      - ./gpu_control/results:/app/data
+      - ${AI_MEDIA_DIR:?set AI_MEDIA_DIR in .env}/models:/app/media_models:ro
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,size=512m
+    networks: [ai_internal, control_internal]
   gpu-control:
     image: python:3.12-alpine
     restart: unless-stopped
@@ -612,6 +638,7 @@ services:
       BENCHMARK_COMFY_PASSWORD: ${AI_SWITCH_PASSWORD:?set AI_SWITCH_PASSWORD in .env}
       AI_SELECTED_MODELS: ${AI_SELECTED_MODELS:-}
       AI_GPU_COMPATIBLE: ${AI_GPU_COMPATIBLE:-1}
+      AI_MULTIMODAL_ENABLED: ${AI_MULTIMODAL_ENABLED:-0}
       BENCHMARK_DB: /app/data/benchmarks.sqlite3
       MODEL_HOST_DIR: ${AI_MODEL_CACHE:?set AI_MODEL_CACHE in .env}/gguf
       MODEL_DIR: /app/models
@@ -635,6 +662,7 @@ services:
       - ./gpu_control/webui_updates.py:/app/webui_updates.py:ro
       - ./gpu_control/context_tuning.py:/app/context_tuning.py:ro
       - ./gpu_control/media_catalog.py:/app/media_catalog.py:ro
+      - ./gpu_control/multimodal_profiles.py:/app/multimodal_profiles.py:ro
       - ./gpu_control/sharing.py:/app/sharing.py:ro
       - ./gpu_control/sharing_views.py:/app/sharing_views.py:ro
       - ./gpu_control/gpu_metrics.py:/app/gpu_metrics.py:ro
@@ -691,7 +719,7 @@ http {
     server {
         listen 8080;
         server_name _;
-        client_max_body_size 16m;
+        client_max_body_size 24m;
         location = /_active_llm {
             internal;
             proxy_pass http://gpu-control:8001/route;
@@ -852,6 +880,19 @@ EXPOSE 8188
 CMD ["python", "main.py", "--listen", "0.0.0.0", "--port", "8188"]
 COMFY_DOCKERFILE
 fi
+mkdir -p "$INSTALL_DIR/multimodal"
+if [[ ! -w "$INSTALL_DIR/multimodal" ]]; then sudo chown "$(id -u):$(id -g)" "$INSTALL_DIR/multimodal"; fi
+cat > "$INSTALL_DIR/multimodal/Dockerfile" <<'MULTIMODAL_DOCKERFILE'
+FROM python:3.12-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    poppler-utils tesseract-ocr espeak-ng ffmpeg && \
+    rm -rf /var/lib/apt/lists/* && \
+    pip install --no-cache-dir 'faster-whisper>=1.1,<2'
+# faster-whisper 1.2.1 still passes metadata_errors to av.open; PyAV 19 removed it.
+RUN pip install --no-cache-dir 'av>=11,<19'
+WORKDIR /app
+CMD ["python", "/app/multimodal_service.py"]
+MULTIMODAL_DOCKERFILE
 
 cat > "$INSTALL_DIR/gpu_control/server.py" <<'GPU_CONTROLLER'
 #!/usr/bin/env python3
@@ -861,6 +902,7 @@ import http.client
 import datetime as dt
 import json
 import os
+from pathlib import Path
 import re
 import socket
 import sqlite3
@@ -883,6 +925,22 @@ from parallel_tuning import ParallelTuner
 import sharing_views
 import model_views
 import harness_views
+import multimodal_profiles
+
+PROFILE_PATH = "/app/data/multimodal/active_profile.json"
+
+
+def profile_recommendations():
+    hardware = MODEL_MANAGER.hardware()
+    available = {mode for mode, (_, container) in MODELS.items()
+                 if mode != "media" and workload_state(container) != "not created"}
+    checkpoints = sorted(path.name for path in (Path("/app/media_models") / "checkpoints").glob("*.safetensors"))
+    media_ready = (hardware.get("gpu_provider") == "nvidia" and
+                   workload_state(MEDIA) != "not created" and bool(checkpoints))
+    rows = multimodal_profiles.recommend(hardware, available, media_ready,
+                                         os.environ.get("AI_MULTIMODAL_ENABLED") == "1", checkpoints,
+                                         active_mode())
+    return hardware, rows
 
 
 def usage_window(query, prefix=""):
@@ -913,8 +971,13 @@ COMFY_URL = os.environ["COMFY_URL"]
 PUBLIC_API_URL = os.environ.get("PUBLIC_API_URL", ORIGIN.rsplit(":", 1)[0] + ":8080/v1")
 CSRF = os.environ["CONTROL_CSRF_TOKEN"]
 SELECTED_MODES = {value for value in os.environ.get("AI_SELECTED_MODELS", "").split(",") if value}
-LOCK = threading.Lock()
+LOCK = threading.RLock()
 LAST_SWITCH_MODE = None
+MEDIA_LEASE_PATH = Path("/app/data/multimodal/gpu_lease.json")
+try:
+    MEDIA_LEASE = json.loads(MEDIA_LEASE_PATH.read_text())
+except (OSError, ValueError):
+    MEDIA_LEASE = None
 BUILTIN_LABELS = {
     "cpu-tiny": "Qwen3 0.6B Q8 CPU (local-cpu-tiny)",
     "cpu-4b": "Qwen3 4B Q4 CPU (local-cpu-4b)",
@@ -977,7 +1040,7 @@ def workload_state(name):
     return status
 
 
-def switch(target):
+def switch(target, internal=False):
     global LAST_SWITCH_MODE
     workloads = {mode: container for mode, (_, container) in MODELS.items()}
     if target not in workloads:
@@ -989,6 +1052,8 @@ def switch(target):
     if ENGINE_UPDATES.busy or CONTEXT_TUNER.busy or PARALLEL_TUNER.busy or MODEL_MANAGER.busy:
         raise RuntimeError("Wait for the model operation or context change to finish before switching models")
     with LOCK:
+        if MEDIA_LEASE and not internal:
+            raise RuntimeError("An image job is using the GPU; wait for it to finish")
         LAST_SWITCH_MODE = target
         start_name = workloads[target]
         backup = MODEL_MANAGER.ensure_current_engine(target)
@@ -1029,6 +1094,45 @@ PARALLEL_TUNER = ParallelTuner(BENCHMARKS.path, MODEL_MANAGER, os.environ["BENCH
 def active_mode():
     active = [mode for mode, (_, container) in MODELS.items() if running(container)]
     return active[0] if len(active) == 1 else None
+
+
+def media_lease(action, job_id):
+    """Reserve the sole GPU for one ComfyUI job and restore its prior model."""
+    global MEDIA_LEASE
+    with LOCK:
+        if action == "acquire":
+            if MEDIA_LEASE:
+                if MEDIA_LEASE["job_id"] == job_id:
+                    if active_mode() != "media":
+                        switch("media", internal=True)
+                    return {"state": "leased", "previous": MEDIA_LEASE["previous"]}
+                raise RuntimeError("The GPU is reserved for another image job")
+            if workload_state(MEDIA) == "not created":
+                raise ValueError("ComfyUI is not installed; select it in the installer")
+            previous = active_mode()
+            MEDIA_LEASE = {"job_id": job_id, "previous": previous}
+            MEDIA_LEASE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            MEDIA_LEASE_PATH.write_text(json.dumps(MEDIA_LEASE))
+            try:
+                if previous != "media":
+                    switch("media", internal=True)
+            except Exception:
+                MEDIA_LEASE = None
+                MEDIA_LEASE_PATH.unlink(missing_ok=True)
+                raise
+            return {"state": "leased", "previous": previous}
+        if action == "release":
+            if not MEDIA_LEASE or MEDIA_LEASE["job_id"] != job_id:
+                raise ValueError("Image job does not own the GPU lease")
+            previous = MEDIA_LEASE["previous"]
+            if previous and previous != "media":
+                switch(previous, internal=True)
+            elif previous is None and running(MEDIA):
+                docker("POST", f"/containers/{MEDIA}/stop?t=30")
+            MEDIA_LEASE = None
+            MEDIA_LEASE_PATH.unlink(missing_ok=True)
+            return {"state": "released", "restored": previous}
+        raise ValueError("Unknown GPU lease action")
 
 
 def workload_snapshot():
@@ -1277,7 +1381,7 @@ class Handler(BaseHTTPRequestHandler):
         home_style += ".api-connection{display:grid;grid-template-columns:minmax(0,12rem) minmax(0,1fr);gap:1rem;align-items:start}.api-connection label{min-width:0;margin:0}.api-connection input[type=text]{width:100%;max-width:none}.api-port{display:block;color:#e8ba78;font-size:.78rem;font-weight:700}@media(max-width:680px){.api-connection{grid-template-columns:1fr}}"
         page = f"""<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>AI Model Switcher</title><style>{benchmark_views.STYLE}{home_style}{sharing_views.USAGE_STYLE}</style>
-<main><nav aria-label="Main navigation"><a href="/">AI Model Switcher</a><a href="/models">Find models</a><a href="/benchmarks">Benchmarks</a><a href="/sharing">Client sharing</a><a href="/harnesses">Coding harnesses</a></nav>
+<main><nav aria-label="Main navigation"><a href="/">AI Model Switcher</a><a href="/models">Find models</a><a href="/benchmarks">Benchmarks</a><a href="/profiles">Task profiles</a><a href="/sharing">Client sharing</a><a href="/harnesses">Coding harnesses</a></nav>
 <header class="hero"><div class="hero-copy"><div class="eyebrow">Local AI / Control desk</div><h1>AI Model Switcher</h1><p>Manage local workloads and model context from one place.</p><div class="active-line"><span class="active-caption">Active workload</span><span class="active-badge {'is-ready' if snapshot['state'] == 'ready' else 'is-failed' if snapshot['state'] == 'failed' else ''}" data-workload-badge>{h(badge_label)}</span><strong data-workload-label>{h(mode)}</strong></div><p class="active-detail" role="status" data-workload-detail>{h(snapshot['detail'])}</p><div class="api-connection"><label>Stable API model ID<input type="text" readonly value="local-llm-api" data-copy-field aria-label="Copyable stable API model ID"></label><label>OpenAI API base URL<input type="text" class="api-base" readonly value="{h(PUBLIC_API_URL)}" data-copy-field aria-label="Copyable OpenAI API base URL">{api_port_note}</label></div><p class="api-note">Use <code>local-llm-api</code> as the model in your harness to reach the currently loaded language model. Wait for “Ready to use” before sending requests.</p></div></header>
 <script src="/assets/operation_poll.js?v=workload-status-1" defer></script>
 {'<p class="message" role="status" data-operation-monitor="/operations/status?scope=home">Checking operation status…</p>' if context_status['busy'] or webui_status['checking'] or webui_status['busy'] else ''}
@@ -1294,7 +1398,7 @@ class Handler(BaseHTTPRequestHandler):
 <h2>Service status</h2><div class="services">{status_cards}</div><p><a href="/">Refresh status</a></p>
 {gpu_card}
 <p class="note">If a service fails, check ai-control.sh huihui-logs or media-logs. If Open WebUI still shows local-coder after switching, set its connection URL to http://nginx:8080/v1 in Admin → Settings → Connections.</p>
-<div class="home-footer"><a href="/models">Find models</a><a href="/benchmarks">Benchmarks and results</a><a href="/sharing">Client sharing and rate limits</a><a href="/harnesses">Coding harnesses</a><a href="{h(WEB_URL)}">Open WebUI</a>{f'<a href="{h(COMFY_URL)}">ComfyUI</a>' if available_builtin('media') else ''}</div></main></html>"""
+<div class="home-footer"><a href="/models">Find models</a><a href="/benchmarks">Benchmarks and results</a><a href="/profiles">Task profiles</a><a href="/sharing">Client sharing and rate limits</a><a href="/harnesses">Coding harnesses</a><a href="{h(WEB_URL)}">Open WebUI</a>{f'<a href="{h(COMFY_URL)}">ComfyUI</a>' if available_builtin('media') else ''}</div></main></html>"""
         data = page.encode()
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -1307,6 +1411,24 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = urllib.parse.urlsplit(self.path)
+        if path.path == "/profiles":
+            try:
+                hardware, rows = profile_recommendations()
+                active = multimodal_profiles.load(PROFILE_PATH)
+                db_path = Path("/app/data/multimodal/jobs.sqlite3")
+                jobs = []
+                if db_path.is_file():
+                    db = sqlite3.connect(db_path)
+                    try:
+                        db.row_factory = sqlite3.Row
+                        jobs = db.execute("SELECT kind,status,stage,created_at FROM jobs ORDER BY rowid DESC LIMIT 20").fetchall()
+                    finally:
+                        db.close()
+            except Exception as exc:
+                self.send_error(503, "Could not read profile recommendations: " + str(exc))
+                return
+            self._send_html(multimodal_profiles.page(rows, active, hardware, CSRF, jobs))
+            return
         if path.path == "/assets/operation_poll.js":
             try:
                 with open("/app/operation_poll.js", "rb") as script:
@@ -1595,7 +1717,31 @@ class Handler(BaseHTTPRequestHandler):
         self._page()
 
     def do_POST(self):
-        if self.path not in ("/switch", "/benchmark", "/context/tune", "/benchmarks/delete", "/models/install", "/models/uninstall", "/models/rename",
+        if self.path in ("/multimodal/acquire", "/multimodal/release"):
+            if self.headers.get("Authorization") != "Bearer " + os.environ["BENCHMARK_API_KEY"]:
+                self.send_error(403)
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if not 1 <= length <= 128 or self.headers.get("Content-Type") != "application/json":
+                    raise ValueError("Invalid lease request")
+                job_id = json.loads(self.rfile.read(length))["job_id"]
+                uuid.UUID(job_id)
+                result = media_lease(self.path.rsplit("/", 1)[1], job_id)
+            except (ValueError, KeyError, TypeError) as exc:
+                self.send_error(400, str(exc))
+                return
+            except RuntimeError as exc:
+                self.send_error(409, str(exc))
+                return
+            data = json.dumps(result).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
+        if self.path not in ("/switch", "/benchmark", "/context/tune", "/benchmarks/delete", "/profiles/apply", "/models/install", "/models/uninstall", "/models/rename",
                              "/models/media/install", "/models/refresh", "/models/search", "/models/hardware/rescan", "/models/discovered/install", "/models/hybrid", "/models/hybrid/apply",
                              "/models/engine/check", "/models/engine/update", "/webui/update", "/webui/update/dismiss",
                              "/sharing/save", "/sharing/reset", "/sharing/client", "/sharing/revoke",
@@ -1616,6 +1762,49 @@ class Handler(BaseHTTPRequestHandler):
         fields = urllib.parse.parse_qs(self.rfile.read(length).decode("utf-8"), strict_parsing=True)
         if fields.get("token") != [CSRF]:
             self.send_error(403, "Invalid request")
+            return
+        if self.path == "/profiles/apply":
+            ident = fields.get("profile", [])
+            if len(ident) != 1:
+                self.send_error(400, "Select one profile")
+                return
+            try:
+                _, rows = profile_recommendations()
+                selected = next((row for row in rows if row["id"] == ident[0] and row["available"]), None)
+                if selected is None:
+                    raise ValueError("This profile is unavailable on the detected system")
+                selected = dict(selected)
+                text_modes = fields.get("text_mode", [])
+                if len(text_modes) != 1 or text_modes[0] not in selected["text_modes"]:
+                    raise ValueError("Select an installed language model")
+                selected["text_mode"] = text_modes[0]
+                if selected["image"]:
+                    checkpoint = fields.get("checkpoint", [])
+                    if len(checkpoint) != 1 or checkpoint[0] not in selected["checkpoints"]:
+                        raise ValueError("Select an installed image checkpoint")
+                    selected["image_checkpoint"] = checkpoint[0]
+                previous = active_mode()
+                old_profile = multimodal_profiles.load(PROFILE_PATH)
+                if previous != selected["text_mode"]:
+                    switch(selected["text_mode"])
+                try:
+                    multimodal_profiles.save(PROFILE_PATH, selected)
+                except Exception:
+                    if previous and previous != selected["text_mode"]:
+                        switch(previous)
+                    if old_profile:
+                        multimodal_profiles.save(PROFILE_PATH, old_profile)
+                    raise
+            except ValueError as exc:
+                self.send_error(400, str(exc))
+                return
+            except Exception as exc:
+                self.send_error(409, "Profile activation failed; previous configuration restored: " + str(exc))
+                return
+            self.send_response(303)
+            self.send_header("Location", "/profiles")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
             return
         if self.path == "/models/uninstall":
             candidate = fields.get("candidate", [])
@@ -2495,13 +2684,14 @@ def shell(title, body, refresh=False, wide=False, monitor_url=None):
     description = ("Compare saved speed and quality results for this machine." if title == "Model benchmarks" else
                    "Find models sized for the hardware in this system." if title == "Hugging Face model recommendations" else
                    "The switcher could not complete this request." if title == "Request failed" else
+                   "Configure task workers and review queued jobs for this system." if title == "Multimodal profiles" else
                    "Compare coding agents and connect them to your local API." if title == "Coding harnesses" else
                    "Inspect this model's recorded runs and system details.")
     display_title = "Find models" if title == "Hugging Face model recommendations" else title
     return (f'<!doctype html><html lang="en"><meta charset="utf-8">'
             f'<meta name="viewport" content="width=device-width,initial-scale=1">'
             f'<title>{esc(title)}</title><style>{STYLE}</style><body{body_class}><main><nav aria-label="Main navigation"><a href="/">AI Model Switcher</a>'
-            f'<a href="/benchmarks">Benchmarks</a><a href="/models">Find models</a><a href="/sharing">Client sharing</a><a href="/harnesses">Coding harnesses</a></nav>'
+            f'<a href="/benchmarks">Benchmarks</a><a href="/models">Find models</a><a href="/profiles">Task profiles</a><a href="/sharing">Client sharing</a><a href="/harnesses">Coding harnesses</a></nav>'
             f'<header class="hero"><div class="hero-copy"><div class="eyebrow">Local AI / Control desk</div><h1>{esc(display_title)}</h1><p>{description}</p></div></header>{monitor}{body}</main></body></html>')
 
 
@@ -5565,6 +5755,14 @@ HOP_HEADERS = {"connection", "keep-alive", "proxy-authenticate", "proxy-authoriz
                "te", "trailer", "transfer-encoding", "upgrade"}
 BACKEND = re.compile(r"[a-z0-9-]+:(?:8000|8080)\Z")
 STABLE_MODEL_ID = "local-llm-api"
+MEDIA_POST_ROUTES = {"/v1/documents/parse", "/v1/ocr", "/v1/audio/transcriptions",
+                     "/v1/audio/speech", "/v1/images/generations"}
+
+
+def is_media_route(path, method):
+    route = path.split("?", 1)[0]
+    return (method == "POST" and route in MEDIA_POST_ROUTES or
+            method == "GET" and (route == "/v1/jobs" or route.startswith("/v1/jobs/")))
 
 
 def resolve_model_alias(raw, content_type, model_id):
@@ -5799,7 +5997,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
             self.reply(411, "Content-Length is required")
             return
         length = int(length)
-        if length > policy["max_request_kib"] * 1024:
+        media = is_media_route(self.path, self.command)
+        if length > (24 * 1024 * 1024 if media else policy["max_request_kib"] * 1024):
             self.reply(413, "Request exceeds the configured size limit")
             return
         raw = self.rfile.read(length) if length else b""
@@ -5822,7 +6021,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
         started_clock = time.monotonic()
         try:
             path = self.path
-            if path.startswith("/vision/v1/"):
+            if media:
+                target = "multimodal:8003"
+                model_id = None
+            elif path.startswith("/vision/v1/"):
                 target = "vision:8000"
                 model_id = "local-vision"
                 path = path[len("/vision"):]
@@ -5831,15 +6033,19 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 with urllib.request.urlopen(request, timeout=10) as routing:
                     target = routing.headers.get("X-LLM-Backend", "")
                     model_id = routing.headers.get("X-LLM-Model", "")
-            if not BACKEND.fullmatch(target):
+            if not media and not BACKEND.fullmatch(target):
                 raise RuntimeError("No active model backend")
-            if self.command == "POST":
+            if self.command == "POST" and not media:
                 raw = resolve_model_alias(raw, self.headers.get("Content-Type", ""), model_id)
             host, port = target.rsplit(":", 1)
             upstream = http.client.HTTPConnection(host, int(port), timeout=600)
             headers = {key: value for key, value in self.headers.items()
                        if key.lower() not in HOP_HEADERS | {"authorization", "host", "content-length"}}
-            headers["Authorization"] = "Bearer " + LEGACY_KEY
+            if media:
+                headers["X-Internal-Token"] = LEGACY_KEY
+                headers["X-AI-Client-ID"] = client_id
+            else:
+                headers["Authorization"] = "Bearer " + LEGACY_KEY
             headers["Host"] = target
             headers["Accept-Encoding"] = "identity"
             headers["Content-Length"] = str(len(raw))
@@ -6308,9 +6514,17 @@ def main():
     except ValueError as exc:
         raise SystemExit(str(exc)) from None
     first = next(item for item in chosen if item != "media")
-    update_env(env_path, {"AI_SELECTED_MODELS": ",".join(chosen), "AI_START_MODEL": first})
+    multimodal = os.environ.get("AI_MULTIMODAL_ENABLED", existing.get("AI_MULTIMODAL_ENABLED"))
+    if multimodal not in ("0", "1", None):
+        raise SystemExit("AI_MULTIMODAL_ENABLED must be 0 or 1")
+    if multimodal is None and sys.stdin.isatty():
+        answer = input("Install document, OCR, audio, and image job workers? [y/N]: ").strip().lower()
+        multimodal = "1" if answer in ("y", "yes") else "0"
+    update_env(env_path, {"AI_SELECTED_MODELS": ",".join(chosen), "AI_START_MODEL": first,
+                          "AI_MULTIMODAL_ENABLED": multimodal or "0"})
     print("Selected:", ", ".join(chosen))
     print("Initial workload:", first)
+    print("Multimodal workers:", "enabled" if multimodal == "1" else "disabled")
 
 
 if __name__ == "__main__":
@@ -6884,6 +7098,605 @@ class MediaManager:
                     self.busy = False
 MEDIA_CATALOG
 
+cat > "$INSTALL_DIR/gpu_control/multimodal_jobs.py" <<'MULTIMODAL_JOBS'
+"""Durable, owner-scoped jobs for CPU and GPU media tasks."""
+import datetime as dt
+import json
+import os
+from pathlib import Path
+import sqlite3
+import uuid
+
+
+CPU_KINDS = frozenset({"pdf", "ocr", "transcription", "speech"})
+GPU_KINDS = frozenset({"image"})
+KINDS = CPU_KINDS | GPU_KINDS
+
+
+def utc_now():
+    return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+
+
+class JobStore:
+    def __init__(self, db_path, artifact_dir):
+        self.db_path = str(db_path)
+        self.artifact_dir = Path(artifact_dir)
+        self.artifact_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.artifact_dir.chmod(0o700)
+        with self.connect() as db:
+            db.execute("""CREATE TABLE IF NOT EXISTS jobs (
+                id TEXT PRIMARY KEY, owner TEXT NOT NULL, kind TEXT NOT NULL,
+                status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                started_at TEXT, completed_at TEXT, attempts INTEGER NOT NULL DEFAULT 0,
+                stage TEXT NOT NULL, request_json TEXT NOT NULL, input_name TEXT,
+                result_name TEXT, result_type TEXT, result_json TEXT, error TEXT,
+                backend_ref TEXT)""")
+            db.execute("CREATE INDEX IF NOT EXISTS jobs_pending ON jobs(status,kind,created_at)")
+            # A single worker process owns this database. On restart, resume unfinished work.
+            db.execute("UPDATE jobs SET status='queued', stage='resuming after worker restart', "
+                       "updated_at=? WHERE status='running'", (utc_now(),))
+
+    def connect(self):
+        db = sqlite3.connect(self.db_path, timeout=30)
+        db.row_factory = sqlite3.Row
+        db.execute("PRAGMA busy_timeout=30000")
+        return db
+
+    def _save_file(self, name, payload):
+        target = self.artifact_dir / name
+        fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(payload)
+        except BaseException:
+            target.unlink(missing_ok=True)
+            raise
+
+    def submit(self, owner, kind, request, payload=b""):
+        if kind not in KINDS or not owner or not isinstance(request, dict):
+            raise ValueError("Invalid job")
+        if not isinstance(payload, bytes):
+            raise ValueError("Job input must be bytes")
+        ident = str(uuid.uuid4())
+        input_name = ident + ".input" if payload else None
+        if input_name:
+            self._save_file(input_name, payload)
+        now = utc_now()
+        try:
+            with self.connect() as db:
+                db.execute("""INSERT INTO jobs
+                    (id,owner,kind,status,created_at,updated_at,stage,request_json,input_name)
+                    VALUES(?,?,?,'queued',?,?,'waiting',?,?)""",
+                    (ident, owner, kind, now, now, json.dumps(request), input_name))
+        except BaseException:
+            if input_name:
+                (self.artifact_dir / input_name).unlink(missing_ok=True)
+            raise
+        return self.get(ident, owner)
+
+    def get(self, ident, owner=None):
+        try:
+            valid = isinstance(ident, str) and uuid.UUID(ident).version == 4
+        except ValueError:
+            valid = False
+        if not valid:
+            raise ValueError("Invalid job ID")
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM jobs WHERE id=?", (ident,)).fetchone()
+        if not row or (owner is not None and row["owner"] != owner):
+            return None
+        value = dict(row)
+        value["request"] = json.loads(value.pop("request_json"))
+        value["result"] = json.loads(value.pop("result_json")) if value.get("result_json") else None
+        return value
+
+    def claim(self, kinds):
+        if not kinds or not set(kinds) <= KINDS:
+            raise ValueError("Invalid job kinds")
+        placeholders = ",".join("?" for _ in kinds)
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(f"SELECT id FROM jobs WHERE status='queued' AND kind IN ({placeholders}) "
+                             "ORDER BY rowid LIMIT 1", tuple(kinds)).fetchone()
+            if row:
+                db.execute("UPDATE jobs SET status='running', stage='starting', started_at=COALESCE(started_at,?), "
+                           "updated_at=?, attempts=attempts+1 WHERE id=?", (utc_now(), utc_now(), row["id"]))
+        return self.get(row["id"]) if row else None
+
+    def update(self, ident, **values):
+        allowed = {"stage", "backend_ref", "status", "result_name", "result_type", "result_json", "error", "completed_at"}
+        if not values or set(values) - allowed:
+            raise ValueError("Invalid job update")
+        values["updated_at"] = utc_now()
+        columns = ",".join(f"{name}=?" for name in values)
+        with self.connect() as db:
+            db.execute(f"UPDATE jobs SET {columns} WHERE id=?", (*values.values(), ident))
+
+    def complete(self, ident, result=None, artifact=None, content_type=None):
+        name = ident + ".result" if artifact is not None else None
+        if name:
+            (self.artifact_dir / name).unlink(missing_ok=True)
+            self._save_file(name, artifact)
+        self.update(ident, status="completed", stage="ready", completed_at=utc_now(),
+                    result_name=name, result_type=content_type,
+                    result_json=json.dumps(result) if result is not None else None)
+        input_name = ident + ".input"
+        (self.artifact_dir / input_name).unlink(missing_ok=True)
+
+    def fail(self, ident, reason):
+        self.update(ident, status="failed", stage="failed", completed_at=utc_now(), error=str(reason)[:500])
+        (self.artifact_dir / (ident + ".input")).unlink(missing_ok=True)
+
+    def artifact(self, job):
+        name = job.get("result_name")
+        if name != job["id"] + ".result":
+            return None
+        return (self.artifact_dir / name).read_bytes()
+
+    def input(self, job):
+        if job.get("input_name") != job["id"] + ".input":
+            return b""
+        return (self.artifact_dir / job["input_name"]).read_bytes()
+
+    def list(self, owner, limit=50):
+        with self.connect() as db:
+            rows = db.execute("SELECT id FROM jobs WHERE owner=? ORDER BY rowid DESC LIMIT ?",
+                              (owner, min(max(int(limit), 1), 100))).fetchall()
+        return [self.get(row["id"], owner) for row in rows]
+MULTIMODAL_JOBS
+
+cat > "$INSTALL_DIR/gpu_control/multimodal_workers.py" <<'MULTIMODAL_WORKERS'
+"""Bounded document, audio, and ComfyUI work for the persistent job service."""
+import io
+import json
+import os
+from pathlib import Path
+import subprocess
+import tempfile
+import time
+import urllib.error
+import urllib.request
+
+
+MAX_PDF_PAGES = 20
+TIMEOUT = 180
+
+
+def run(command, timeout=TIMEOUT):
+    result = subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            timeout=timeout, env={**os.environ, "OMP_THREAD_LIMIT": "4"})
+    return result.stdout
+
+
+def pdf(job, payload):
+    with tempfile.TemporaryDirectory() as directory:
+        source = Path(directory) / "document.pdf"
+        source.write_bytes(payload)
+        pages = int(run(["pdfinfo", str(source)]).decode(errors="replace").split("Pages:", 1)[1].splitlines()[0].strip())
+        if pages > MAX_PDF_PAGES:
+            raise ValueError(f"PDF exceeds the {MAX_PDF_PAGES}-page limit")
+        text = run(["pdftotext", "-layout", "-f", "1", "-l", str(pages), str(source), "-"]).decode(errors="replace")
+        ocr_used = False
+        if not text.strip() and job["request"].get("ocr", True):
+            prefix = Path(directory) / "page"
+            run(["pdftoppm", "-f", "1", "-l", str(pages), "-r", "150", "-png", str(source), str(prefix)], timeout=300)
+            text = "\n\n".join(run(["tesseract", str(page), "stdout"], timeout=60).decode(errors="replace")
+                               for page in sorted(Path(directory).glob("page-*.png")))
+            ocr_used = True
+        return {"text": text, "pages": pages, "ocr_used": ocr_used}
+
+
+def ocr(job, payload):
+    with tempfile.TemporaryDirectory() as directory:
+        source = Path(directory) / "image"
+        source.write_bytes(payload)
+        language = job["request"].get("language", "eng")
+        if not isinstance(language, str) or not language.replace("+", "").isalpha() or len(language) > 24:
+            raise ValueError("Invalid OCR language")
+        text = run(["tesseract", str(source), "stdout", "-l", language]).decode(errors="replace")
+        return {"text": text, "language": language}
+
+
+def transcription(job, payload):
+    from faster_whisper import WhisperModel
+    model_name = job["request"].get("model", "")
+    if model_name not in {"tiny", "base", "small"}:
+        raise ValueError("Choose a supported Whisper size: tiny, base, or small")
+    cache = Path(os.environ.get("ASR_MODEL_DIR", "/app/data/asr-models"))
+    cache.mkdir(parents=True, exist_ok=True)
+    # The user explicitly selects the ASR size in the job or active profile.
+    model = WhisperModel(model_name, device="cpu", compute_type="int8", cpu_threads=4,
+                         download_root=str(cache))
+    with tempfile.TemporaryDirectory() as directory:
+        source = Path(directory) / "audio"
+        source.write_bytes(payload)
+        segments, info = model.transcribe(str(source), beam_size=1)
+        text = " ".join(segment.text.strip() for segment in segments)
+        return {"text": text, "language": info.language, "duration": info.duration}
+
+
+def speech(job):
+    text = job["request"].get("input", "")
+    voice = job["request"].get("voice", "en")
+    if not isinstance(text, str) or not 1 <= len(text) <= 4000:
+        raise ValueError("Speech input must have 1–4000 characters")
+    if not isinstance(voice, str) or not voice.replace("-", "").isalpha() or len(voice) > 24:
+        raise ValueError("Invalid speech voice")
+    with tempfile.TemporaryDirectory() as directory:
+        output = Path(directory) / "speech.wav"
+        run(["espeak-ng", "-v", voice, "-w", str(output), text], timeout=60)
+        return {"voice": voice, "format": "wav"}, output.read_bytes(), "audio/wav"
+
+
+def comfy_request(path, body=None, timeout=30):
+    base = os.environ.get("COMFY_INTERNAL_URL", "http://comfyui:8188")
+    data = json.dumps(body).encode() if body is not None else None
+    request = urllib.request.Request(base + path, data=data,
+                                     headers={"Content-Type": "application/json"} if data else {})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.load(response)
+
+
+def sdxl_workflow(prompt, checkpoint, width, height, steps):
+    return {
+        "4": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": checkpoint}},
+        "5": {"class_type": "EmptyLatentImage", "inputs": {"width": width, "height": height, "batch_size": 1}},
+        "6": {"class_type": "CLIPTextEncode", "inputs": {"text": prompt, "clip": ["4", 1]}},
+        "7": {"class_type": "CLIPTextEncode", "inputs": {"text": "", "clip": ["4", 1]}},
+        "8": {"class_type": "KSampler", "inputs": {"seed": int(time.time_ns() % (2**53)),
+                 "steps": steps, "cfg": 7, "sampler_name": "euler", "scheduler": "normal",
+                 "denoise": 1, "model": ["4", 0], "positive": ["6", 0], "negative": ["7", 0], "latent_image": ["5", 0]}},
+        "9": {"class_type": "VAEDecode", "inputs": {"samples": ["8", 0], "vae": ["4", 2]}},
+        "10": {"class_type": "SaveImage", "inputs": {"filename_prefix": "ai-switcher", "images": ["9", 0]}},
+    }
+
+
+def image(job, update):
+    request = job["request"]
+    prompt = request.get("prompt", "")
+    checkpoint = request.get("checkpoint", "")
+    width, height, steps = (request.get(key) for key in ("width", "height", "steps"))
+    if not isinstance(prompt, str) or not 1 <= len(prompt) <= 4000:
+        raise ValueError("Image prompt must have 1–4000 characters")
+    if not isinstance(checkpoint, str) or Path(checkpoint).name != checkpoint or not checkpoint.endswith(".safetensors"):
+        raise ValueError("Select an installed checkpoint")
+    if not (isinstance(width, int) and isinstance(height, int) and isinstance(steps, int) and
+            256 <= width <= 1536 and 256 <= height <= 1536 and width % 8 == height % 8 == 0 and 1 <= steps <= 60):
+        raise ValueError("Choose width/height 256–1536 in multiples of 8 and steps 1–60")
+    installed = Path(os.environ.get("COMFY_MODEL_DIR", "/app/media_models")) / "checkpoints" / checkpoint
+    if not installed.is_file():
+        raise ValueError("Checkpoint is not installed in ComfyUI")
+    workflow = sdxl_workflow(prompt, checkpoint, width, height, steps)
+    reply = comfy_request("/prompt", {"prompt": workflow, "client_id": job["id"]})
+    ref = reply.get("prompt_id")
+    if not ref:
+        raise RuntimeError("ComfyUI rejected the workflow")
+    update(job["id"], backend_ref=ref, stage="rendering in ComfyUI")
+    deadline = time.monotonic() + 900
+    while time.monotonic() < deadline:
+        history = comfy_request("/history/" + ref).get(ref)
+        if history:
+            if history.get("status", {}).get("status_str") == "error":
+                raise RuntimeError("ComfyUI workflow failed")
+            outputs = history.get("outputs", {})
+            images = outputs.get("10", {}).get("images", [])
+            if images:
+                item = images[0]
+                from urllib.parse import urlencode
+                url = os.environ.get("COMFY_INTERNAL_URL", "http://comfyui:8188") + "/view?" + urlencode({
+                    "filename": item["filename"], "subfolder": item.get("subfolder", ""), "type": item.get("type", "output")})
+                with urllib.request.urlopen(url, timeout=60) as response:
+                    data = response.read(32 * 1024 * 1024 + 1)
+                    if len(data) > 32 * 1024 * 1024:
+                        raise ValueError("ComfyUI result exceeds 32 MiB")
+                    return {"prompt_id": ref, "checkpoint": checkpoint}, data, response.headers.get_content_type()
+        time.sleep(3)
+    raise TimeoutError("ComfyUI image job timed out")
+MULTIMODAL_WORKERS
+
+cat > "$INSTALL_DIR/gpu_control/multimodal_service.py" <<'MULTIMODAL_SERVICE'
+#!/usr/bin/env python3
+"""Authenticated-internal HTTP front end and persistent task workers."""
+import base64
+import binascii
+import json
+import os
+import threading
+import time
+import urllib.request
+from pathlib import Path
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+from multimodal_jobs import JobStore, CPU_KINDS, GPU_KINDS
+import multimodal_workers as workers
+
+
+ROOT = os.environ.get("MULTIMODAL_DATA", "/app/data/multimodal")
+STORE = JobStore(ROOT + "/jobs.sqlite3", ROOT + "/artifacts")
+TOKEN = os.environ["MULTIMODAL_INTERNAL_KEY"]
+CONTROLLER = os.environ.get("MULTIMODAL_CONTROLLER", "http://gpu-control:8001")
+ROUTES = {"/v1/documents/parse": "pdf", "/v1/ocr": "ocr",
+          "/v1/audio/transcriptions": "transcription", "/v1/audio/speech": "speech",
+          "/v1/images/generations": "image"}
+
+
+def controller(action, ident):
+    body = json.dumps({"job_id": ident}).encode()
+    request = urllib.request.Request(CONTROLLER + "/multimodal/" + action, data=body,
+                                     headers={"Authorization": "Bearer " + TOKEN,
+                                              "Content-Type": "application/json"})
+    with urllib.request.urlopen(request, timeout=180) as response:
+        return json.load(response)
+
+
+def worker(kinds):
+    while True:
+        job = STORE.claim(kinds)
+        if job is None:
+            time.sleep(1)
+            continue
+        leased = False
+        try:
+            payload = STORE.input(job)
+            kind = job["kind"]
+            if kind == "pdf":
+                STORE.complete(job["id"], workers.pdf(job, payload))
+            elif kind == "ocr":
+                STORE.complete(job["id"], workers.ocr(job, payload))
+            elif kind == "transcription":
+                STORE.complete(job["id"], workers.transcription(job, payload))
+            elif kind == "speech":
+                result, artifact, mime = workers.speech(job)
+                STORE.complete(job["id"], result, artifact, mime)
+            elif kind == "image":
+                STORE.update(job["id"], stage="waiting for GPU")
+                controller("acquire", job["id"])
+                leased = True
+                STORE.update(job["id"], stage="loading ComfyUI")
+                ready_by = time.monotonic() + 300
+                while True:
+                    try:
+                        workers.comfy_request("/system_stats", timeout=5)
+                        break
+                    except Exception:
+                        if time.monotonic() >= ready_by:
+                            raise TimeoutError("ComfyUI did not become ready within five minutes")
+                        time.sleep(5)
+                result, artifact, mime = workers.image(job, STORE.update)
+                STORE.update(job["id"], stage="restoring language model")
+                release = controller("release", job["id"])
+                leased = False
+                restored = release.get("restored")
+                if restored and restored != "media":
+                    ready_by = time.monotonic() + 300
+                    while True:
+                        with urllib.request.urlopen(CONTROLLER + "/workload/status", timeout=10) as response:
+                            state = json.load(response)
+                        if state.get("mode") == restored and state.get("state") == "ready":
+                            break
+                        if time.monotonic() >= ready_by:
+                            raise TimeoutError("Previous language model did not become ready within five minutes")
+                        time.sleep(5)
+                STORE.complete(job["id"], result, artifact, mime)
+        except Exception as exc:
+            STORE.fail(job["id"], str(exc))
+        finally:
+            if leased:
+                try:
+                    controller("release", job["id"])
+                except Exception as exc:
+                    STORE.update(job["id"], stage="completed; previous model restore failed: " + str(exc)[:160])
+
+
+class Handler(BaseHTTPRequestHandler):
+    def reply(self, status, value):
+        raw = json.dumps(value, separators=(",", ":")).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def identity(self):
+        if self.headers.get("X-Internal-Token") != TOKEN:
+            self.reply(403, {"error": {"message": "Internal access only"}})
+            return None
+        owner = self.headers.get("X-AI-Client-ID", "")
+        if not owner or len(owner) > 120:
+            self.reply(400, {"error": {"message": "Missing client identity"}})
+            return None
+        return owner
+
+    def do_POST(self):
+        owner = self.identity()
+        if owner is None:
+            return
+        kind = ROUTES.get(self.path)
+        if not kind:
+            self.reply(404, {"error": {"message": "Unknown task route"}})
+            return
+        length = self.headers.get("Content-Length", "")
+        if not length.isdecimal() or not 1 <= int(length) <= 24 * 1024 * 1024:
+            self.reply(413, {"error": {"message": "Request body must be 1–24 MiB"}})
+            return
+        try:
+            request = json.loads(self.rfile.read(int(length)))
+            if not isinstance(request, dict):
+                raise ValueError("JSON object required")
+            profile_path = Path(ROOT) / "active_profile.json"
+            profile = json.loads(profile_path.read_text()) if profile_path.is_file() else {}
+            if kind == "transcription":
+                request.setdefault("model", profile.get("asr_model", "tiny"))
+            if kind == "image":
+                if not profile.get("image"):
+                    raise ValueError("Load a Creative studio profile before requesting an image")
+                request.setdefault("checkpoint", profile.get("image_checkpoint"))
+                request.setdefault("width", 1024)
+                request.setdefault("height", 1024)
+                request.setdefault("steps", 20)
+            data = request.pop("data", None)
+            if kind in {"pdf", "ocr", "transcription"}:
+                if not isinstance(data, str):
+                    raise ValueError("Base64 data field is required")
+                payload = base64.b64decode(data, validate=True)
+                if not 1 <= len(payload) <= 16 * 1024 * 1024:
+                    raise ValueError("Input must be 1–16 MiB")
+                if kind == "pdf" and not payload.startswith(b"%PDF-"):
+                    raise ValueError("Input is not a PDF")
+            else:
+                payload = b""
+                if data is not None:
+                    raise ValueError("This task does not accept uploaded data")
+            job = STORE.submit(owner, kind, request, payload)
+        except (ValueError, binascii.Error, UnicodeDecodeError) as exc:
+            self.reply(400, {"error": {"message": str(exc)}})
+            return
+        self.reply(202, {"id": job["id"], "status": "queued", "kind": kind,
+                         "status_url": "/v1/jobs/" + job["id"]})
+
+    def do_GET(self):
+        owner = self.identity()
+        if owner is None:
+            return
+        path = self.path.split("?", 1)[0]
+        if path == "/v1/jobs":
+            self.reply(200, {"data": [self.public(job) for job in STORE.list(owner)]})
+            return
+        parts = path.strip("/").split("/")
+        if len(parts) not in (3, 4) or parts[:2] != ["v1", "jobs"]:
+            self.reply(404, {"error": {"message": "Unknown task route"}})
+            return
+        try:
+            job = STORE.get(parts[2], owner)
+        except ValueError:
+            job = None
+        if job is None:
+            self.reply(404, {"error": {"message": "Job not found"}})
+            return
+        if len(parts) == 3:
+            self.reply(200, self.public(job))
+            return
+        if parts[3] != "result" or job["status"] != "completed" or not job["result_name"]:
+            self.reply(404, {"error": {"message": "Result not available"}})
+            return
+        data = STORE.artifact(job)
+        self.send_response(200)
+        self.send_header("Content-Type", job["result_type"] or "application/octet-stream")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        self.wfile.write(data)
+
+    @staticmethod
+    def public(job):
+        return {key: job[key] for key in ("id", "kind", "status", "created_at", "updated_at",
+                                        "started_at", "completed_at", "attempts", "stage", "result", "error")}
+
+
+if __name__ == "__main__":
+    for kinds in (CPU_KINDS, GPU_KINDS):
+        threading.Thread(target=worker, args=(kinds,), daemon=True).start()
+    ThreadingHTTPServer(("0.0.0.0", 8003), Handler).serve_forever()
+MULTIMODAL_SERVICE
+
+cat > "$INSTALL_DIR/gpu_control/multimodal_profiles.py" <<'MULTIMODAL_PROFILES'
+"""Hardware-aware task recipes that preserve the stable text-model API ID."""
+import html
+import json
+from pathlib import Path
+
+from benchmark_views import shell
+
+
+RECIPES = (
+    ("general", "General assistant", "Chat and document analysis", "base"),
+    ("documents", "Document desk", "PDF extraction, OCR, and spoken transcription", "small"),
+    ("creative", "Creative studio", "Text assistance and queued ComfyUI images", "base"),
+    ("audio", "Audio desk", "Speech transcription and speech generation", "small"),
+)
+
+
+def recommend(hardware, modes, media_ready, worker_enabled, checkpoints=(), current=None):
+    """Rank installed text workloads using detected RAM/VRAM; no model download."""
+    vram = (hardware.get("vram_mib") or 0) / 1024
+    ram = hardware.get("ram_gib") or 0
+    modes = set(modes) - {"media"}
+    preferred = ["qwen4b", "deepseek", "cpu-4b", "cpu-tiny", "llm", "gemma4", "huihui"]
+    if vram >= 24 and ram >= 48:
+        preferred = ["qwen4b", "llm", "deepseek", "gemma4", "huihui", "cpu-4b", "cpu-tiny"]
+    elif vram < 12:
+        preferred = ["cpu-4b", "cpu-tiny", "deepseek", "qwen4b", "llm"]
+    chosen = current if current in modes else next((mode for mode in preferred if mode in modes), next(iter(sorted(modes)), None))
+    if chosen is None:
+        return []
+    rows = []
+    for ident, label, use, asr in RECIPES:
+        rows.append({"id": ident, "name": label, "use": use, "text_mode": chosen,
+                     "text_modes": sorted(modes),
+                     "asr_model": asr if ident in ("documents", "audio") else "tiny",
+                     "pdf": worker_enabled, "ocr": worker_enabled, "audio": worker_enabled,
+                     "image": bool(worker_enabled and media_ready and ident == "creative"),
+                     "image_checkpoint": checkpoints[0] if checkpoints and ident == "creative" else None,
+                     "checkpoints": list(checkpoints) if ident == "creative" else [],
+                     "available": bool(worker_enabled and (ident != "creative" or media_ready)),
+                     "reason": ("Ready to configure" if worker_enabled and (ident != "creative" or media_ready) else
+                                "Enable multimodal workers in the installer" if not worker_enabled else
+                                "Install ComfyUI and an SDXL checkpoint to enable images")})
+    return rows
+
+
+def save(path, profile):
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_suffix(".tmp")
+    temporary.write_text(json.dumps(profile, sort_keys=True))
+    temporary.replace(target)
+
+
+def load(path):
+    target = Path(path)
+    return json.loads(target.read_text()) if target.is_file() else None
+
+
+def page(rows, active, hardware, csrf, jobs=()):
+    esc = lambda value: html.escape(str(value), quote=True)
+    cards = []
+    for row in rows:
+        state = "Available" if row["available"] else "Unavailable"
+        checkpoint_choice = (f'<label>Image checkpoint <select name="checkpoint">'
+                             + "".join(f'<option value="{esc(name)}">{esc(name)}</option>' for name in row["checkpoints"])
+                             + '</select></label>' if row["image"] else "")
+        text_choice = (f'<label>Language model <select name="text_mode">' +
+                       "".join(f'<option value="{esc(mode)}"{" selected" if mode == row["text_mode"] else ""}>'
+                               f'{esc(mode)}</option>' for mode in row["text_modes"]) + '</select></label>')
+        button = (f'<form method="post" action="/profiles/apply"><input type="hidden" name="token" value="{esc(csrf)}">'
+                  f'<input type="hidden" name="profile" value="{esc(row["id"])}">{text_choice}{checkpoint_choice}<button type="submit"'
+                  f'{"" if row["available"] else " disabled"}>Load profile</button></form>')
+        cards.append(f'<section class="card"><div class="eyebrow">{esc(state)}</div><h2>{esc(row["name"])}</h2>'
+                     f'<p>{esc(row["use"])}</p><p>Language model: {esc(row["text_mode"])} via '
+                     '<code>local-llm-api</code>. PDF/OCR and audio run as queued CPU work. '
+                     f'Image generation: {"queued on ComfyUI" if row["image"] else "not configured"}. '
+                     f'ASR size: {esc(row["asr_model"])}.</p><p>{esc(row["reason"])}</p>{button}</section>')
+    current = (f'Active profile: {esc(active["name"])}; language model: {esc(active["text_mode"])}.'
+               if active else 'No multimodal profile is active.')
+    body = ('<section class="card"><div class="eyebrow">MULTIMODAL PROFILES</div><h1>Task profiles</h1>'
+            f'<p>{current}</p><p>Detected hardware: {esc(hardware.get("gpu") or "CPU only")}; '
+            f'{esc(hardware.get("ram_gib"))} GiB RAM. Profiles choose installed models and worker settings; '
+            'they do not download a language or image model.</p><p>Clients continue using the same '
+            'OpenAI compatible base URL and <code>local-llm-api</code> for text. '
+            'Document, audio, and image tasks use dedicated paths at that base URL.</p>'
+            '<p><a href="/">Back to switcher</a></p></section>')
+    queue = ('<section class="card"><h2>Recent task jobs</h2><p>Jobs stay in the durable queue across worker restarts. '
+             'Use the authenticated API job URL to retrieve each result.</p><table><thead><tr><th>Started UTC</th>'
+             '<th>Task</th><th>Status</th><th>Stage</th></tr></thead><tbody>' +
+             "".join(f'<tr><td>{esc(item["created_at"])}</td><td>{esc(item["kind"])}</td>'
+                     f'<td>{esc(item["status"])}</td><td>{esc(item["stage"])}</td></tr>' for item in jobs) +
+             '</tbody></table></section>')
+    return shell("Multimodal profiles", body + "".join(cards) + queue)
+MULTIMODAL_PROFILES
+
 cat > "$INSTALL_DIR/gpu_control/update-engine.sh" <<'ENGINE_UPDATE_SCRIPT'
 #!/bin/sh
 # Run only inside the fixed-action Docker CLI helper created by gpu-control.
@@ -7242,6 +8055,10 @@ IFS=, read -ra models <<< "$selected"
 sudo docker ps -q --filter label=local-ai.model-manager=1 | xargs -r sudo docker stop
 compose "${all_profiles[@]}" stop "${all_services[@]}"
 compose up -d
+if grep -qx 'AI_MULTIMODAL_ENABLED=1' .env; then
+  compose --profile multimodal build multimodal
+  compose --profile multimodal up -d --no-deps multimodal
+fi
 for model in "${models[@]}"; do
   service_for "$model"
   if [[ $model == media ]]; then

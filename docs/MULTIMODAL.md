@@ -1,0 +1,39 @@
+# Multimodal task profiles
+
+The switcher can run a language model and CPU document/audio workers together. Image jobs temporarily reserve the GPU for ComfyUI, then restore the prior language model. Text clients keep using the same `/v1` base URL and the `local-llm-api` model ID. During an image job, text requests may receive a temporary backend-unavailable response until the language model is ready again.
+
+## Install and configure
+
+Run the standalone installer and answer **yes** to the multimodal worker prompt, or set `AI_MULTIMODAL_ENABLED=1` before running it. The installer builds a CPU worker with Poppler, Tesseract, FFmpeg, eSpeak NG, and faster-whisper. It does not download language, image, or speech-recognition model weights by default. The first transcription request downloads the explicitly selected Whisper size (`tiny`, `base`, or `small`) into `~/ai_setup/gpu_control/results/multimodal/asr-models`.
+
+For images, also select the ComfyUI workload during installation and install an SDXL-compatible `.safetensors` checkpoint through **Find models** or place one in the ComfyUI `models/checkpoints` directory. The bundled ComfyUI image currently requires an NVIDIA GPU; document and audio workers also work on CPU-only, AMD, and Intel systems. Only SDXL-style checkpoints work with the built-in image workflow. Other ComfyUI workflows remain available in the separate ComfyUI interface.
+
+Open **Task profiles** in the switcher. The page detects installed workloads, RAM, GPU type, and image checkpoints, then recommends a general, document, creative, or audio recipe. **Load profile** starts its text model and saves the recipe. The creative recipe selects an installed image checkpoint and queues ComfyUI only when an image request arrives. Profiles do not install missing language or image weights.
+
+## Task API
+
+Use the same authenticated API origin as `/v1/chat/completions`. The task endpoints are asynchronous: `POST` returns HTTP 202 with a job ID and status URL. Poll `GET /v1/jobs/<id>`; completed JSON results appear in `result`. Binary images/audio are at `GET /v1/jobs/<id>/result`. `GET /v1/jobs` lists the current API key's recent jobs. Keys cannot read each other's jobs. Requests remain subject to gateway key authentication and admission limits. The request body limit is 24 MiB, with decoded uploads limited to 16 MiB.
+
+| Task | POST path | JSON body |
+| --- | --- | --- |
+| PDF text and optional OCR | `/v1/documents/parse` | `{"data":"<base64 PDF>","ocr":true}` |
+| Image OCR | `/v1/ocr` | `{"data":"<base64 image>","language":"eng"}` |
+| Speech transcription | `/v1/audio/transcriptions` | `{"data":"<base64 audio>","model":"tiny"}` |
+| Speech generation | `/v1/audio/speech` | `{"input":"Hello","voice":"en"}` |
+| Image generation | `/v1/images/generations` | `{"prompt":"A red bicycle","width":1024,"height":1024,"steps":20}` |
+
+The image route uses the active Creative studio profile's checkpoint unless `checkpoint` is specified. These job routes are switcher-specific; `/v1/images/generations` does **not** return the synchronous OpenAI Images API response. The text chat/responses routes retain their existing OpenAI-compatible behavior and `local-llm-api` alias.
+
+Example (substitute the local API address and key):
+
+```bash
+curl -sS -H "Authorization: Bearer $AI_KEY" -H 'Content-Type: application/json' \
+  -d '{"input":"Hello from the switcher","voice":"en"}' \
+  http://YOUR_HOST:8080/v1/audio/speech
+curl -sS -H "Authorization: Bearer $AI_KEY" \
+  http://YOUR_HOST:8080/v1/jobs/JOB_ID
+curl -sS -H "Authorization: Bearer $AI_KEY" \
+  http://YOUR_HOST:8080/v1/jobs/JOB_ID/result -o speech.wav
+```
+
+Jobs and artifacts persist under `~/ai_setup/gpu_control/results/multimodal` (or the installation directory configured with `AI_SETUP_DIR`). The worker requeues unfinished jobs when it starts; an interrupted job may run again. A PDF is limited to 20 pages. ComfyUI image jobs are serialized; CPU jobs run separately. Jobs currently have no automatic artifact retention policy, so include this directory in backups and remove old artifacts during maintenance.

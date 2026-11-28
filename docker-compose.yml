@@ -446,6 +446,32 @@ services:
     read_only: true
     depends_on: [gpu-control]
     networks: [ai_internal, control_internal]
+  multimodal:
+    profiles: [multimodal]
+    build:
+      context: ./multimodal
+    image: local-ai/multimodal:1
+    restart: unless-stopped
+    environment:
+      MULTIMODAL_INTERNAL_KEY: ${AI_API_KEY:?set AI_API_KEY in .env}
+      MULTIMODAL_DATA: /app/data/multimodal
+      COMFY_MODEL_DIR: /app/media_models
+      ASR_MODEL_DIR: /app/data/multimodal/asr-models
+      HF_HOME: /app/data/multimodal/hf-cache
+      XDG_CACHE_HOME: /app/data/multimodal/cache
+      HOME: /tmp
+      HF_HUB_DISABLE_XET: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+    volumes:
+      - ./gpu_control/multimodal_service.py:/app/multimodal_service.py:ro
+      - ./gpu_control/multimodal_jobs.py:/app/multimodal_jobs.py:ro
+      - ./gpu_control/multimodal_workers.py:/app/multimodal_workers.py:ro
+      - ./gpu_control/results:/app/data
+      - ${AI_MEDIA_DIR:?set AI_MEDIA_DIR in .env}/models:/app/media_models:ro
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,size=512m
+    networks: [ai_internal, control_internal]
   gpu-control:
     image: python:3.12-alpine
     restart: unless-stopped
@@ -459,6 +485,7 @@ services:
       BENCHMARK_COMFY_PASSWORD: ${AI_SWITCH_PASSWORD:?set AI_SWITCH_PASSWORD in .env}
       AI_SELECTED_MODELS: ${AI_SELECTED_MODELS:-}
       AI_GPU_COMPATIBLE: ${AI_GPU_COMPATIBLE:-1}
+      AI_MULTIMODAL_ENABLED: ${AI_MULTIMODAL_ENABLED:-0}
       BENCHMARK_DB: /app/data/benchmarks.sqlite3
       MODEL_HOST_DIR: ${AI_MODEL_CACHE:?set AI_MODEL_CACHE in .env}/gguf
       MODEL_DIR: /app/models
@@ -482,6 +509,7 @@ services:
       - ./gpu_control/webui_updates.py:/app/webui_updates.py:ro
       - ./gpu_control/context_tuning.py:/app/context_tuning.py:ro
       - ./gpu_control/media_catalog.py:/app/media_catalog.py:ro
+      - ./gpu_control/multimodal_profiles.py:/app/multimodal_profiles.py:ro
       - ./gpu_control/sharing.py:/app/sharing.py:ro
       - ./gpu_control/sharing_views.py:/app/sharing_views.py:ro
       - ./gpu_control/gpu_metrics.py:/app/gpu_metrics.py:ro

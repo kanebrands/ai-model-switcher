@@ -5,6 +5,7 @@ import http.client
 import datetime as dt
 import json
 import os
+from pathlib import Path
 import re
 import socket
 import sqlite3
@@ -27,6 +28,22 @@ from parallel_tuning import ParallelTuner
 import sharing_views
 import model_views
 import harness_views
+import multimodal_profiles
+
+PROFILE_PATH = "/app/data/multimodal/active_profile.json"
+
+
+def profile_recommendations():
+    hardware = MODEL_MANAGER.hardware()
+    available = {mode for mode, (_, container) in MODELS.items()
+                 if mode != "media" and workload_state(container) != "not created"}
+    checkpoints = sorted(path.name for path in (Path("/app/media_models") / "checkpoints").glob("*.safetensors"))
+    media_ready = (hardware.get("gpu_provider") == "nvidia" and
+                   workload_state(MEDIA) != "not created" and bool(checkpoints))
+    rows = multimodal_profiles.recommend(hardware, available, media_ready,
+                                         os.environ.get("AI_MULTIMODAL_ENABLED") == "1", checkpoints,
+                                         active_mode())
+    return hardware, rows
 
 
 def usage_window(query, prefix=""):
@@ -57,8 +74,13 @@ COMFY_URL = os.environ["COMFY_URL"]
 PUBLIC_API_URL = os.environ.get("PUBLIC_API_URL", ORIGIN.rsplit(":", 1)[0] + ":8080/v1")
 CSRF = os.environ["CONTROL_CSRF_TOKEN"]
 SELECTED_MODES = {value for value in os.environ.get("AI_SELECTED_MODELS", "").split(",") if value}
-LOCK = threading.Lock()
+LOCK = threading.RLock()
 LAST_SWITCH_MODE = None
+MEDIA_LEASE_PATH = Path("/app/data/multimodal/gpu_lease.json")
+try:
+    MEDIA_LEASE = json.loads(MEDIA_LEASE_PATH.read_text())
+except (OSError, ValueError):
+    MEDIA_LEASE = None
 BUILTIN_LABELS = {
     "cpu-tiny": "Qwen3 0.6B Q8 CPU (local-cpu-tiny)",
     "cpu-4b": "Qwen3 4B Q4 CPU (local-cpu-4b)",
@@ -121,7 +143,7 @@ def workload_state(name):
     return status
 
 
-def switch(target):
+def switch(target, internal=False):
     global LAST_SWITCH_MODE
     workloads = {mode: container for mode, (_, container) in MODELS.items()}
     if target not in workloads:
@@ -133,6 +155,8 @@ def switch(target):
     if ENGINE_UPDATES.busy or CONTEXT_TUNER.busy or PARALLEL_TUNER.busy or MODEL_MANAGER.busy:
         raise RuntimeError("Wait for the model operation or context change to finish before switching models")
     with LOCK:
+        if MEDIA_LEASE and not internal:
+            raise RuntimeError("An image job is using the GPU; wait for it to finish")
         LAST_SWITCH_MODE = target
         start_name = workloads[target]
         backup = MODEL_MANAGER.ensure_current_engine(target)
@@ -173,6 +197,45 @@ PARALLEL_TUNER = ParallelTuner(BENCHMARKS.path, MODEL_MANAGER, os.environ["BENCH
 def active_mode():
     active = [mode for mode, (_, container) in MODELS.items() if running(container)]
     return active[0] if len(active) == 1 else None
+
+
+def media_lease(action, job_id):
+    """Reserve the sole GPU for one ComfyUI job and restore its prior model."""
+    global MEDIA_LEASE
+    with LOCK:
+        if action == "acquire":
+            if MEDIA_LEASE:
+                if MEDIA_LEASE["job_id"] == job_id:
+                    if active_mode() != "media":
+                        switch("media", internal=True)
+                    return {"state": "leased", "previous": MEDIA_LEASE["previous"]}
+                raise RuntimeError("The GPU is reserved for another image job")
+            if workload_state(MEDIA) == "not created":
+                raise ValueError("ComfyUI is not installed; select it in the installer")
+            previous = active_mode()
+            MEDIA_LEASE = {"job_id": job_id, "previous": previous}
+            MEDIA_LEASE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            MEDIA_LEASE_PATH.write_text(json.dumps(MEDIA_LEASE))
+            try:
+                if previous != "media":
+                    switch("media", internal=True)
+            except Exception:
+                MEDIA_LEASE = None
+                MEDIA_LEASE_PATH.unlink(missing_ok=True)
+                raise
+            return {"state": "leased", "previous": previous}
+        if action == "release":
+            if not MEDIA_LEASE or MEDIA_LEASE["job_id"] != job_id:
+                raise ValueError("Image job does not own the GPU lease")
+            previous = MEDIA_LEASE["previous"]
+            if previous and previous != "media":
+                switch(previous, internal=True)
+            elif previous is None and running(MEDIA):
+                docker("POST", f"/containers/{MEDIA}/stop?t=30")
+            MEDIA_LEASE = None
+            MEDIA_LEASE_PATH.unlink(missing_ok=True)
+            return {"state": "released", "restored": previous}
+        raise ValueError("Unknown GPU lease action")
 
 
 def workload_snapshot():
@@ -421,7 +484,7 @@ class Handler(BaseHTTPRequestHandler):
         home_style += ".api-connection{display:grid;grid-template-columns:minmax(0,12rem) minmax(0,1fr);gap:1rem;align-items:start}.api-connection label{min-width:0;margin:0}.api-connection input[type=text]{width:100%;max-width:none}.api-port{display:block;color:#e8ba78;font-size:.78rem;font-weight:700}@media(max-width:680px){.api-connection{grid-template-columns:1fr}}"
         page = f"""<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>AI Model Switcher</title><style>{benchmark_views.STYLE}{home_style}{sharing_views.USAGE_STYLE}</style>
-<main><nav aria-label="Main navigation"><a href="/">AI Model Switcher</a><a href="/models">Find models</a><a href="/benchmarks">Benchmarks</a><a href="/sharing">Client sharing</a><a href="/harnesses">Coding harnesses</a></nav>
+<main><nav aria-label="Main navigation"><a href="/">AI Model Switcher</a><a href="/models">Find models</a><a href="/benchmarks">Benchmarks</a><a href="/profiles">Task profiles</a><a href="/sharing">Client sharing</a><a href="/harnesses">Coding harnesses</a></nav>
 <header class="hero"><div class="hero-copy"><div class="eyebrow">Local AI / Control desk</div><h1>AI Model Switcher</h1><p>Manage local workloads and model context from one place.</p><div class="active-line"><span class="active-caption">Active workload</span><span class="active-badge {'is-ready' if snapshot['state'] == 'ready' else 'is-failed' if snapshot['state'] == 'failed' else ''}" data-workload-badge>{h(badge_label)}</span><strong data-workload-label>{h(mode)}</strong></div><p class="active-detail" role="status" data-workload-detail>{h(snapshot['detail'])}</p><div class="api-connection"><label>Stable API model ID<input type="text" readonly value="local-llm-api" data-copy-field aria-label="Copyable stable API model ID"></label><label>OpenAI API base URL<input type="text" class="api-base" readonly value="{h(PUBLIC_API_URL)}" data-copy-field aria-label="Copyable OpenAI API base URL">{api_port_note}</label></div><p class="api-note">Use <code>local-llm-api</code> as the model in your harness to reach the currently loaded language model. Wait for “Ready to use” before sending requests.</p></div></header>
 <script src="/assets/operation_poll.js?v=workload-status-1" defer></script>
 {'<p class="message" role="status" data-operation-monitor="/operations/status?scope=home">Checking operation status…</p>' if context_status['busy'] or webui_status['checking'] or webui_status['busy'] else ''}
@@ -438,7 +501,7 @@ class Handler(BaseHTTPRequestHandler):
 <h2>Service status</h2><div class="services">{status_cards}</div><p><a href="/">Refresh status</a></p>
 {gpu_card}
 <p class="note">If a service fails, check ai-control.sh huihui-logs or media-logs. If Open WebUI still shows local-coder after switching, set its connection URL to http://nginx:8080/v1 in Admin → Settings → Connections.</p>
-<div class="home-footer"><a href="/models">Find models</a><a href="/benchmarks">Benchmarks and results</a><a href="/sharing">Client sharing and rate limits</a><a href="/harnesses">Coding harnesses</a><a href="{h(WEB_URL)}">Open WebUI</a>{f'<a href="{h(COMFY_URL)}">ComfyUI</a>' if available_builtin('media') else ''}</div></main></html>"""
+<div class="home-footer"><a href="/models">Find models</a><a href="/benchmarks">Benchmarks and results</a><a href="/profiles">Task profiles</a><a href="/sharing">Client sharing and rate limits</a><a href="/harnesses">Coding harnesses</a><a href="{h(WEB_URL)}">Open WebUI</a>{f'<a href="{h(COMFY_URL)}">ComfyUI</a>' if available_builtin('media') else ''}</div></main></html>"""
         data = page.encode()
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -451,6 +514,24 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = urllib.parse.urlsplit(self.path)
+        if path.path == "/profiles":
+            try:
+                hardware, rows = profile_recommendations()
+                active = multimodal_profiles.load(PROFILE_PATH)
+                db_path = Path("/app/data/multimodal/jobs.sqlite3")
+                jobs = []
+                if db_path.is_file():
+                    db = sqlite3.connect(db_path)
+                    try:
+                        db.row_factory = sqlite3.Row
+                        jobs = db.execute("SELECT kind,status,stage,created_at FROM jobs ORDER BY rowid DESC LIMIT 20").fetchall()
+                    finally:
+                        db.close()
+            except Exception as exc:
+                self.send_error(503, "Could not read profile recommendations: " + str(exc))
+                return
+            self._send_html(multimodal_profiles.page(rows, active, hardware, CSRF, jobs))
+            return
         if path.path == "/assets/operation_poll.js":
             try:
                 with open("/app/operation_poll.js", "rb") as script:
@@ -739,7 +820,31 @@ class Handler(BaseHTTPRequestHandler):
         self._page()
 
     def do_POST(self):
-        if self.path not in ("/switch", "/benchmark", "/context/tune", "/benchmarks/delete", "/models/install", "/models/uninstall", "/models/rename",
+        if self.path in ("/multimodal/acquire", "/multimodal/release"):
+            if self.headers.get("Authorization") != "Bearer " + os.environ["BENCHMARK_API_KEY"]:
+                self.send_error(403)
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if not 1 <= length <= 128 or self.headers.get("Content-Type") != "application/json":
+                    raise ValueError("Invalid lease request")
+                job_id = json.loads(self.rfile.read(length))["job_id"]
+                uuid.UUID(job_id)
+                result = media_lease(self.path.rsplit("/", 1)[1], job_id)
+            except (ValueError, KeyError, TypeError) as exc:
+                self.send_error(400, str(exc))
+                return
+            except RuntimeError as exc:
+                self.send_error(409, str(exc))
+                return
+            data = json.dumps(result).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
+        if self.path not in ("/switch", "/benchmark", "/context/tune", "/benchmarks/delete", "/profiles/apply", "/models/install", "/models/uninstall", "/models/rename",
                              "/models/media/install", "/models/refresh", "/models/search", "/models/hardware/rescan", "/models/discovered/install", "/models/hybrid", "/models/hybrid/apply",
                              "/models/engine/check", "/models/engine/update", "/webui/update", "/webui/update/dismiss",
                              "/sharing/save", "/sharing/reset", "/sharing/client", "/sharing/revoke",
@@ -760,6 +865,49 @@ class Handler(BaseHTTPRequestHandler):
         fields = urllib.parse.parse_qs(self.rfile.read(length).decode("utf-8"), strict_parsing=True)
         if fields.get("token") != [CSRF]:
             self.send_error(403, "Invalid request")
+            return
+        if self.path == "/profiles/apply":
+            ident = fields.get("profile", [])
+            if len(ident) != 1:
+                self.send_error(400, "Select one profile")
+                return
+            try:
+                _, rows = profile_recommendations()
+                selected = next((row for row in rows if row["id"] == ident[0] and row["available"]), None)
+                if selected is None:
+                    raise ValueError("This profile is unavailable on the detected system")
+                selected = dict(selected)
+                text_modes = fields.get("text_mode", [])
+                if len(text_modes) != 1 or text_modes[0] not in selected["text_modes"]:
+                    raise ValueError("Select an installed language model")
+                selected["text_mode"] = text_modes[0]
+                if selected["image"]:
+                    checkpoint = fields.get("checkpoint", [])
+                    if len(checkpoint) != 1 or checkpoint[0] not in selected["checkpoints"]:
+                        raise ValueError("Select an installed image checkpoint")
+                    selected["image_checkpoint"] = checkpoint[0]
+                previous = active_mode()
+                old_profile = multimodal_profiles.load(PROFILE_PATH)
+                if previous != selected["text_mode"]:
+                    switch(selected["text_mode"])
+                try:
+                    multimodal_profiles.save(PROFILE_PATH, selected)
+                except Exception:
+                    if previous and previous != selected["text_mode"]:
+                        switch(previous)
+                    if old_profile:
+                        multimodal_profiles.save(PROFILE_PATH, old_profile)
+                    raise
+            except ValueError as exc:
+                self.send_error(400, str(exc))
+                return
+            except Exception as exc:
+                self.send_error(409, "Profile activation failed; previous configuration restored: " + str(exc))
+                return
+            self.send_response(303)
+            self.send_header("Location", "/profiles")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
             return
         if self.path == "/models/uninstall":
             candidate = fields.get("candidate", [])

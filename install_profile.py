@@ -89,9 +89,17 @@ def main():
     except ValueError as exc:
         raise SystemExit(str(exc)) from None
     first = next(item for item in chosen if item != "media")
-    update_env(env_path, {"AI_SELECTED_MODELS": ",".join(chosen), "AI_START_MODEL": first})
+    multimodal = os.environ.get("AI_MULTIMODAL_ENABLED", existing.get("AI_MULTIMODAL_ENABLED"))
+    if multimodal not in ("0", "1", None):
+        raise SystemExit("AI_MULTIMODAL_ENABLED must be 0 or 1")
+    if multimodal is None and sys.stdin.isatty():
+        answer = input("Install document, OCR, audio, and image job workers? [y/N]: ").strip().lower()
+        multimodal = "1" if answer in ("y", "yes") else "0"
+    update_env(env_path, {"AI_SELECTED_MODELS": ",".join(chosen), "AI_START_MODEL": first,
+                          "AI_MULTIMODAL_ENABLED": multimodal or "0"})
     print("Selected:", ", ".join(chosen))
     print("Initial workload:", first)
+    print("Multimodal workers:", "enabled" if multimodal == "1" else "disabled")
 
 
 if __name__ == "__main__":

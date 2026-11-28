@@ -22,6 +22,14 @@ HOP_HEADERS = {"connection", "keep-alive", "proxy-authenticate", "proxy-authoriz
                "te", "trailer", "transfer-encoding", "upgrade"}
 BACKEND = re.compile(r"[a-z0-9-]+:(?:8000|8080)\Z")
 STABLE_MODEL_ID = "local-llm-api"
+MEDIA_POST_ROUTES = {"/v1/documents/parse", "/v1/ocr", "/v1/audio/transcriptions",
+                     "/v1/audio/speech", "/v1/images/generations"}
+
+
+def is_media_route(path, method):
+    route = path.split("?", 1)[0]
+    return (method == "POST" and route in MEDIA_POST_ROUTES or
+            method == "GET" and (route == "/v1/jobs" or route.startswith("/v1/jobs/")))
 
 
 def resolve_model_alias(raw, content_type, model_id):
@@ -256,7 +264,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
             self.reply(411, "Content-Length is required")
             return
         length = int(length)
-        if length > policy["max_request_kib"] * 1024:
+        media = is_media_route(self.path, self.command)
+        if length > (24 * 1024 * 1024 if media else policy["max_request_kib"] * 1024):
             self.reply(413, "Request exceeds the configured size limit")
             return
         raw = self.rfile.read(length) if length else b""
@@ -279,7 +288,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
         started_clock = time.monotonic()
         try:
             path = self.path
-            if path.startswith("/vision/v1/"):
+            if media:
+                target = "multimodal:8003"
+                model_id = None
+            elif path.startswith("/vision/v1/"):
                 target = "vision:8000"
                 model_id = "local-vision"
                 path = path[len("/vision"):]
@@ -288,15 +300,19 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 with urllib.request.urlopen(request, timeout=10) as routing:
                     target = routing.headers.get("X-LLM-Backend", "")
                     model_id = routing.headers.get("X-LLM-Model", "")
-            if not BACKEND.fullmatch(target):
+            if not media and not BACKEND.fullmatch(target):
                 raise RuntimeError("No active model backend")
-            if self.command == "POST":
+            if self.command == "POST" and not media:
                 raw = resolve_model_alias(raw, self.headers.get("Content-Type", ""), model_id)
             host, port = target.rsplit(":", 1)
             upstream = http.client.HTTPConnection(host, int(port), timeout=600)
             headers = {key: value for key, value in self.headers.items()
                        if key.lower() not in HOP_HEADERS | {"authorization", "host", "content-length"}}
-            headers["Authorization"] = "Bearer " + LEGACY_KEY
+            if media:
+                headers["X-Internal-Token"] = LEGACY_KEY
+                headers["X-AI-Client-ID"] = client_id
+            else:
+                headers["Authorization"] = "Bearer " + LEGACY_KEY
             headers["Host"] = target
             headers["Accept-Encoding"] = "identity"
             headers["Content-Length"] = str(len(raw))
