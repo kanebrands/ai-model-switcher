@@ -8,7 +8,7 @@ Run the standalone installer and answer **yes** to the multimodal worker prompt,
 
 For images, also select the ComfyUI workload during installation and install an SDXL-compatible `.safetensors` checkpoint through **Find models** or place one in the ComfyUI `models/checkpoints` directory. Object removal additionally needs an inpainting checkpoint in that directory (a filename containing `inpaint`). The bundled ComfyUI image currently requires an NVIDIA GPU; document and audio workers also work on CPU-only, AMD, and Intel systems. Only SDXL-style checkpoints work with the built-in text-to-image workflow. Other ComfyUI workflows remain available in the separate ComfyUI interface.
 
-Open **Task profiles** in the switcher. The page detects installed workloads, RAM, GPU type, and image checkpoints, then recommends a general, document, creative, or audio recipe. **Load profile** starts its text model and saves the recipe. The creative recipe selects an installed image checkpoint and queues ComfyUI only when an image request arrives. Profiles do not install missing language or image weights.
+Open **Task profiles** in the switcher. The page detects installed workloads, RAM, GPU type, image checkpoints, and complete supported video bundles, then recommends general, document, creative, video, or audio recipes. **Load profile** starts its text model and saves the recipe. Creative studio selects installed image and inpainting checkpoints. Video studio selects an installed Wan 2.1 T2V 1.3B bundle. ComfyUI is queued only when an image or video request arrives. Profiles do not install missing weights. Install the complete Wan 2.1 T2V 1.3B bundle from **Find models** to enable Video studio. Other catalog video models remain available for manual workflows in ComfyUI; this job adapter currently supports only Wan 2.1 T2V 1.3B.
 
 ## Task API
 
@@ -22,8 +22,11 @@ Use the same authenticated API origin as `/v1/chat/completions`. The task endpoi
 | Speech generation | `/v1/audio/speech` | `{"input":"Hello","voice":"en"}` |
 | Image generation | `/v1/images/generations` | `{"prompt":"A red bicycle","width":1024,"height":1024,"steps":20}` |
 | Object removal | `/v1/images/edits` | `{"data":"<base64 JPEG/PNG/WebP>","prompt":"Remove the trash can from the attached image"}` |
+| Text-to-video | `/v1/videos/generations` | `{"prompt":"A fox running through snow","width":512,"height":512,"frames":33,"fps":16,"steps":30}` |
 
 The image route uses the active Creative studio profile's checkpoint unless `checkpoint` is specified. These job routes are switcher-specific; `/v1/images/generations` does **not** return the synchronous OpenAI Images API response. The text chat/responses routes retain their existing OpenAI-compatible behavior and `local-llm-api` alias.
+
+The video route requires the active Video studio profile. It produces a short silent WebM clip from the installed Wan 2.1 T2V 1.3B model. Defaults are 512×512, 33 frames, 16 fps, and 30 sampling steps (about two seconds). Supported sizes are 512×512 and 832×480; frame counts are 17, 33, 49, or 81; rates are 8, 16, or 24 fps. Render time and available memory depend on the host. Download the completed clip from the job result URL. This route does not yet support image-to-video, audio, or 30-second generation.
 
 The **Image editor** page at `/image-edit` accepts a photo and instruction through the switcher's Basic Auth UI and polls progress without refreshing the page. The API route accepts the same two inputs as JSON. The first object-removal request downloads Grounding DINO Tiny and SAM ViT Base into the persistent model cache. It then detects the named object, segments it, runs the installed inpainting checkpoint in ComfyUI, and composites only the edited region into a PNG at the original dimensions. If detection finds no confident match or several similar matches, the job fails without changing the image; clients can retry with an explicit `target` and `[x1,y1,x2,y2]` `box` in source-image pixels. This automatic workflow is intended for a single named object and may require manual ComfyUI editing for difficult scenes.
 

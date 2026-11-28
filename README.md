@@ -1,6 +1,6 @@
 # AI Model Switcher
 
-The optional [multimodal task profiles](docs/MULTIMODAL.md) add persistent PDF/OCR, audio, and ComfyUI image jobs behind the same authenticated API origin. The [Image editor](docs/MULTIMODAL.md#task-api) can remove a named object from an uploaded photo. Text clients continue to use `local-llm-api`.
+The optional [multimodal task profiles](docs/MULTIMODAL.md) add persistent PDF/OCR, audio, ComfyUI image, and short Wan 2.1 video jobs behind the same authenticated API origin. The [Image editor](docs/MULTIMODAL.md#task-api) can remove a named object from an uploaded photo. Text clients continue to use `local-llm-api`.
 
 An all-in-one Ubuntu 24.04 installation for local AI. It runs an OpenAI-compatible LLM API, Open WebUI, and a browser-based model switcher behind Nginx. On compatible NVIDIA hardware, selected GPU models and ComfyUI are available too. The switcher manages model selection, hardware-aware recommendations, benchmark history, context and generation-slot tuning, client limits, and live GPU metrics when a GPU is available.
 

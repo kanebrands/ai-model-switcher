@@ -928,7 +928,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from benchmarks import BenchmarkManager, MODELS
 import benchmark_views
 from model_catalog import BY_ID, ModelManager, model_display_name
-from media_catalog import MediaManager
+from media_catalog import MediaManager, MEDIA_BY_ID
 from catalog_discovery import CatalogDiscovery
 from engine_updates import EngineUpdates
 from context_tuning import ContextTuner, context_presets
@@ -951,10 +951,14 @@ def profile_recommendations():
                  if mode != "media" and workload_state(container) != "not created"}
     checkpoints = sorted(path.name for path in (Path("/app/media_models") / "checkpoints").glob("*.safetensors"))
     media_ready = (hardware.get("gpu_provider") == "nvidia" and
-                   workload_state(MEDIA) != "not created" and bool(checkpoints))
+                   workload_state(MEDIA) != "not created")
+    video_bundle = MEDIA_BY_ID["wan21-1b"]
+    video_bundles = ([video_bundle["id"]] if media_ready and all(
+        (Path("/app/media_models") / destination).is_file()
+        for _, _, destination in video_bundle["files"]) else [])
     rows = multimodal_profiles.recommend(hardware, available, media_ready,
                                          os.environ.get("AI_MULTIMODAL_ENABLED") == "1", checkpoints,
-                                         active_mode())
+                                         active_mode(), video_bundles)
     return hardware, rows
 
 
@@ -1936,6 +1940,11 @@ class Handler(BaseHTTPRequestHandler):
                         if len(edit_checkpoint) != 1 or edit_checkpoint[0] not in selected["image_edit_checkpoints"]:
                             raise ValueError("Select an installed inpainting checkpoint")
                         selected["image_edit_checkpoint"] = edit_checkpoint[0]
+                if selected["video"]:
+                    video_model = fields.get("video_model", [])
+                    if len(video_model) != 1 or video_model[0] not in selected["video_models"]:
+                        raise ValueError("Select an installed video model")
+                    selected["video_model"] = video_model[0]
                 previous = active_mode()
                 old_profile = multimodal_profiles.load(PROFILE_PATH)
                 if previous != selected["text_mode"]:
@@ -5910,7 +5919,8 @@ HOP_HEADERS = {"connection", "keep-alive", "proxy-authenticate", "proxy-authoriz
 BACKEND = re.compile(r"[a-z0-9-]+:(?:8000|8080)\Z")
 STABLE_MODEL_ID = "local-llm-api"
 MEDIA_POST_ROUTES = {"/v1/documents/parse", "/v1/ocr", "/v1/audio/transcriptions",
-                     "/v1/audio/speech", "/v1/images/generations", "/v1/images/edits"}
+                     "/v1/audio/speech", "/v1/images/generations", "/v1/images/edits",
+                     "/v1/videos/generations"}
 
 
 def is_media_route(path, method):
@@ -7263,7 +7273,7 @@ import uuid
 
 
 CPU_KINDS = frozenset({"pdf", "ocr", "transcription", "speech"})
-GPU_KINDS = frozenset({"image", "image_edit"})
+GPU_KINDS = frozenset({"image", "image_edit", "video"})
 KINDS = CPU_KINDS | GPU_KINDS
 
 
@@ -7525,32 +7535,81 @@ def image(job, update):
     return {**result, "checkpoint": checkpoint}, data, mime
 
 
-def render_workflow(job, workflow, update, output_node="10"):
+def wan21_workflow(prompt, width, height, frames, fps, steps):
+    return {
+        "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "wan2.1_t2v_1.3B_fp16.safetensors", "weight_dtype": "default"}},
+        "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": "umt5_xxl_fp8_e4m3fn_scaled.safetensors", "type": "wan", "device": "default"}},
+        "3": {"class_type": "VAELoader", "inputs": {"vae_name": "wan_2.1_vae.safetensors"}},
+        "4": {"class_type": "CLIPTextEncode", "inputs": {"text": prompt, "clip": ["2", 0]}},
+        "5": {"class_type": "CLIPTextEncode", "inputs": {"text": "blurry, static, low quality, distorted", "clip": ["2", 0]}},
+        "6": {"class_type": "EmptyHunyuanLatentVideo", "inputs": {"width": width, "height": height, "length": frames, "batch_size": 1}},
+        "7": {"class_type": "ModelSamplingSD3", "inputs": {"model": ["1", 0], "shift": 8}},
+        "8": {"class_type": "KSampler", "inputs": {"seed": int(time.time_ns() % (2**53)), "steps": steps,
+                "cfg": 6, "sampler_name": "uni_pc", "scheduler": "simple", "denoise": 1,
+                "model": ["7", 0], "positive": ["4", 0], "negative": ["5", 0], "latent_image": ["6", 0]}},
+        "9": {"class_type": "VAEDecode", "inputs": {"samples": ["8", 0], "vae": ["3", 0]}},
+        "10": {"class_type": "SaveWEBM", "inputs": {"images": ["9", 0],
+                 "filename_prefix": "ai-switcher-video", "codec": "vp9", "fps": fps, "crf": 32}},
+    }
+
+
+def video(job, update):
+    request = job["request"]
+    prompt = request.get("prompt")
+    if not isinstance(prompt, str) or not 1 <= len(prompt) <= 4000:
+        raise ValueError("Video prompt must have 1–4000 characters")
+    if request.get("model") != "wan21-1b":
+        raise ValueError("This video route supports the Wan 2.1 T2V 1.3B bundle")
+    width, height, frames, fps, steps = (request.get(key) for key in
+                                        ("width", "height", "frames", "fps", "steps"))
+    if (any(type(value) is not int for value in (width, height, frames, fps, steps)) or
+            (width, height) not in ((512, 512), (832, 480)) or
+            frames not in (17, 33, 49, 81) or fps not in (8, 16, 24) or
+            not 1 <= steps <= 50):
+        raise ValueError("Choose 512x512 or 832x480, 17/33/49/81 frames, 8/16/24 fps, and 1–50 steps")
+    model_dir = Path(os.environ.get("COMFY_MODEL_DIR", "/app/media_models"))
+    files = ("diffusion_models/wan2.1_t2v_1.3B_fp16.safetensors",
+             "text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors", "vae/wan_2.1_vae.safetensors")
+    if not all((model_dir / name).is_file() for name in files):
+        raise ValueError("Install the complete Wan 2.1 T2V 1.3B bundle in ComfyUI")
+    result, data, mime = render_workflow(job, wan21_workflow(prompt, width, height, frames, fps, steps),
+                                         update, output_extension=".webm", timeout=3600, size_limit=128 * 1024 * 1024)
+    return {**result, "model": "wan21-1b", "frames": frames, "fps": fps,
+            "width": width, "height": height}, data, mime
+
+
+def render_workflow(job, workflow, update, output_node="10", output_extension=None,
+                    timeout=900, size_limit=32 * 1024 * 1024):
     reply = comfy_request("/prompt", {"prompt": workflow, "client_id": job["id"]})
     ref = reply.get("prompt_id")
     if not ref:
         raise RuntimeError("ComfyUI rejected the workflow")
     update(job["id"], backend_ref=ref, stage="rendering in ComfyUI")
-    deadline = time.monotonic() + 900
+    deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         history = comfy_request("/history/" + ref).get(ref)
         if history:
             if history.get("status", {}).get("status_str") == "error":
                 raise RuntimeError("ComfyUI workflow failed")
             outputs = history.get("outputs", {})
-            images = outputs.get(output_node, {}).get("images", [])
-            if images:
-                item = images[0]
+            entries = outputs.get(output_node, {})
+            candidates = [item for value in entries.values() if isinstance(value, list)
+                          for item in value if isinstance(item, dict) and "filename" in item]
+            matches = [item for item in candidates if
+                       output_extension is None or item["filename"].lower().endswith(output_extension)]
+            if matches:
+                item = matches[0]
                 from urllib.parse import urlencode
                 url = os.environ.get("COMFY_INTERNAL_URL", "http://comfyui:8188") + "/view?" + urlencode({
                     "filename": item["filename"], "subfolder": item.get("subfolder", ""), "type": item.get("type", "output")})
                 with urllib.request.urlopen(url, timeout=60) as response:
-                    data = response.read(32 * 1024 * 1024 + 1)
-                    if len(data) > 32 * 1024 * 1024:
-                        raise ValueError("ComfyUI result exceeds 32 MiB")
-                    return {"prompt_id": ref}, data, response.headers.get_content_type()
+                    data = response.read(size_limit + 1)
+                    if len(data) > size_limit:
+                        raise ValueError("ComfyUI result exceeds the job size limit")
+                    mime = "video/webm" if output_extension == ".webm" else response.headers.get_content_type()
+                    return {"prompt_id": ref}, data, mime
         time.sleep(3)
-    raise TimeoutError("ComfyUI image job timed out")
+    raise TimeoutError("ComfyUI job timed out")
 
 
 def prepare_image_edit(job, payload, update):
@@ -7586,7 +7645,8 @@ TOKEN = os.environ["MULTIMODAL_INTERNAL_KEY"]
 CONTROLLER = os.environ.get("MULTIMODAL_CONTROLLER", "http://gpu-control:8001")
 ROUTES = {"/v1/documents/parse": "pdf", "/v1/ocr": "ocr",
           "/v1/audio/transcriptions": "transcription", "/v1/audio/speech": "speech",
-          "/v1/images/generations": "image", "/v1/images/edits": "image_edit"}
+          "/v1/images/generations": "image", "/v1/images/edits": "image_edit",
+          "/v1/videos/generations": "video"}
 
 
 def controller(action, ident):
@@ -7617,7 +7677,7 @@ def worker(kinds):
             elif kind == "speech":
                 result, artifact, mime = workers.speech(job)
                 STORE.complete(job["id"], result, artifact, mime)
-            elif kind in ("image", "image_edit"):
+            elif kind in ("image", "image_edit", "video"):
                 prepared = None
                 if kind == "image_edit":
                     STORE.update(job["id"], stage="locating object and building mask")
@@ -7636,7 +7696,8 @@ def worker(kinds):
                             raise TimeoutError("ComfyUI did not become ready within five minutes")
                         time.sleep(5)
                 result, artifact, mime = (workers.image_edit(job, prepared, STORE.update)
-                                          if kind == "image_edit" else workers.image(job, STORE.update))
+                                          if kind == "image_edit" else workers.video(job, STORE.update)
+                                          if kind == "video" else workers.image(job, STORE.update))
                 STORE.update(job["id"], stage="restoring language model")
                 release = controller("release", job["id"])
                 leased = False
@@ -7718,6 +7779,17 @@ class Handler(BaseHTTPRequestHandler):
                 if request["checkpoint"] not in choices:
                     raise ValueError("Install and select an inpainting checkpoint in ComfyUI")
                 request.setdefault("steps", 22)
+            if kind == "video":
+                if not profile.get("video"):
+                    raise ValueError("Load a Video studio profile before requesting a video")
+                request.setdefault("model", profile.get("video_model"))
+                if request["model"] != profile.get("video_model"):
+                    raise ValueError("Select the video model in the active profile")
+                request.setdefault("width", 512)
+                request.setdefault("height", 512)
+                request.setdefault("frames", 33)
+                request.setdefault("fps", 16)
+                request.setdefault("steps", 30)
             data = request.pop("data", None)
             if kind in {"pdf", "ocr", "transcription", "image_edit"}:
                 if not isinstance(data, str):
@@ -7797,11 +7869,13 @@ RECIPES = (
     ("general", "General assistant", "Chat and document analysis", "base"),
     ("documents", "Document desk", "PDF extraction, OCR, and spoken transcription", "small"),
     ("creative", "Creative studio", "Text assistance and queued ComfyUI images", "base"),
+    ("video", "Video studio", "Text-to-video clips through ComfyUI", "base"),
     ("audio", "Audio desk", "Speech transcription and speech generation", "small"),
 )
 
 
-def recommend(hardware, modes, media_ready, worker_enabled, checkpoints=(), current=None):
+def recommend(hardware, modes, media_ready, worker_enabled, checkpoints=(), current=None,
+              video_bundles=()):
     """Rank installed text workloads using detected RAM/VRAM; no model download."""
     vram = (hardware.get("vram_mib") or 0) / 1024
     ram = hardware.get("ram_gib") or 0
@@ -7815,21 +7889,29 @@ def recommend(hardware, modes, media_ready, worker_enabled, checkpoints=(), curr
     if chosen is None:
         return []
     edit_choices = [name for name in checkpoints if "inpaint" in name.lower()]
+    video_choices = [bundle for bundle in video_bundles if bundle == "wan21-1b"]
     rows = []
     for ident, label, use, asr in RECIPES:
+        video = bool(worker_enabled and media_ready and video_choices and ident == "video")
+        image = bool(worker_enabled and media_ready and checkpoints and ident == "creative")
+        available = bool(worker_enabled and (ident not in ("creative", "video") or
+                                             (image if ident == "creative" else video)))
         rows.append({"id": ident, "name": label, "use": use, "text_mode": chosen,
                      "text_modes": sorted(modes),
                      "asr_model": asr if ident in ("documents", "audio") else "tiny",
                      "pdf": worker_enabled, "ocr": worker_enabled, "audio": worker_enabled,
-                     "image": bool(worker_enabled and media_ready and ident == "creative"),
+                     "image": image, "video": video,
+                     "video_model": video_choices[0] if video else None,
+                     "video_models": video_choices if ident == "video" else [],
                      "image_checkpoint": checkpoints[0] if checkpoints and ident == "creative" else None,
                      "image_edit_checkpoint": edit_choices[0] if edit_choices and ident == "creative" else None,
                      "image_edit_checkpoints": edit_choices if ident == "creative" else [],
                      "checkpoints": list(checkpoints) if ident == "creative" else [],
-                     "available": bool(worker_enabled and (ident != "creative" or media_ready)),
-                     "reason": ("Ready to configure" if worker_enabled and (ident != "creative" or media_ready) else
+                     "available": available,
+                     "reason": ("Ready to configure" if available else
                                 "Enable multimodal workers in the installer" if not worker_enabled else
-                                "Install ComfyUI and an SDXL checkpoint to enable images")})
+                                "Install ComfyUI and an image checkpoint" if ident == "creative" else
+                                "Install ComfyUI and the Wan 2.1 T2V 1.3B bundle from Find models")})
     return rows
 
 
@@ -7857,17 +7939,21 @@ def page(rows, active, hardware, csrf, jobs=()):
         edit_checkpoint_choice = (f'<label>Inpainting checkpoint <select name="edit_checkpoint">'
                                   + "".join(f'<option value="{esc(name)}">{esc(name)}</option>' for name in row["image_edit_checkpoints"])
                                   + '</select></label>' if row["image"] and row["image_edit_checkpoints"] else "")
+        video_choice = (f'<label>Video model <select name="video_model">'
+                        + "".join(f'<option value="{esc(name)}">{esc(name)}</option>' for name in row["video_models"])
+                        + '</select></label>' if row["video"] else "")
         text_choice = (f'<label>Language model <select name="text_mode">' +
                        "".join(f'<option value="{esc(mode)}"{" selected" if mode == row["text_mode"] else ""}>'
                                f'{esc(mode)}</option>' for mode in row["text_modes"]) + '</select></label>')
         button = (f'<form method="post" action="/profiles/apply"><input type="hidden" name="token" value="{esc(csrf)}">'
-                  f'<input type="hidden" name="profile" value="{esc(row["id"])}">{text_choice}{checkpoint_choice}{edit_checkpoint_choice}<button type="submit"'
+                  f'<input type="hidden" name="profile" value="{esc(row["id"])}">{text_choice}{checkpoint_choice}{edit_checkpoint_choice}{video_choice}<button type="submit"'
                   f'{"" if row["available"] else " disabled"}>Load profile</button></form>')
         cards.append(f'<section class="card"><div class="eyebrow">{esc(state)}</div><h2>{esc(row["name"])}</h2>'
                      f'<p>{esc(row["use"])}</p><p>Language model: {esc(row["text_mode"])} via '
                      '<code>local-llm-api</code>. PDF/OCR and audio run as queued CPU work. '
                      f'Image generation: {"queued on ComfyUI" if row["image"] else "not configured"}. '
                      f'Object removal: {"available" if row["image_edit_checkpoint"] else "install an inpainting checkpoint"}. '
+                     f'Video: {esc(row["video_model"] or "not configured")}. '
                      f'ASR size: {esc(row["asr_model"])}.</p><p>{esc(row["reason"])}</p>{button}</section>')
     current = (f'Active profile: {esc(active["name"])}; language model: {esc(active["text_mode"])}.'
                if active else 'No multimodal profile is active.')
@@ -7877,7 +7963,8 @@ def page(rows, active, hardware, csrf, jobs=()):
             'they do not download a language or image model.</p><p>Clients continue using the same '
             'OpenAI compatible base URL and <code>local-llm-api</code> for text. '
             'Document, audio, and image tasks use dedicated paths at that base URL.</p>'
-            '<p><a href="/image-edit">Open image editor</a> · <a href="/">Back to switcher</a></p></section>')
+            '<p><a href="/models">Find image and video models</a> · '
+            '<a href="/image-edit">Open image editor</a> · <a href="/">Back to switcher</a></p></section>')
     queue = ('<section class="card"><h2>Recent task jobs</h2><p>Jobs stay in the durable queue across worker restarts. '
              'Use the authenticated API job URL to retrieve each result.</p><table><thead><tr><th>Started UTC</th>'
              '<th>Task</th><th>Status</th><th>Stage</th></tr></thead><tbody>' +

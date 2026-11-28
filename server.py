@@ -21,7 +21,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from benchmarks import BenchmarkManager, MODELS
 import benchmark_views
 from model_catalog import BY_ID, ModelManager, model_display_name
-from media_catalog import MediaManager
+from media_catalog import MediaManager, MEDIA_BY_ID
 from catalog_discovery import CatalogDiscovery
 from engine_updates import EngineUpdates
 from context_tuning import ContextTuner, context_presets
@@ -44,10 +44,14 @@ def profile_recommendations():
                  if mode != "media" and workload_state(container) != "not created"}
     checkpoints = sorted(path.name for path in (Path("/app/media_models") / "checkpoints").glob("*.safetensors"))
     media_ready = (hardware.get("gpu_provider") == "nvidia" and
-                   workload_state(MEDIA) != "not created" and bool(checkpoints))
+                   workload_state(MEDIA) != "not created")
+    video_bundle = MEDIA_BY_ID["wan21-1b"]
+    video_bundles = ([video_bundle["id"]] if media_ready and all(
+        (Path("/app/media_models") / destination).is_file()
+        for _, _, destination in video_bundle["files"]) else [])
     rows = multimodal_profiles.recommend(hardware, available, media_ready,
                                          os.environ.get("AI_MULTIMODAL_ENABLED") == "1", checkpoints,
-                                         active_mode())
+                                         active_mode(), video_bundles)
     return hardware, rows
 
 
@@ -1029,6 +1033,11 @@ class Handler(BaseHTTPRequestHandler):
                         if len(edit_checkpoint) != 1 or edit_checkpoint[0] not in selected["image_edit_checkpoints"]:
                             raise ValueError("Select an installed inpainting checkpoint")
                         selected["image_edit_checkpoint"] = edit_checkpoint[0]
+                if selected["video"]:
+                    video_model = fields.get("video_model", [])
+                    if len(video_model) != 1 or video_model[0] not in selected["video_models"]:
+                        raise ValueError("Select an installed video model")
+                    selected["video_model"] = video_model[0]
                 previous = active_mode()
                 old_profile = multimodal_profiles.load(PROFILE_PATH)
                 if previous != selected["text_mode"]:

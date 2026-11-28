@@ -123,32 +123,81 @@ def image(job, update):
     return {**result, "checkpoint": checkpoint}, data, mime
 
 
-def render_workflow(job, workflow, update, output_node="10"):
+def wan21_workflow(prompt, width, height, frames, fps, steps):
+    return {
+        "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "wan2.1_t2v_1.3B_fp16.safetensors", "weight_dtype": "default"}},
+        "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": "umt5_xxl_fp8_e4m3fn_scaled.safetensors", "type": "wan", "device": "default"}},
+        "3": {"class_type": "VAELoader", "inputs": {"vae_name": "wan_2.1_vae.safetensors"}},
+        "4": {"class_type": "CLIPTextEncode", "inputs": {"text": prompt, "clip": ["2", 0]}},
+        "5": {"class_type": "CLIPTextEncode", "inputs": {"text": "blurry, static, low quality, distorted", "clip": ["2", 0]}},
+        "6": {"class_type": "EmptyHunyuanLatentVideo", "inputs": {"width": width, "height": height, "length": frames, "batch_size": 1}},
+        "7": {"class_type": "ModelSamplingSD3", "inputs": {"model": ["1", 0], "shift": 8}},
+        "8": {"class_type": "KSampler", "inputs": {"seed": int(time.time_ns() % (2**53)), "steps": steps,
+                "cfg": 6, "sampler_name": "uni_pc", "scheduler": "simple", "denoise": 1,
+                "model": ["7", 0], "positive": ["4", 0], "negative": ["5", 0], "latent_image": ["6", 0]}},
+        "9": {"class_type": "VAEDecode", "inputs": {"samples": ["8", 0], "vae": ["3", 0]}},
+        "10": {"class_type": "SaveWEBM", "inputs": {"images": ["9", 0],
+                 "filename_prefix": "ai-switcher-video", "codec": "vp9", "fps": fps, "crf": 32}},
+    }
+
+
+def video(job, update):
+    request = job["request"]
+    prompt = request.get("prompt")
+    if not isinstance(prompt, str) or not 1 <= len(prompt) <= 4000:
+        raise ValueError("Video prompt must have 1–4000 characters")
+    if request.get("model") != "wan21-1b":
+        raise ValueError("This video route supports the Wan 2.1 T2V 1.3B bundle")
+    width, height, frames, fps, steps = (request.get(key) for key in
+                                        ("width", "height", "frames", "fps", "steps"))
+    if (any(type(value) is not int for value in (width, height, frames, fps, steps)) or
+            (width, height) not in ((512, 512), (832, 480)) or
+            frames not in (17, 33, 49, 81) or fps not in (8, 16, 24) or
+            not 1 <= steps <= 50):
+        raise ValueError("Choose 512x512 or 832x480, 17/33/49/81 frames, 8/16/24 fps, and 1–50 steps")
+    model_dir = Path(os.environ.get("COMFY_MODEL_DIR", "/app/media_models"))
+    files = ("diffusion_models/wan2.1_t2v_1.3B_fp16.safetensors",
+             "text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors", "vae/wan_2.1_vae.safetensors")
+    if not all((model_dir / name).is_file() for name in files):
+        raise ValueError("Install the complete Wan 2.1 T2V 1.3B bundle in ComfyUI")
+    result, data, mime = render_workflow(job, wan21_workflow(prompt, width, height, frames, fps, steps),
+                                         update, output_extension=".webm", timeout=3600, size_limit=128 * 1024 * 1024)
+    return {**result, "model": "wan21-1b", "frames": frames, "fps": fps,
+            "width": width, "height": height}, data, mime
+
+
+def render_workflow(job, workflow, update, output_node="10", output_extension=None,
+                    timeout=900, size_limit=32 * 1024 * 1024):
     reply = comfy_request("/prompt", {"prompt": workflow, "client_id": job["id"]})
     ref = reply.get("prompt_id")
     if not ref:
         raise RuntimeError("ComfyUI rejected the workflow")
     update(job["id"], backend_ref=ref, stage="rendering in ComfyUI")
-    deadline = time.monotonic() + 900
+    deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         history = comfy_request("/history/" + ref).get(ref)
         if history:
             if history.get("status", {}).get("status_str") == "error":
                 raise RuntimeError("ComfyUI workflow failed")
             outputs = history.get("outputs", {})
-            images = outputs.get(output_node, {}).get("images", [])
-            if images:
-                item = images[0]
+            entries = outputs.get(output_node, {})
+            candidates = [item for value in entries.values() if isinstance(value, list)
+                          for item in value if isinstance(item, dict) and "filename" in item]
+            matches = [item for item in candidates if
+                       output_extension is None or item["filename"].lower().endswith(output_extension)]
+            if matches:
+                item = matches[0]
                 from urllib.parse import urlencode
                 url = os.environ.get("COMFY_INTERNAL_URL", "http://comfyui:8188") + "/view?" + urlencode({
                     "filename": item["filename"], "subfolder": item.get("subfolder", ""), "type": item.get("type", "output")})
                 with urllib.request.urlopen(url, timeout=60) as response:
-                    data = response.read(32 * 1024 * 1024 + 1)
-                    if len(data) > 32 * 1024 * 1024:
-                        raise ValueError("ComfyUI result exceeds 32 MiB")
-                    return {"prompt_id": ref}, data, response.headers.get_content_type()
+                    data = response.read(size_limit + 1)
+                    if len(data) > size_limit:
+                        raise ValueError("ComfyUI result exceeds the job size limit")
+                    mime = "video/webm" if output_extension == ".webm" else response.headers.get_content_type()
+                    return {"prompt_id": ref}, data, mime
         time.sleep(3)
-    raise TimeoutError("ComfyUI image job timed out")
+    raise TimeoutError("ComfyUI job timed out")
 
 
 def prepare_image_edit(job, payload, update):

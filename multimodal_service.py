@@ -20,7 +20,8 @@ TOKEN = os.environ["MULTIMODAL_INTERNAL_KEY"]
 CONTROLLER = os.environ.get("MULTIMODAL_CONTROLLER", "http://gpu-control:8001")
 ROUTES = {"/v1/documents/parse": "pdf", "/v1/ocr": "ocr",
           "/v1/audio/transcriptions": "transcription", "/v1/audio/speech": "speech",
-          "/v1/images/generations": "image", "/v1/images/edits": "image_edit"}
+          "/v1/images/generations": "image", "/v1/images/edits": "image_edit",
+          "/v1/videos/generations": "video"}
 
 
 def controller(action, ident):
@@ -51,7 +52,7 @@ def worker(kinds):
             elif kind == "speech":
                 result, artifact, mime = workers.speech(job)
                 STORE.complete(job["id"], result, artifact, mime)
-            elif kind in ("image", "image_edit"):
+            elif kind in ("image", "image_edit", "video"):
                 prepared = None
                 if kind == "image_edit":
                     STORE.update(job["id"], stage="locating object and building mask")
@@ -70,7 +71,8 @@ def worker(kinds):
                             raise TimeoutError("ComfyUI did not become ready within five minutes")
                         time.sleep(5)
                 result, artifact, mime = (workers.image_edit(job, prepared, STORE.update)
-                                          if kind == "image_edit" else workers.image(job, STORE.update))
+                                          if kind == "image_edit" else workers.video(job, STORE.update)
+                                          if kind == "video" else workers.image(job, STORE.update))
                 STORE.update(job["id"], stage="restoring language model")
                 release = controller("release", job["id"])
                 leased = False
@@ -152,6 +154,17 @@ class Handler(BaseHTTPRequestHandler):
                 if request["checkpoint"] not in choices:
                     raise ValueError("Install and select an inpainting checkpoint in ComfyUI")
                 request.setdefault("steps", 22)
+            if kind == "video":
+                if not profile.get("video"):
+                    raise ValueError("Load a Video studio profile before requesting a video")
+                request.setdefault("model", profile.get("video_model"))
+                if request["model"] != profile.get("video_model"):
+                    raise ValueError("Select the video model in the active profile")
+                request.setdefault("width", 512)
+                request.setdefault("height", 512)
+                request.setdefault("frames", 33)
+                request.setdefault("fps", 16)
+                request.setdefault("steps", 30)
             data = request.pop("data", None)
             if kind in {"pdf", "ocr", "transcription", "image_edit"}:
                 if not isinstance(data, str):

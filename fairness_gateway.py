@@ -23,7 +23,8 @@ HOP_HEADERS = {"connection", "keep-alive", "proxy-authenticate", "proxy-authoriz
 BACKEND = re.compile(r"[a-z0-9-]+:(?:8000|8080)\Z")
 STABLE_MODEL_ID = "local-llm-api"
 MEDIA_POST_ROUTES = {"/v1/documents/parse", "/v1/ocr", "/v1/audio/transcriptions",
-                     "/v1/audio/speech", "/v1/images/generations", "/v1/images/edits"}
+                     "/v1/audio/speech", "/v1/images/generations", "/v1/images/edits",
+                     "/v1/videos/generations"}
 
 
 def is_media_route(path, method):

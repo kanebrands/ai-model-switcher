@@ -7,6 +7,7 @@ import os
 
 from multimodal_jobs import JobStore, CPU_KINDS, GPU_KINDS
 from multimodal_profiles import recommend, save, load
+from multimodal_workers import wan21_workflow, video, render_workflow
 with patch.dict(os.environ, {"BENCHMARK_API_KEY": "multimodal-test-key"}):
     from fairness_gateway import is_media_route
 
@@ -63,6 +64,37 @@ class MultimodalTests(unittest.TestCase):
         self.assertTrue(is_media_route("/v1/jobs/123/result", "GET"))
         self.assertFalse(is_media_route("/v1/chat/completions", "POST"))
         self.assertFalse(is_media_route("/v1/jobs/123", "POST"))
+        self.assertTrue(is_media_route("/v1/videos/generations", "POST"))
+
+    def test_video_profile_requires_complete_bundle_and_validates_job(self):
+        hardware = {"ram_gib": 128, "vram_mib": 24576}
+        rows = recommend(hardware, ["qwen4b"], True, True, [], "qwen4b")
+        self.assertFalse(next(row for row in rows if row["id"] == "video")["available"])
+        rows = recommend(hardware, ["qwen4b"], True, True, [], "qwen4b", ["wan21-1b"])
+        profile = next(row for row in rows if row["id"] == "video")
+        self.assertEqual(profile["video_model"], "wan21-1b")
+        self.assertTrue(profile["available"])
+        graph = wan21_workflow("a fox running", 512, 512, 33, 16, 30)
+        self.assertEqual(graph["10"]["class_type"], "SaveWEBM")
+        self.assertEqual(graph["8"]["inputs"]["latent_image"], ["6", 0])
+        with self.assertRaisesRegex(ValueError, "512x512"):
+            video({"request": {"prompt": "a fox", "model": "wan21-1b", "width": 1024,
+                               "height": 1024, "frames": 33, "fps": 16, "steps": 30}}, lambda *a, **k: None)
+
+    def test_video_job_collects_webm_from_comfy_history(self):
+        from unittest.mock import MagicMock
+        history = {"ref": {"outputs": {"10": {"videos": [{"filename": "clip.webm", "type": "output"}]}}}}
+        with patch("multimodal_workers.comfy_request", side_effect=[{"prompt_id": "ref"}, history]), \
+             patch("multimodal_workers.urllib.request.urlopen") as open_result:
+            response = MagicMock()
+            response.__enter__.return_value = response
+            response.read.return_value = b"\x1aE\xdf\xa3webm"
+            open_result.return_value = response
+            result, payload, mime = render_workflow({"id": "job"}, {"10": {}}, lambda *a, **k: None,
+                                                     output_extension=".webm")
+        self.assertEqual(result["prompt_id"], "ref")
+        self.assertEqual(mime, "video/webm")
+        self.assertTrue(payload.startswith(b"\x1aE\xdf\xa3"))
 
 
 if __name__ == "__main__":
