@@ -2,11 +2,13 @@
 """Authenticated-internal HTTP front end and persistent task workers."""
 import base64
 import binascii
+import io
 import json
 import os
 import threading
 import time
 import urllib.request
+import zipfile
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -75,7 +77,7 @@ def worker(kinds):
                         time.sleep(5)
                 result, artifact, mime = (workers.image_edit(job, prepared, store.update)
                                           if kind == "image_edit" else workers.video(job, store.update)
-                                          if kind == "video" else workers.image(job, store.update))
+                                          if kind == "video" else workers.image(job, payload, store.update))
                 store.update(job["id"], stage="restoring language model")
                 release = controller("release", job["id"])
                 leased = False
@@ -150,9 +152,11 @@ class Handler(BaseHTTPRequestHandler):
                 if not profile.get("image_checkpoint"):
                     raise ValueError("Load a Creative studio profile before requesting an image")
                 request.setdefault("checkpoint", profile.get("image_checkpoint"))
-                request.setdefault("width", 1024)
-                request.setdefault("height", 1024)
+                has_references = bool(request.get("references")) or request.get("data") is not None
+                request.setdefault("width", None if has_references else 1024)
+                request.setdefault("height", None if has_references else 1024)
                 request.setdefault("steps", 20)
+                request.setdefault("reference_strength", 0.55)
             if kind == "image_edit":
                 if not profile.get("image"):
                     raise ValueError("Load a Creative studio profile before editing an image")
@@ -174,7 +178,33 @@ class Handler(BaseHTTPRequestHandler):
                 request.setdefault("fps", 16)
                 request.setdefault("steps", 30)
             data = request.pop("data", None)
-            if kind in {"pdf", "ocr", "transcription", "image_edit"}:
+            references = request.pop("references", None)
+            if kind == "image":
+                if data is not None and references is not None:
+                    raise ValueError("Use data or references, not both")
+                if data is not None:
+                    references = [data]
+                if references is None:
+                    references = []
+                if not isinstance(references, list) or len(references) > 3:
+                    raise ValueError("Upload at most three reference images")
+                decoded = []
+                for encoded in references:
+                    if not isinstance(encoded, str):
+                        raise ValueError("Each reference must be base64 text")
+                    raw = base64.b64decode(encoded, validate=True)
+                    if not 1 <= len(raw) <= 8 * 1024 * 1024:
+                        raise ValueError("Each reference must be 1–8 MiB")
+                    decoded.append(raw)
+                if sum(map(len, decoded)) > 16 * 1024 * 1024:
+                    raise ValueError("Reference images total more than 16 MiB")
+                archive = io.BytesIO()
+                if decoded:
+                    with zipfile.ZipFile(archive, "w", zipfile.ZIP_STORED) as bundle:
+                        for index, raw in enumerate(decoded, 1):
+                            bundle.writestr(f"reference-{index}.bin", raw)
+                payload = archive.getvalue()
+            elif kind in {"pdf", "ocr", "transcription", "image_edit"}:
                 if not isinstance(data, str):
                     raise ValueError("Base64 data field is required")
                 payload = base64.b64decode(data, validate=True)
@@ -184,7 +214,7 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("Input is not a PDF")
             else:
                 payload = b""
-                if data is not None:
+                if data is not None or references is not None:
                     raise ValueError("This task does not accept uploaded data")
             job = (PRIVATE_STORE if private else STORE).submit(owner, kind, request, payload)
         except (ValueError, binascii.Error, UnicodeDecodeError) as exc:

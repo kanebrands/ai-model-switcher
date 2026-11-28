@@ -4,7 +4,7 @@ import unittest
 from image_edit import target_from_prompt, select_box, workflow, private_workflow
 from image_edit_views import page
 from multimodal_jobs import PrivateJobStore, GPU_KINDS
-from multimodal_workers import render_workflow
+from multimodal_workers import render_workflow, sdxl_reference_workflow, image
 
 
 class ImageEditTests(unittest.TestCase):
@@ -36,6 +36,43 @@ class ImageEditTests(unittest.TestCase):
         self.assertIn('data-edit-job="a-test-id"', html)
         self.assertIn("image_edit_poll.js", html)
         self.assertIn('name="private"', html)
+        self.assertIn('id="image-generate-form"', html)
+        self.assertIn('name="reference"', html)
+        self.assertIn('multiple', html)
+
+    def test_reference_graph_encodes_uploaded_image_and_strength(self):
+        graph = sdxl_reference_workflow("garden", "sdxl.safetensors", b"PNG", 512, 512, 10, 0.55)
+        self.assertEqual(graph["5"]["class_type"], "AISwitcherReferenceImage")
+        self.assertEqual(graph["11"]["class_type"], "VAEEncode")
+        self.assertEqual(graph["8"]["inputs"]["latent_image"], ["11", 0])
+        self.assertEqual(graph["8"]["inputs"]["denoise"], 0.55)
+
+    def test_multiple_references_generate_separate_images_in_zip(self):
+        import io
+        import zipfile
+        from unittest.mock import patch
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, "w") as bundle:
+            bundle.writestr("reference-1.bin", b"image1")
+            bundle.writestr("reference-2.bin", b"image2")
+        job = {"id": "abc", "request": {"prompt": "garden", "checkpoint": "sdxl.safetensors",
+                                       "width": None, "height": None, "steps": 4,
+                                       "reference_strength": 0.55, "_private": True}}
+        frames = [object(), object()]
+        with patch("multimodal_workers.reference_images", return_value=frames), \
+             patch("multimodal_workers._prepare_reference", side_effect=[(b"PNG1", 512, 512),
+                                                                         (b"PNG2", 512, 512)]), \
+             patch("multimodal_workers.Path.is_file", return_value=True), \
+             patch("multimodal_workers.render_workflow", side_effect=[({}, b"out1", "image/png"),
+                                                                      ({}, b"out2", "image/png")]) as render:
+            result, payload, mime = image(job, archive.getvalue(), lambda *args, **kwargs: None)
+        self.assertEqual((mime, result["output_count"], result["reference_count"]),
+                         ("application/zip", 2, 2))
+        with zipfile.ZipFile(io.BytesIO(payload)) as bundle:
+            self.assertEqual(bundle.read("generated-01.png"), b"out1")
+            self.assertEqual(bundle.read("generated-02.png"), b"out2")
+        self.assertEqual(render.call_count, 2)
+        self.assertTrue(all(call.kwargs["private_key"] == "private_images" for call in render.call_args_list))
 
     def test_private_jobs_leave_no_database_or_artifact_files(self):
         import tempfile

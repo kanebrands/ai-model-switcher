@@ -7,6 +7,8 @@ from email.parser import BytesParser
 from email.policy import default as email_policy
 import base64
 import json
+import io
+import zipfile
 import os
 from pathlib import Path
 import re
@@ -120,7 +122,7 @@ def profile_recommendations():
     return hardware, rows
 
 
-def image_edit_job(ident):
+def image_edit_job(ident, kind="image_edit"):
     try:
         if uuid.UUID(ident).version != 4:
             return None
@@ -132,11 +134,29 @@ def image_edit_job(ident):
     db = sqlite3.connect(path)
     try:
         db.row_factory = sqlite3.Row
-        row = db.execute("SELECT * FROM jobs WHERE id=? AND owner='switcher-admin' AND kind='image_edit'",
-                         (ident,)).fetchone()
+        row = db.execute("SELECT * FROM jobs WHERE id=? AND owner='switcher-admin' AND kind=?",
+                         (ident, kind)).fetchone()
     finally:
         db.close()
     return dict(row) if row else None
+
+
+def image_preview(data, content_type, query):
+    values = urllib.parse.parse_qs(query).get("index", ["1"])
+    if len(values) != 1 or values[0] not in ("1", "2", "3"):
+        raise ValueError("Invalid preview index")
+    index = int(values[0])
+    if content_type == "image/png":
+        if index != 1:
+            raise ValueError("No image at that index")
+        return data
+    if content_type != "application/zip":
+        raise ValueError("Unsupported result type")
+    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+        name = f"generated-{index:02}.png"
+        if archive.getinfo(name).file_size > 32 * 1024 * 1024:
+            raise ValueError("Image preview is too large")
+        return archive.read(name)
 
 
 def usage_window(query, prefix=""):
@@ -608,20 +628,31 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urllib.parse.urlsplit(self.path)
         if path.path == "/image-edit":
-            job_id = urllib.parse.parse_qs(path.query).get("job", [None])[0]
-            if job_id and not image_edit_job(job_id):
+            query = urllib.parse.parse_qs(path.query)
+            job_id = query.get("job", [None])[0]
+            task = query.get("task", ["edit"])[0]
+            if task not in ("edit", "generate") or job_id and not image_edit_job(
+                    job_id, "image" if task == "generate" else "image_edit"):
                 self.send_error(404, "Image edit job not found")
                 return
-            self._send_html(image_edit_views.page(CSRF, job_id))
+            self._send_html(image_edit_views.page(CSRF, job_id, task))
+            return
+        if path.path.startswith("/image-edit/private/preview/"):
+            self._private_image_preview(path.path.rsplit("/", 1)[1], path.query)
             return
         for prefix, suffix in (("/image-edit/private/status/", ""),
                                ("/image-edit/private/result/", "/result")):
             if path.path.startswith(prefix):
                 self._private_edit_proxy(path.path[len(prefix):], suffix)
                 return
-        for prefix, binary in (("/image-edit/status/", False), ("/image-edit/result/", True)):
+        for prefix, kind, binary, preview in (
+                ("/image-edit/status/", "image_edit", False, False),
+                ("/image-edit/result/", "image_edit", True, False),
+                ("/image-edit/generation/status/", "image", False, False),
+                ("/image-edit/generation/result/", "image", True, False),
+                ("/image-edit/generation/preview/", "image", True, True)):
             if path.path.startswith(prefix):
-                job = image_edit_job(path.path[len(prefix):])
+                job = image_edit_job(path.path[len(prefix):], kind)
                 if not job:
                     self.send_error(404, "Image edit job not found")
                     return
@@ -630,8 +661,16 @@ class Handler(BaseHTTPRequestHandler):
                         self.send_error(404, "Edited image is not ready")
                         return
                     data = (Path("/app/data/multimodal/artifacts") / job["result_name"]).read_bytes()
+                    content_type = job["result_type"] or "image/png"
+                    if preview:
+                        try:
+                            data = image_preview(data, content_type, path.query)
+                        except (ValueError, KeyError, zipfile.BadZipFile):
+                            self.send_error(400, "Invalid image preview")
+                            return
+                        content_type = "image/png"
                     self.send_response(200)
-                    self.send_header("Content-Type", "image/png")
+                    self.send_header("Content-Type", content_type)
                     self.send_header("Content-Length", str(len(data)))
                     self.send_header("Cache-Control", "no-store")
                     self.send_header("X-Content-Type-Options", "nosniff")
@@ -1045,6 +1084,109 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
 
+    def _submit_image_generation(self):
+        if self.headers.get("Origin") != ORIGIN or self.headers.get("Host") != urllib.parse.urlsplit(ORIGIN).netloc:
+            self.send_error(403, "Invalid origin")
+            return
+        content_type = self.headers.get("Content-Type", "")
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            length = 0
+        if not 1 <= length <= 24 * 1024 * 1024 or not content_type.startswith("multipart/form-data;"):
+            self.send_error(413, "Upload up to three reference images, 16 MiB total")
+            return
+        document = BytesParser(policy=email_policy).parsebytes(
+            b"MIME-Version: 1.0\r\nContent-Type: " + content_type.encode("ascii", "ignore") +
+            b"\r\n\r\n" + self.rfile.read(length))
+        if not document.is_multipart():
+            self.send_error(400, "Invalid upload form")
+            return
+        fields, references = {}, []
+        for part in document.iter_parts():
+            name = part.get_param("name", header="content-disposition")
+            if name == "reference":
+                data = part.get_payload(decode=True)
+                if data:
+                    references.append(data)
+            elif name in ("token", "prompt", "private", "reference_strength") and name not in fields:
+                fields[name] = part.get_payload(decode=True)
+            else:
+                self.send_error(400, "Invalid upload form fields")
+                return
+        if fields.get("token") != CSRF.encode():
+            self.send_error(403, "Invalid request")
+            return
+        try:
+            prompt = fields.get("prompt", b"").decode("utf-8")
+            strength = fields.get("reference_strength", b"0.55").decode("ascii")
+        except UnicodeDecodeError:
+            self.send_error(400, "Invalid prompt or reference strength")
+            return
+        if not 1 <= len(prompt) <= 1000 or strength not in ("0.35", "0.55", "0.75") or \
+                not 0 <= len(references) <= 3 or any(not 1 <= len(item) <= 8 * 1024 * 1024 for item in references) or \
+                sum(map(len, references)) > 16 * 1024 * 1024 or fields.get("private") not in (None, b"on"):
+            self.send_error(400, "Use a short prompt and up to three reference images, 16 MiB total")
+            return
+        private = fields.get("private") == b"on"
+        payload = json.dumps({"prompt": prompt, "references": [base64.b64encode(item).decode() for item in references],
+                              "reference_strength": float(strength), "private": private}).encode()
+        request = urllib.request.Request("http://multimodal:8003/v1/images/generations", data=payload,
+                                         headers={"Content-Type": "application/json",
+                                                  "X-Internal-Token": os.environ["BENCHMARK_API_KEY"],
+                                                  "X-AI-Client-ID": "switcher-admin"})
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                ident = json.load(response)["id"]
+        except urllib.error.HTTPError as exc:
+            try:
+                detail = json.load(exc).get("error", {}).get("message", "Image generation was rejected")
+            except (ValueError, TypeError):
+                detail = "Image generation was rejected"
+            self.send_error(exc.code, detail)
+            return
+        except (OSError, KeyError, ValueError):
+            self.send_error(502, "Image worker is unavailable")
+            return
+        if private:
+            data = json.dumps({"id": ident, "status": "queued", "private": True}).encode()
+            self.send_response(202)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.end_headers()
+            self.wfile.write(data)
+            return
+        self.send_response(303)
+        self.send_header("Location", "/image-edit?task=generate&job=" + ident)
+        self.send_header("Content-Length", "0")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+
+    def _private_image_preview(self, ident, query):
+        try:
+            if uuid.UUID(ident).version != 4:
+                raise ValueError("Invalid job ID")
+            request = urllib.request.Request("http://multimodal:8003/v1/jobs/" + ident + "/result",
+                                             headers={"X-Internal-Token": os.environ["BENCHMARK_API_KEY"],
+                                                      "X-AI-Client-ID": "switcher-admin"})
+            with urllib.request.urlopen(request, timeout=30) as response:
+                data = response.read(128 * 1024 * 1024 + 1)
+                if len(data) > 128 * 1024 * 1024:
+                    raise ValueError("Result too large")
+                image = image_preview(data, response.headers.get_content_type(), query)
+        except (ValueError, KeyError, zipfile.BadZipFile, OSError):
+            self.send_error(404, "Private image preview unavailable")
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "image/png")
+        self.send_header("Content-Length", str(len(image)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        self.wfile.write(image)
+
     def _private_edit_proxy(self, ident, suffix="", method="GET"):
         try:
             if uuid.UUID(ident).version != 4:
@@ -1085,6 +1227,9 @@ class Handler(BaseHTTPRequestHandler):
         self._private_edit_proxy(self.path[len(prefix):], method="DELETE")
 
     def do_POST(self):
+        if self.path == "/image-edit/generate":
+            self._submit_image_generation()
+            return
         if self.path == "/image-edit/submit":
             self._submit_image_edit()
             return

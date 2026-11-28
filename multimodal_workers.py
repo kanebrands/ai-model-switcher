@@ -9,6 +9,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+import zipfile
 
 
 MAX_PDF_PAGES = 20
@@ -104,28 +105,94 @@ def sdxl_workflow(prompt, checkpoint, width, height, steps):
     }
 
 
-def image(job, update):
+def sdxl_reference_workflow(prompt, checkpoint, image_data, width, height, steps, strength):
+    graph = sdxl_workflow(prompt, checkpoint, width, height, steps)
+    graph["5"] = {"class_type": "AISwitcherReferenceImage",
+                  "inputs": {"image_base64": base64.b64encode(image_data).decode("ascii")}}
+    graph["11"] = {"class_type": "VAEEncode", "inputs": {"pixels": ["5", 0], "vae": ["4", 2]}}
+    graph["8"]["inputs"]["latent_image"] = ["11", 0]
+    graph["8"]["inputs"]["denoise"] = strength
+    return graph
+
+
+def reference_images(payload):
+    if not payload:
+        return []
+    from PIL import Image, ImageOps
+    images = []
+    with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+        names = archive.namelist()
+        if not 1 <= len(names) <= 3 or names != [f"reference-{index}.bin" for index in range(1, len(names) + 1)]:
+            raise ValueError("Reference archive must contain 1–3 images")
+        for name in names:
+            if archive.getinfo(name).file_size > 8 * 1024 * 1024:
+                raise ValueError("Each reference image must be at most 8 MiB")
+            with Image.open(io.BytesIO(archive.read(name))) as opened:
+                if opened.format not in ("JPEG", "PNG", "WEBP") or opened.width * opened.height > 20_000_000 or min(opened.size) < 256:
+                    raise ValueError("References must be JPEG, PNG, or WebP, 256 px or larger and at most 20 megapixels")
+                images.append(ImageOps.exif_transpose(opened).convert("RGB"))
+    return images
+
+
+def _prepare_reference(image, width=None, height=None):
+    from PIL import ImageOps
+    if width is None and height is None:
+        scale = min(1, 1024 / max(image.size))
+        width = max(256, round(image.width * scale / 8) * 8)
+        height = max(256, round(image.height * scale / 8) * 8)
+    image = ImageOps.fit(image, (width, height))
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    return buffer.getvalue(), width, height
+
+
+def image(job, payload, update):
     request = job["request"]
     prompt = request.get("prompt", "")
     checkpoint = request.get("checkpoint", "")
     width, height, steps = (request.get(key) for key in ("width", "height", "steps"))
+    strength = request.get("reference_strength", 0.55)
     if not isinstance(prompt, str) or not 1 <= len(prompt) <= 4000:
         raise ValueError("Image prompt must have 1–4000 characters")
     if not isinstance(checkpoint, str) or Path(checkpoint).name != checkpoint or not checkpoint.endswith(".safetensors"):
         raise ValueError("Select an installed checkpoint")
-    if not (isinstance(width, int) and isinstance(height, int) and isinstance(steps, int) and
-            256 <= width <= 1536 and 256 <= height <= 1536 and width % 8 == height % 8 == 0 and 1 <= steps <= 60):
+    if not (isinstance(steps, int) and not isinstance(steps, bool) and 1 <= steps <= 60):
+        raise ValueError("Choose 1–60 sampling steps")
+    if not (width is None and height is None or
+            type(width) is int and type(height) is int and 256 <= width <= 1536 and
+            256 <= height <= 1536 and width % 8 == height % 8 == 0):
         raise ValueError("Choose width/height 256–1536 in multiples of 8 and steps 1–60")
+    if strength not in (0.35, 0.55, 0.75):
+        raise ValueError("Choose a reference strength of 0.35, 0.55, or 0.75")
     installed = Path(os.environ.get("COMFY_MODEL_DIR", "/app/media_models")) / "checkpoints" / checkpoint
     if not installed.is_file():
         raise ValueError("Checkpoint is not installed in ComfyUI")
-    workflow = sdxl_workflow(prompt, checkpoint, width, height, steps)
+    references = reference_images(payload)
     private = bool(request.get("_private"))
-    if private:
-        workflow["10"] = {"class_type": "AISwitcherPrivateImageResult", "inputs": {"images": ["9", 0]}}
-    result, data, mime = render_workflow(job, workflow, update,
-                                         private_key="private_images" if private else None)
-    return {**result, "checkpoint": checkpoint}, data, mime
+    outputs = []
+    for index, reference in enumerate(references or [None], 1):
+        if reference is None:
+            output_width, output_height = width or 1024, height or 1024
+            workflow = sdxl_workflow(prompt, checkpoint, output_width, output_height, steps)
+        else:
+            prepared, output_width, output_height = _prepare_reference(reference, width, height)
+            workflow = sdxl_reference_workflow(prompt, checkpoint, prepared, output_width,
+                                               output_height, steps, strength)
+        if private:
+            workflow["10"] = {"class_type": "AISwitcherPrivateImageResult", "inputs": {"images": ["9", 0]}}
+        update(job["id"], stage=f"rendering image {index} of {len(references) or 1}")
+        result, data, mime = render_workflow(job, workflow, update,
+                                             private_key="private_images" if private else None)
+        outputs.append(data)
+    if len(outputs) == 1:
+        return {**result, "checkpoint": checkpoint, "reference_count": len(references),
+                "output_count": 1}, outputs[0], "image/png"
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as bundle:
+        for index, data in enumerate(outputs, 1):
+            bundle.writestr(f"generated-{index:02}.png", data)
+    return {"checkpoint": checkpoint, "reference_count": len(references),
+            "output_count": len(outputs)}, archive.getvalue(), "application/zip"
 
 
 def wan21_workflow(prompt, width, height, frames, fps, steps,

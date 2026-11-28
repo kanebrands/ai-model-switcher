@@ -31,6 +31,26 @@ class PrivateImageAndMask:
         return pixels, alpha
 
 
+class ReferenceImage:
+    """Decode one reference from the prompt in RAM without using ComfyUI's input directory."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"image_base64": ("STRING", {"multiline": True})}}
+
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "load"
+    CATEGORY = "AI Switcher/reference"
+
+    def load(self, image_base64):
+        with Image.open(BytesIO(base64.b64decode(image_base64, validate=True))) as source:
+            image = source.convert("RGB")
+        if image.width * image.height > 4_000_000:
+            raise ValueError("Reference image exceeds the size limit")
+        pixels = torch.from_numpy(np.array(image).astype(np.float32) / 255).unsqueeze(0)
+        return (pixels,)
+
+
 class PrivateImageResult:
     @classmethod
     def INPUT_TYPES(cls):
@@ -85,6 +105,7 @@ class PrivateVideoResult:
 
 NODE_CLASS_MAPPINGS = {
     "AISwitcherPrivateImageAndMask": PrivateImageAndMask,
+    "AISwitcherReferenceImage": ReferenceImage,
     "AISwitcherPrivateImageResult": PrivateImageResult,
     "AISwitcherPrivateVideoResult": PrivateVideoResult,
 }

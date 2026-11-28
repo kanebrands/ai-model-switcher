@@ -919,6 +919,8 @@ from email.parser import BytesParser
 from email.policy import default as email_policy
 import base64
 import json
+import io
+import zipfile
 import os
 from pathlib import Path
 import re
@@ -1032,7 +1034,7 @@ def profile_recommendations():
     return hardware, rows
 
 
-def image_edit_job(ident):
+def image_edit_job(ident, kind="image_edit"):
     try:
         if uuid.UUID(ident).version != 4:
             return None
@@ -1044,11 +1046,29 @@ def image_edit_job(ident):
     db = sqlite3.connect(path)
     try:
         db.row_factory = sqlite3.Row
-        row = db.execute("SELECT * FROM jobs WHERE id=? AND owner='switcher-admin' AND kind='image_edit'",
-                         (ident,)).fetchone()
+        row = db.execute("SELECT * FROM jobs WHERE id=? AND owner='switcher-admin' AND kind=?",
+                         (ident, kind)).fetchone()
     finally:
         db.close()
     return dict(row) if row else None
+
+
+def image_preview(data, content_type, query):
+    values = urllib.parse.parse_qs(query).get("index", ["1"])
+    if len(values) != 1 or values[0] not in ("1", "2", "3"):
+        raise ValueError("Invalid preview index")
+    index = int(values[0])
+    if content_type == "image/png":
+        if index != 1:
+            raise ValueError("No image at that index")
+        return data
+    if content_type != "application/zip":
+        raise ValueError("Unsupported result type")
+    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+        name = f"generated-{index:02}.png"
+        if archive.getinfo(name).file_size > 32 * 1024 * 1024:
+            raise ValueError("Image preview is too large")
+        return archive.read(name)
 
 
 def usage_window(query, prefix=""):
@@ -1520,20 +1540,31 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urllib.parse.urlsplit(self.path)
         if path.path == "/image-edit":
-            job_id = urllib.parse.parse_qs(path.query).get("job", [None])[0]
-            if job_id and not image_edit_job(job_id):
+            query = urllib.parse.parse_qs(path.query)
+            job_id = query.get("job", [None])[0]
+            task = query.get("task", ["edit"])[0]
+            if task not in ("edit", "generate") or job_id and not image_edit_job(
+                    job_id, "image" if task == "generate" else "image_edit"):
                 self.send_error(404, "Image edit job not found")
                 return
-            self._send_html(image_edit_views.page(CSRF, job_id))
+            self._send_html(image_edit_views.page(CSRF, job_id, task))
+            return
+        if path.path.startswith("/image-edit/private/preview/"):
+            self._private_image_preview(path.path.rsplit("/", 1)[1], path.query)
             return
         for prefix, suffix in (("/image-edit/private/status/", ""),
                                ("/image-edit/private/result/", "/result")):
             if path.path.startswith(prefix):
                 self._private_edit_proxy(path.path[len(prefix):], suffix)
                 return
-        for prefix, binary in (("/image-edit/status/", False), ("/image-edit/result/", True)):
+        for prefix, kind, binary, preview in (
+                ("/image-edit/status/", "image_edit", False, False),
+                ("/image-edit/result/", "image_edit", True, False),
+                ("/image-edit/generation/status/", "image", False, False),
+                ("/image-edit/generation/result/", "image", True, False),
+                ("/image-edit/generation/preview/", "image", True, True)):
             if path.path.startswith(prefix):
-                job = image_edit_job(path.path[len(prefix):])
+                job = image_edit_job(path.path[len(prefix):], kind)
                 if not job:
                     self.send_error(404, "Image edit job not found")
                     return
@@ -1542,8 +1573,16 @@ class Handler(BaseHTTPRequestHandler):
                         self.send_error(404, "Edited image is not ready")
                         return
                     data = (Path("/app/data/multimodal/artifacts") / job["result_name"]).read_bytes()
+                    content_type = job["result_type"] or "image/png"
+                    if preview:
+                        try:
+                            data = image_preview(data, content_type, path.query)
+                        except (ValueError, KeyError, zipfile.BadZipFile):
+                            self.send_error(400, "Invalid image preview")
+                            return
+                        content_type = "image/png"
                     self.send_response(200)
-                    self.send_header("Content-Type", "image/png")
+                    self.send_header("Content-Type", content_type)
                     self.send_header("Content-Length", str(len(data)))
                     self.send_header("Cache-Control", "no-store")
                     self.send_header("X-Content-Type-Options", "nosniff")
@@ -1957,6 +1996,109 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
 
+    def _submit_image_generation(self):
+        if self.headers.get("Origin") != ORIGIN or self.headers.get("Host") != urllib.parse.urlsplit(ORIGIN).netloc:
+            self.send_error(403, "Invalid origin")
+            return
+        content_type = self.headers.get("Content-Type", "")
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            length = 0
+        if not 1 <= length <= 24 * 1024 * 1024 or not content_type.startswith("multipart/form-data;"):
+            self.send_error(413, "Upload up to three reference images, 16 MiB total")
+            return
+        document = BytesParser(policy=email_policy).parsebytes(
+            b"MIME-Version: 1.0\r\nContent-Type: " + content_type.encode("ascii", "ignore") +
+            b"\r\n\r\n" + self.rfile.read(length))
+        if not document.is_multipart():
+            self.send_error(400, "Invalid upload form")
+            return
+        fields, references = {}, []
+        for part in document.iter_parts():
+            name = part.get_param("name", header="content-disposition")
+            if name == "reference":
+                data = part.get_payload(decode=True)
+                if data:
+                    references.append(data)
+            elif name in ("token", "prompt", "private", "reference_strength") and name not in fields:
+                fields[name] = part.get_payload(decode=True)
+            else:
+                self.send_error(400, "Invalid upload form fields")
+                return
+        if fields.get("token") != CSRF.encode():
+            self.send_error(403, "Invalid request")
+            return
+        try:
+            prompt = fields.get("prompt", b"").decode("utf-8")
+            strength = fields.get("reference_strength", b"0.55").decode("ascii")
+        except UnicodeDecodeError:
+            self.send_error(400, "Invalid prompt or reference strength")
+            return
+        if not 1 <= len(prompt) <= 1000 or strength not in ("0.35", "0.55", "0.75") or \
+                not 0 <= len(references) <= 3 or any(not 1 <= len(item) <= 8 * 1024 * 1024 for item in references) or \
+                sum(map(len, references)) > 16 * 1024 * 1024 or fields.get("private") not in (None, b"on"):
+            self.send_error(400, "Use a short prompt and up to three reference images, 16 MiB total")
+            return
+        private = fields.get("private") == b"on"
+        payload = json.dumps({"prompt": prompt, "references": [base64.b64encode(item).decode() for item in references],
+                              "reference_strength": float(strength), "private": private}).encode()
+        request = urllib.request.Request("http://multimodal:8003/v1/images/generations", data=payload,
+                                         headers={"Content-Type": "application/json",
+                                                  "X-Internal-Token": os.environ["BENCHMARK_API_KEY"],
+                                                  "X-AI-Client-ID": "switcher-admin"})
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                ident = json.load(response)["id"]
+        except urllib.error.HTTPError as exc:
+            try:
+                detail = json.load(exc).get("error", {}).get("message", "Image generation was rejected")
+            except (ValueError, TypeError):
+                detail = "Image generation was rejected"
+            self.send_error(exc.code, detail)
+            return
+        except (OSError, KeyError, ValueError):
+            self.send_error(502, "Image worker is unavailable")
+            return
+        if private:
+            data = json.dumps({"id": ident, "status": "queued", "private": True}).encode()
+            self.send_response(202)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.end_headers()
+            self.wfile.write(data)
+            return
+        self.send_response(303)
+        self.send_header("Location", "/image-edit?task=generate&job=" + ident)
+        self.send_header("Content-Length", "0")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+
+    def _private_image_preview(self, ident, query):
+        try:
+            if uuid.UUID(ident).version != 4:
+                raise ValueError("Invalid job ID")
+            request = urllib.request.Request("http://multimodal:8003/v1/jobs/" + ident + "/result",
+                                             headers={"X-Internal-Token": os.environ["BENCHMARK_API_KEY"],
+                                                      "X-AI-Client-ID": "switcher-admin"})
+            with urllib.request.urlopen(request, timeout=30) as response:
+                data = response.read(128 * 1024 * 1024 + 1)
+                if len(data) > 128 * 1024 * 1024:
+                    raise ValueError("Result too large")
+                image = image_preview(data, response.headers.get_content_type(), query)
+        except (ValueError, KeyError, zipfile.BadZipFile, OSError):
+            self.send_error(404, "Private image preview unavailable")
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "image/png")
+        self.send_header("Content-Length", str(len(image)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        self.wfile.write(image)
+
     def _private_edit_proxy(self, ident, suffix="", method="GET"):
         try:
             if uuid.UUID(ident).version != 4:
@@ -1997,6 +2139,9 @@ class Handler(BaseHTTPRequestHandler):
         self._private_edit_proxy(self.path[len(prefix):], method="DELETE")
 
     def do_POST(self):
+        if self.path == "/image-edit/generate":
+            self._submit_image_generation()
+            return
         if self.path == "/image-edit/submit":
             self._submit_image_edit()
             return
@@ -7691,6 +7836,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+import zipfile
 
 
 MAX_PDF_PAGES = 20
@@ -7786,28 +7932,94 @@ def sdxl_workflow(prompt, checkpoint, width, height, steps):
     }
 
 
-def image(job, update):
+def sdxl_reference_workflow(prompt, checkpoint, image_data, width, height, steps, strength):
+    graph = sdxl_workflow(prompt, checkpoint, width, height, steps)
+    graph["5"] = {"class_type": "AISwitcherReferenceImage",
+                  "inputs": {"image_base64": base64.b64encode(image_data).decode("ascii")}}
+    graph["11"] = {"class_type": "VAEEncode", "inputs": {"pixels": ["5", 0], "vae": ["4", 2]}}
+    graph["8"]["inputs"]["latent_image"] = ["11", 0]
+    graph["8"]["inputs"]["denoise"] = strength
+    return graph
+
+
+def reference_images(payload):
+    if not payload:
+        return []
+    from PIL import Image, ImageOps
+    images = []
+    with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+        names = archive.namelist()
+        if not 1 <= len(names) <= 3 or names != [f"reference-{index}.bin" for index in range(1, len(names) + 1)]:
+            raise ValueError("Reference archive must contain 1–3 images")
+        for name in names:
+            if archive.getinfo(name).file_size > 8 * 1024 * 1024:
+                raise ValueError("Each reference image must be at most 8 MiB")
+            with Image.open(io.BytesIO(archive.read(name))) as opened:
+                if opened.format not in ("JPEG", "PNG", "WEBP") or opened.width * opened.height > 20_000_000 or min(opened.size) < 256:
+                    raise ValueError("References must be JPEG, PNG, or WebP, 256 px or larger and at most 20 megapixels")
+                images.append(ImageOps.exif_transpose(opened).convert("RGB"))
+    return images
+
+
+def _prepare_reference(image, width=None, height=None):
+    from PIL import ImageOps
+    if width is None and height is None:
+        scale = min(1, 1024 / max(image.size))
+        width = max(256, round(image.width * scale / 8) * 8)
+        height = max(256, round(image.height * scale / 8) * 8)
+    image = ImageOps.fit(image, (width, height))
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    return buffer.getvalue(), width, height
+
+
+def image(job, payload, update):
     request = job["request"]
     prompt = request.get("prompt", "")
     checkpoint = request.get("checkpoint", "")
     width, height, steps = (request.get(key) for key in ("width", "height", "steps"))
+    strength = request.get("reference_strength", 0.55)
     if not isinstance(prompt, str) or not 1 <= len(prompt) <= 4000:
         raise ValueError("Image prompt must have 1–4000 characters")
     if not isinstance(checkpoint, str) or Path(checkpoint).name != checkpoint or not checkpoint.endswith(".safetensors"):
         raise ValueError("Select an installed checkpoint")
-    if not (isinstance(width, int) and isinstance(height, int) and isinstance(steps, int) and
-            256 <= width <= 1536 and 256 <= height <= 1536 and width % 8 == height % 8 == 0 and 1 <= steps <= 60):
+    if not (isinstance(steps, int) and not isinstance(steps, bool) and 1 <= steps <= 60):
+        raise ValueError("Choose 1–60 sampling steps")
+    if not (width is None and height is None or
+            type(width) is int and type(height) is int and 256 <= width <= 1536 and
+            256 <= height <= 1536 and width % 8 == height % 8 == 0):
         raise ValueError("Choose width/height 256–1536 in multiples of 8 and steps 1–60")
+    if strength not in (0.35, 0.55, 0.75):
+        raise ValueError("Choose a reference strength of 0.35, 0.55, or 0.75")
     installed = Path(os.environ.get("COMFY_MODEL_DIR", "/app/media_models")) / "checkpoints" / checkpoint
     if not installed.is_file():
         raise ValueError("Checkpoint is not installed in ComfyUI")
-    workflow = sdxl_workflow(prompt, checkpoint, width, height, steps)
+    references = reference_images(payload)
     private = bool(request.get("_private"))
-    if private:
-        workflow["10"] = {"class_type": "AISwitcherPrivateImageResult", "inputs": {"images": ["9", 0]}}
-    result, data, mime = render_workflow(job, workflow, update,
-                                         private_key="private_images" if private else None)
-    return {**result, "checkpoint": checkpoint}, data, mime
+    outputs = []
+    for index, reference in enumerate(references or [None], 1):
+        if reference is None:
+            output_width, output_height = width or 1024, height or 1024
+            workflow = sdxl_workflow(prompt, checkpoint, output_width, output_height, steps)
+        else:
+            prepared, output_width, output_height = _prepare_reference(reference, width, height)
+            workflow = sdxl_reference_workflow(prompt, checkpoint, prepared, output_width,
+                                               output_height, steps, strength)
+        if private:
+            workflow["10"] = {"class_type": "AISwitcherPrivateImageResult", "inputs": {"images": ["9", 0]}}
+        update(job["id"], stage=f"rendering image {index} of {len(references) or 1}")
+        result, data, mime = render_workflow(job, workflow, update,
+                                             private_key="private_images" if private else None)
+        outputs.append(data)
+    if len(outputs) == 1:
+        return {**result, "checkpoint": checkpoint, "reference_count": len(references),
+                "output_count": 1}, outputs[0], "image/png"
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as bundle:
+        for index, data in enumerate(outputs, 1):
+            bundle.writestr(f"generated-{index:02}.png", data)
+    return {"checkpoint": checkpoint, "reference_count": len(references),
+            "output_count": len(outputs)}, archive.getvalue(), "application/zip"
 
 
 def wan21_workflow(prompt, width, height, frames, fps, steps,
@@ -7929,11 +8141,13 @@ cat > "$INSTALL_DIR/gpu_control/multimodal_service.py" <<'MULTIMODAL_SERVICE'
 """Authenticated-internal HTTP front end and persistent task workers."""
 import base64
 import binascii
+import io
 import json
 import os
 import threading
 import time
 import urllib.request
+import zipfile
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -8002,7 +8216,7 @@ def worker(kinds):
                         time.sleep(5)
                 result, artifact, mime = (workers.image_edit(job, prepared, store.update)
                                           if kind == "image_edit" else workers.video(job, store.update)
-                                          if kind == "video" else workers.image(job, store.update))
+                                          if kind == "video" else workers.image(job, payload, store.update))
                 store.update(job["id"], stage="restoring language model")
                 release = controller("release", job["id"])
                 leased = False
@@ -8077,9 +8291,11 @@ class Handler(BaseHTTPRequestHandler):
                 if not profile.get("image_checkpoint"):
                     raise ValueError("Load a Creative studio profile before requesting an image")
                 request.setdefault("checkpoint", profile.get("image_checkpoint"))
-                request.setdefault("width", 1024)
-                request.setdefault("height", 1024)
+                has_references = bool(request.get("references")) or request.get("data") is not None
+                request.setdefault("width", None if has_references else 1024)
+                request.setdefault("height", None if has_references else 1024)
                 request.setdefault("steps", 20)
+                request.setdefault("reference_strength", 0.55)
             if kind == "image_edit":
                 if not profile.get("image"):
                     raise ValueError("Load a Creative studio profile before editing an image")
@@ -8101,7 +8317,33 @@ class Handler(BaseHTTPRequestHandler):
                 request.setdefault("fps", 16)
                 request.setdefault("steps", 30)
             data = request.pop("data", None)
-            if kind in {"pdf", "ocr", "transcription", "image_edit"}:
+            references = request.pop("references", None)
+            if kind == "image":
+                if data is not None and references is not None:
+                    raise ValueError("Use data or references, not both")
+                if data is not None:
+                    references = [data]
+                if references is None:
+                    references = []
+                if not isinstance(references, list) or len(references) > 3:
+                    raise ValueError("Upload at most three reference images")
+                decoded = []
+                for encoded in references:
+                    if not isinstance(encoded, str):
+                        raise ValueError("Each reference must be base64 text")
+                    raw = base64.b64decode(encoded, validate=True)
+                    if not 1 <= len(raw) <= 8 * 1024 * 1024:
+                        raise ValueError("Each reference must be 1–8 MiB")
+                    decoded.append(raw)
+                if sum(map(len, decoded)) > 16 * 1024 * 1024:
+                    raise ValueError("Reference images total more than 16 MiB")
+                archive = io.BytesIO()
+                if decoded:
+                    with zipfile.ZipFile(archive, "w", zipfile.ZIP_STORED) as bundle:
+                        for index, raw in enumerate(decoded, 1):
+                            bundle.writestr(f"reference-{index}.bin", raw)
+                payload = archive.getvalue()
+            elif kind in {"pdf", "ocr", "transcription", "image_edit"}:
                 if not isinstance(data, str):
                     raise ValueError("Base64 data field is required")
                 payload = base64.b64decode(data, validate=True)
@@ -8111,7 +8353,7 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("Input is not a PDF")
             else:
                 payload = b""
-                if data is not None:
+                if data is not None or references is not None:
                     raise ValueError("This task does not accept uploaded data")
             job = (PRIVATE_STORE if private else STORE).submit(owner, kind, request, payload)
         except (ValueError, binascii.Error, UnicodeDecodeError) as exc:
@@ -8685,6 +8927,26 @@ class PrivateImageAndMask:
         return pixels, alpha
 
 
+class ReferenceImage:
+    """Decode one reference from the prompt in RAM without using ComfyUI's input directory."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"image_base64": ("STRING", {"multiline": True})}}
+
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "load"
+    CATEGORY = "AI Switcher/reference"
+
+    def load(self, image_base64):
+        with Image.open(BytesIO(base64.b64decode(image_base64, validate=True))) as source:
+            image = source.convert("RGB")
+        if image.width * image.height > 4_000_000:
+            raise ValueError("Reference image exceeds the size limit")
+        pixels = torch.from_numpy(np.array(image).astype(np.float32) / 255).unsqueeze(0)
+        return (pixels,)
+
+
 class PrivateImageResult:
     @classmethod
     def INPUT_TYPES(cls):
@@ -8739,29 +9001,52 @@ class PrivateVideoResult:
 
 NODE_CLASS_MAPPINGS = {
     "AISwitcherPrivateImageAndMask": PrivateImageAndMask,
+    "AISwitcherReferenceImage": ReferenceImage,
     "AISwitcherPrivateImageResult": PrivateImageResult,
     "AISwitcherPrivateVideoResult": PrivateVideoResult,
 }
 COMFY_PRIVATE_NODES
 
 cat > "$INSTALL_DIR/gpu_control/image_edit_views.py" <<'IMAGE_EDIT_VIEWS'
-"""Browser upload and progress page for grounded object removal."""
+"""Browser upload and progress page for image generation and object removal."""
 import html
 
 from benchmark_views import shell
 
 
-def page(csrf, job_id=None):
+def page(csrf, job_id=None, task="edit"):
     esc = lambda value: html.escape(str(value), quote=True)
-    progress = (f'<section class="card" data-edit-panel data-edit-job="{esc(job_id or "")}"'
+    progress = (f'<section class="card" data-edit-panel data-edit-job="{esc(job_id or "")}" data-edit-task="{esc(task)}"'
                 f'{"" if job_id else " hidden"}>'
                 '<h2>Editing progress</h2><p id="edit-status" role="status">Checking job status…</p>'
                 '<p id="edit-detail" class="note"></p>'
-                '<img id="edit-preview" alt="Edited image preview" hidden style="max-width:100%;height:auto">'
+                '<div id="edit-gallery" style="display:flex;flex-wrap:wrap;gap:1rem"></div>'
                 '<p><a id="edit-download" download="edited-image.png" hidden>Download edited image</a></p>'
                 '<p id="edit-private-note" class="note" hidden>Private result stays only in this browser tab until you close it.</p>'
                 '<button type="button" id="edit-discard" hidden>Discard private result</button></section>'
                 '<script src="/assets/image_edit_poll.js" defer></script>')
+    generation = ('<section class="card"><div class="eyebrow">IMAGE GENERATION</div><h1>Generate an image</h1>'
+                  '<p>Describe the image you want. Optionally upload up to three reference photos. '
+                  'Each reference produces a separate image guided by its composition; without references, '
+                  'the model creates a new image from the prompt. Multiple results download as a ZIP.</p>'
+                  '<form id="image-generate-form" method="post" action="/image-edit/generate" '
+                  'enctype="multipart/form-data" autocomplete="off">'
+                  f'<input type="hidden" name="token" value="{esc(csrf)}">'
+                  '<label>Prompt <input type="text" name="prompt" autocomplete="off" maxlength="1000" '
+                  'placeholder="A sunlit garden in watercolor" required></label>'
+                  '<label>Reference images (optional, up to three) '
+                  '<input type="file" name="reference" accept="image/jpeg,image/png,image/webp" multiple></label>'
+                  '<label>How much to change each reference '
+                  '<select name="reference_strength"><option value="0.35">Subtle</option>'
+                  '<option value="0.55" selected>Balanced</option><option value="0.75">Strong</option></select></label>'
+                  '<p class="note">The reference keeps some composition and colors. This is image-to-image '
+                  'generation; it does not guarantee a person’s identity or exact details are preserved. '
+                  'Each image must be 8 MiB or less; all uploads together must be 16 MiB or less.</p>'
+                  '<label><input type="checkbox" name="private"> Private mode: do not retain uploads, prompt, '
+                  'job record, or results on the server. Results stay in this tab until closed.</label>'
+                  '<button type="submit">Generate image</button></form>'
+                  '<p class="note">Requires a Creative studio profile with an installed SDXL-style image checkpoint.</p>'
+                  '<p><a href="/profiles">Task profiles</a></p></section>')
     body = ('<section class="card"><div class="eyebrow">OBJECT REMOVAL</div><h1>Edit an image</h1>'
             '<p>Upload a photo and describe the object to remove. The switcher locates it, builds a mask, '
             'runs the installed inpainting checkpoint, and returns a PNG at the original dimensions. '
@@ -8779,99 +9064,116 @@ def page(csrf, job_id=None):
             '<p class="note">A Creative studio profile and an installed inpainting checkpoint are required. '
             'If several matching objects are present, the job stops and asks for a more precise selection.</p>'
             '<p><a href="/profiles">Task profiles</a></p></section>')
-    return shell("Image editor", body + progress)
+    return shell("Image editor", generation + body + progress)
 IMAGE_EDIT_VIEWS
 
 cat > "$INSTALL_DIR/gpu_control/image_edit_poll.js" <<'IMAGE_EDIT_POLL'
 (() => {
-  const form = document.getElementById('image-edit-form');
+  const forms = [...document.querySelectorAll('#image-edit-form, #image-generate-form')];
   const panel = document.querySelector('[data-edit-panel]');
-  if (!form || !panel) return;
+  if (!forms.length || !panel) return;
   const status = document.getElementById('edit-status');
   const detail = document.getElementById('edit-detail');
-  const preview = document.getElementById('edit-preview');
+  const gallery = document.getElementById('edit-gallery');
   const download = document.getElementById('edit-download');
   const privateNote = document.getElementById('edit-private-note');
   const discard = document.getElementById('edit-discard');
-  let objectURL = null;
-
-  const clearResult = () => {
-    if (objectURL) URL.revokeObjectURL(objectURL);
-    objectURL = null;
-    preview.removeAttribute('src');
-    preview.hidden = true;
+  const objectURLs = [];
+  let generation = 0;
+  function clearResult() {
+    generation++;
+    objectURLs.forEach(url => URL.revokeObjectURL(url));
+    objectURLs.length = 0;
+    gallery.replaceChildren();
     download.removeAttribute('href');
     download.hidden = true;
     privateNote.hidden = true;
     discard.hidden = true;
-  };
+  }
   window.addEventListener('pagehide', clearResult);
-  discard.addEventListener('click', clearResult);
-
-  const poll = async (id, privateMode) => {
-    const base = privateMode ? '/image-edit/private/' : '/image-edit/';
+  discard.addEventListener('click', () => { clearResult(); panel.hidden = true; });
+  async function getBlob(url) {
+    const response = await fetch(url, {cache: 'no-store', credentials: 'same-origin'});
+    if (!response.ok) throw new Error(`Result request failed (${response.status})`);
+    return response.blob();
+  }
+  async function poll(id, privateMode, task, run) {
+    const base = privateMode ? '/image-edit/private/' : task === 'generate' ? '/image-edit/generation/' : '/image-edit/';
+    const encoded = encodeURIComponent(id);
     try {
-      const response = await fetch(`${base}status/${encodeURIComponent(id)}`,
-        {cache: 'no-store', credentials: 'same-origin'});
+      const response = await fetch(`${base}status/${encoded}`, {cache: 'no-store', credentials: 'same-origin'});
       if (!response.ok) throw new Error(`Status request failed (${response.status})`);
       const job = await response.json();
+      if (run !== generation) return;
       status.textContent = `${job.status}: ${job.stage}`;
       if (job.status === 'completed') {
-        detail.textContent = `Removed ${job.result?.target || 'selected object'}. The original image size was preserved.`;
-        const url = `${base}result/${encodeURIComponent(id)}`;
+        const count = task === 'generate' ? Math.min(3, job.result?.output_count || 1) : 1;
+        detail.textContent = task === 'generate' ? `Generated ${count} image${count === 1 ? '' : 's'}.` :
+          `Removed ${job.result?.target || 'selected object'}. The original image size was preserved.`;
+        const resultURL = `${base}result/${encoded}`;
+        for (let index = 1; index <= count; index++) {
+          const imageURL = task === 'generate' ? (privateMode ?
+            `/image-edit/private/preview/${encoded}?index=${index}` : `${base}preview/${encoded}?index=${index}`) : resultURL;
+          const src = privateMode ? URL.createObjectURL(await getBlob(imageURL)) : imageURL;
+          if (privateMode) objectURLs.push(src);
+          const img = document.createElement('img');
+          img.src = src;
+          img.alt = `Result image ${index}`;
+          img.style.cssText = 'max-width:min(100%, 420px);height:auto;object-fit:contain';
+          gallery.appendChild(img);
+        }
+        const result = privateMode ? URL.createObjectURL(await getBlob(resultURL)) : resultURL;
+        if (privateMode) objectURLs.push(result);
+        download.href = result;
+        download.download = task === 'generate' ? (count > 1 ? 'generated-images.zip' : 'generated-image.png') : 'edited-image.png';
+        download.textContent = count > 1 ? 'Download images ZIP' : 'Download image';
+        download.hidden = false;
         if (privateMode) {
-          const result = await fetch(url, {cache: 'no-store', credentials: 'same-origin'});
-          if (!result.ok) throw new Error(`Private image retrieval failed (${result.status})`);
-          objectURL = URL.createObjectURL(await result.blob());
-          preview.src = objectURL;
-          download.href = objectURL;
           privateNote.hidden = false;
           discard.hidden = false;
-          const token = form.elements.namedItem('token').value;
-          await fetch(`/image-edit/private/${encodeURIComponent(id)}`,
-            {method: 'DELETE', cache: 'no-store', credentials: 'same-origin', headers: {'X-CSRF-Token': token}});
-        } else {
-          preview.src = url;
-          download.href = url;
+          await fetch(`/image-edit/private/${encoded}`, {method: 'DELETE', cache: 'no-store',
+            credentials: 'same-origin', headers: {'X-CSRF-Token': forms[0].elements.namedItem('token').value}});
         }
-        preview.hidden = false;
-        download.hidden = false;
       } else if (job.status === 'failed') {
-        detail.textContent = job.error || 'The edit could not be completed.';
-        if (privateMode) {
-          const token = form.elements.namedItem('token').value;
-          await fetch(`/image-edit/private/${encodeURIComponent(id)}`,
-            {method: 'DELETE', cache: 'no-store', credentials: 'same-origin', headers: {'X-CSRF-Token': token}});
-        }
-      } else {
-        setTimeout(() => poll(id, privateMode), 2000);
-      }
+        detail.textContent = job.error || 'The image could not be created.';
+        if (privateMode) await fetch(`/image-edit/private/${encoded}`, {method: 'DELETE', cache: 'no-store',
+          credentials: 'same-origin', headers: {'X-CSRF-Token': forms[0].elements.namedItem('token').value}});
+      } else setTimeout(() => poll(id, privateMode, task, run), 2000);
     } catch (error) {
+      if (run !== generation) return;
       status.textContent = error.message;
-      setTimeout(() => poll(id, privateMode), 5000);
+      setTimeout(() => poll(id, privateMode, task, run), 5000);
     }
-  };
-
-  form.addEventListener('submit', async event => {
+  }
+  forms.forEach(form => form.addEventListener('submit', async event => {
+    const isGenerate = form.id === 'image-generate-form';
+    if (isGenerate) {
+      const refs = form.elements.namedItem('reference').files;
+      if (refs.length > 3 || [...refs].some(file => file.size > 8 * 1024 * 1024) ||
+          [...refs].reduce((sum, file) => sum + file.size, 0) > 16 * 1024 * 1024) {
+        event.preventDefault();
+        status.textContent = 'Choose at most three images, each under 8 MiB and 16 MiB total.';
+        panel.hidden = false;
+        return;
+      }
+    }
     if (!form.elements.namedItem('private').checked) return;
     event.preventDefault();
     clearResult();
     panel.hidden = false;
-    status.textContent = 'Submitting private edit…';
+    const task = isGenerate ? 'generate' : 'edit';
+    status.textContent = 'Submitting private image job…';
     detail.textContent = '';
     try {
-      const response = await fetch(form.action,
-        {method: 'POST', body: new FormData(form), cache: 'no-store', credentials: 'same-origin'});
-      if (!response.ok) throw new Error(`Private edit was rejected (${response.status})`);
+      const response = await fetch(form.action, {method: 'POST', body: new FormData(form),
+        cache: 'no-store', credentials: 'same-origin'});
+      if (!response.ok) throw new Error(`Private image request rejected (${response.status})`);
       const job = await response.json();
       form.reset();
-      poll(job.id, true);
-    } catch (error) {
-      status.textContent = error.message;
-    }
-  });
-
-  if (panel.dataset.editJob) poll(panel.dataset.editJob, false);
+      poll(job.id, true, task, generation);
+    } catch (error) { status.textContent = error.message; }
+  }));
+  if (panel.dataset.editJob) poll(panel.dataset.editJob, false, panel.dataset.editTask, generation);
 })();
 IMAGE_EDIT_POLL
 
