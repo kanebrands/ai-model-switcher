@@ -1,10 +1,30 @@
 # AI Model Switcher
 
-The switcher's **Coding harnesses** page links to official installation and local API guides for Hermes Agent, OpenCode, Pi, Aider, Cline, and Goose, with strengths and tradeoffs for each. It also shows an OpenCode 2.x provider configuration for `~/.config/opencode/opencode.json` using this installation's API URL and stable model ID.
-
 An all-in-one Ubuntu 24.04 installation for local AI. It runs an OpenAI-compatible LLM API, Open WebUI, and a browser-based model switcher behind Nginx. On compatible NVIDIA hardware, selected GPU models and ComfyUI are available too. The switcher manages model selection, hardware-aware recommendations, benchmark history, context and generation-slot tuning, client limits, and live GPU metrics when a GPU is available.
 
 No GPU is required. The installer measures host RAM and, when present, NVIDIA VRAM and CUDA compatibility. It offers CPU and compatible NVIDIA workload choices; AMD and Intel owners can add GGUF models through the switcher's Vulkan path after installation. It downloads no model until you select one or more at the installation prompt; at least one text or vision model is required. ComfyUI is optional and its image/video model files are chosen separately later.
+
+## Screenshots
+
+Captured from a running Ubuntu installation. The host address and client names are masked; available models and benchmark values depend on the hardware and workloads you install.
+
+### Switch models and tune context
+
+![AI Model Switcher dashboard showing the active model, stable API ID, workload selector, and context tuning](docs/screenshots/dashboard.png)
+
+### Find models for the detected hardware
+
+![Recommended text and code models with intended use, estimated speed, context, and installation status](docs/screenshots/find-models.png)
+
+### Compare benchmark results
+
+![Benchmark table comparing models by speed, code checks, and email classification measures](docs/screenshots/benchmarks.png)
+
+### Manage client keys and usage
+
+![Client API key table with one key's compact token statistics and graphs expanded](docs/screenshots/client-sharing.png)
+
+The **Coding harnesses** page links to official installation and local API guides for Hermes Agent, OpenCode, Pi, Aider, Cline, and Goose, with strengths and tradeoffs for each. It also shows an OpenCode 2.x provider configuration for `~/.config/opencode/opencode.json` using this installation's API URL and stable model ID.
 
 ## Quick start
 
